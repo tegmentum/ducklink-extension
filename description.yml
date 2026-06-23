@@ -24,15 +24,26 @@ repo:
 
 docs:
   hello_world: |
-    -- Load a duckdb:extension WebAssembly component and expose its functions.
+    -- The extension ships one built-in, so loading works with no component:
     LOAD ducklink;
-    CALL ducklink_load('isin.wasm');
-    SELECT isin_is_valid('US0378331005');  -- a scalar registered by the component
+    SELECT ducklink_version();   -- e.g. 'ducklink 0.1.0'
+
+    -- To expose a component's functions, point ducklink at one or more
+    -- `duckdb:extension` WebAssembly components via the DUCKLINK_COMPONENTS
+    -- environment variable BEFORE starting DuckDB, e.g.
+    --   DUCKLINK_COMPONENTS=isin=/path/to/isin.wasm
+    -- then every function the component registers becomes callable:
+    --   LOAD ducklink;
+    --   SELECT isin_is_valid('US0378331005');
   extended_description: |
     ducklink lets a single, portable WebAssembly component — built once against
     the `duckdb:extension` WIT world — load into DuckDB on any supported platform
-    without per-platform native builds. The extension embeds wasmtime, loads the
-    component, runs its `load()` to capture the scalar/table/aggregate functions
-    it registers, and bridges them to DuckDB's function catalog. The same
-    components run under the standalone `ducklink` host (DuckDB-compiled-to-wasm),
-    so one artifact targets both directions.
+    without per-platform native builds. The extension embeds wasmtime, loads each
+    component named in the `DUCKLINK_COMPONENTS` environment variable (a
+    `:`-separated list of `name=path` entries, read when `LOAD ducklink` runs),
+    runs its `load()` to capture the scalar/table/aggregate functions it
+    registers, and bridges them into DuckDB's function catalog. A built-in
+    `ducklink_version()` scalar is always available so the extension is usable
+    and testable before any component is configured. The same components run
+    unchanged under the standalone `ducklink` host (DuckDB-compiled-to-wasm), so
+    one artifact targets both directions.
