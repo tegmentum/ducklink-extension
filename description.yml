@@ -19,8 +19,7 @@ extension:
 
 repo:
   github: tegmentum/ducklink-extension
-  # Filled in at submission time with the tagged release commit.
-  ref: 0000000000000000000000000000000000000000
+  ref: v0.1.0
 
 docs:
   hello_world: |
