@@ -1,0 +1,13 @@
+# name: test/sql/ducklink.test
+# description: the ducklink extension loads and registers its C-API entrypoint
+# group: [ducklink]
+
+# Require statement ensures the extension is loaded from now on. With no
+# DUCKLINK_COMPONENTS set, the extension loads and registers zero component
+# functions; this asserts the entrypoint runs cleanly and the engine boots.
+require ducklink
+
+query I
+SELECT 42;
+----
+42
