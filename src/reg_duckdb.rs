@@ -23,8 +23,40 @@ use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 use duckdb::Connection;
 
 use ducklink_runtime::reg;
+// The WIT value type the component dispatcher consumes/produces. The scalar hot
+// path marshals DuckDB vectors straight to/from this type, so no per-chunk
+// neutral(reg::DuckValue) <-> WIT rebuild happens inside the engine (measured at
+// ~15% of dispatch). The cold table/aggregate paths still use reg::DuckValue.
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Duckvalue as WitVal;
 
 use crate::engine::{AggregateFunc, Engine2, ScalarFunc, TableFunc};
+
+/// Format a caught panic payload as a one-line message.
+fn panic_msg(p: Box<dyn std::any::Any + Send>, what: &str) -> String {
+    let detail = p
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("internal panic in wasm {what}: {detail}")
+}
+
+/// Run a fallible FFI-callback body, catching any panic so it cannot unwind
+/// across DuckDB's `extern "C"` call boundary — which (duckdb-rs installs no
+/// catch of its own) would abort the entire host process. A caught panic becomes
+/// an `Err`, surfaced to DuckDB as a normal query error. These bodies are
+/// panic-free in normal operation; this is a last line of defence so that an
+/// unexpected panic (a future bug, an internal dependency panic) fails one query
+/// instead of tearing down every connection in the process.
+fn guard<T>(
+    what: &str,
+    f: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(p) => Err(panic_msg(p, what).into()),
+    }
+}
 
 /// Per-function state DuckDB hands back to `invoke`: which component callback to
 /// dispatch to, the shared engine, and the function's argument / return type
@@ -71,55 +103,129 @@ fn logical_type(code: u8) -> LogicalTypeHandle {
     LogicalTypeHandle::from(id)
 }
 
-/// Read row `i` of a flat input column (type `code`) into a neutral value.
-fn read_arg(code: u8, vec: &FlatVector, i: usize, len: usize) -> reg::DuckValue {
+/// True if row `r` is valid (non-NULL) under DuckDB's bitmask layout. A null
+/// `validity` pointer means the whole column is valid.
+///
+/// # Safety
+/// `validity`, when non-null, must point to a DuckDB validity mask with at least
+/// `r + 1` rows.
+#[inline]
+unsafe fn row_valid(validity: *const u64, r: usize) -> bool {
+    *validity.add(r / 64) & (1u64 << (r % 64)) != 0
+}
+
+/// Marshal an entire input column (type `code`) into argument slot `j` of every
+/// row, ready to hand straight to the component dispatcher with no further
+/// conversion. Column-major: the typed slice is derived and the type code is
+/// matched once per column (not once per cell), leaving only an index and an
+/// enum wrap per row in the hot loop.
+///
+/// DuckDB uses default NULL handling for these scalars: it still invokes the
+/// function on rows whose inputs are NULL, then overwrites those result rows
+/// with NULL. So the component must receive a *type-valid* value for every row,
+/// including NULL ones (handing it `WitVal::Null` makes a type-checking
+/// component reject the whole batch). For numeric types the raw slot value is
+/// already type-valid (and discarded), so they read unconditionally — the
+/// fast path. For TEXT/BLOB a NULL row's `duckdb_string_t` holds no valid
+/// pointer, so reading it would dereference garbage; those rows are instead
+/// given an empty (but valid) string/blob. `validity` is the column's mask
+/// (null when the column has no NULLs) and is consulted only for TEXT/BLOB.
+fn read_col_into(
+    code: u8,
+    vec: &FlatVector,
+    validity: *const u64,
+    len: usize,
+    rows: &mut [Vec<WitVal>],
+    j: usize,
+) {
+    macro_rules! fill {
+        ($ty:ty, $variant:ident) => {{
+            let s = unsafe { vec.as_slice_with_len::<$ty>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                row[j] = WitVal::$variant(s[i]);
+            }
+        }};
+    }
+    // For TEXT/BLOB: true when row `i` is NULL and its string slot must not be
+    // read. Numeric columns never call this.
+    let is_null = |i: usize| !validity.is_null() && unsafe { !row_valid(validity, i) };
     match code {
-        T_I64 => reg::DuckValue::Int64(unsafe { vec.as_slice_with_len::<i64>(len) }[i]),
-        T_U64 => reg::DuckValue::Uint64(unsafe { vec.as_slice_with_len::<u64>(len) }[i]),
-        T_F64 => reg::DuckValue::Float64(unsafe { vec.as_slice_with_len::<f64>(len) }[i]),
-        T_BOOL => reg::DuckValue::Boolean(unsafe { vec.as_slice_with_len::<bool>(len) }[i]),
+        T_I64 => fill!(i64, Int64),
+        T_U64 => fill!(u64, Uint64),
+        T_F64 => fill!(f64, Float64),
+        T_BOOL => fill!(bool, Boolean),
         T_TEXT => {
-            let mut s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) }[i];
-            reg::DuckValue::Text(DuckString::new(&mut s).as_str().into_owned())
+            let s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                row[j] = if is_null(i) {
+                    WitVal::Text(String::new())
+                } else {
+                    let mut t = s[i];
+                    WitVal::Text(DuckString::new(&mut t).as_str().into_owned())
+                };
+            }
         }
         T_BLOB => {
-            let mut s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) }[i];
-            reg::DuckValue::Blob(DuckString::new(&mut s).as_bytes().to_vec())
+            let s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                row[j] = if is_null(i) {
+                    WitVal::Blob(Vec::new())
+                } else {
+                    let mut t = s[i];
+                    WitVal::Blob(DuckString::new(&mut t).as_bytes().to_vec())
+                };
+            }
         }
         _ => unreachable!("type code out of range"),
     }
 }
 
-/// Write a neutral value into row `i` of a flat output column (type `code`).
+/// Convert a neutral value into the WIT value `write_ret` consumes. Used only by
+/// the cold table path (one materialized result set per query); the hot scalar
+/// path skips it entirely -- `read_arg` yields `WitVal` and the dispatcher
+/// returns `WitVal`, so nothing on that path touches `reg::DuckValue`.
+fn neutral_to_wit(v: reg::DuckValue) -> WitVal {
+    match v {
+        reg::DuckValue::Null => WitVal::Null,
+        reg::DuckValue::Boolean(b) => WitVal::Boolean(b),
+        reg::DuckValue::Int64(i) => WitVal::Int64(i),
+        reg::DuckValue::Uint64(u) => WitVal::Uint64(u),
+        reg::DuckValue::Float64(f) => WitVal::Float64(f),
+        reg::DuckValue::Text(s) => WitVal::Text(s),
+        reg::DuckValue::Blob(b) => WitVal::Blob(b),
+    }
+}
+
+/// Write a component-returned WIT value into row `i` of a flat output column.
 fn write_ret(
     code: u8,
     vec: &mut FlatVector,
     i: usize,
     len: usize,
-    v: reg::DuckValue,
+    v: WitVal,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match (code, v) {
         // A component may return SQL NULL for any declared return type (e.g. a
         // validator on bad input) — mark the output row invalid.
-        (_, reg::DuckValue::Null) => vec.set_null(i),
-        (T_I64, reg::DuckValue::Int64(x)) => {
+        (_, WitVal::Null) => vec.set_null(i),
+        (T_I64, WitVal::Int64(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
             s[i] = x;
         }
-        (T_U64, reg::DuckValue::Uint64(x)) => {
+        (T_U64, WitVal::Uint64(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<u64>(len) };
             s[i] = x;
         }
-        (T_F64, reg::DuckValue::Float64(x)) => {
+        (T_F64, WitVal::Float64(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<f64>(len) };
             s[i] = x;
         }
-        (T_BOOL, reg::DuckValue::Boolean(x)) => {
+        (T_BOOL, WitVal::Boolean(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<bool>(len) };
             s[i] = x;
         }
-        (T_TEXT, reg::DuckValue::Text(x)) => vec.insert(i, x.as_str()),
-        (T_BLOB, reg::DuckValue::Blob(x)) => vec.insert(i, x.as_slice()),
+        (T_TEXT, WitVal::Text(x)) => vec.insert(i, x.as_str()),
+        (T_BLOB, WitVal::Blob(x)) => vec.insert(i, x.as_slice()),
         (_, other) => {
             return Err(format!(
                 "component returned {other:?}, incompatible with declared return type"
@@ -136,6 +242,13 @@ fn write_ret(
 // set immediately before the (synchronous) registration call.
 thread_local! {
     static PENDING_SIGNATURE: RefCell<Option<(Vec<u8>, u8)>> = const { RefCell::new(None) };
+
+    /// Per-thread reusable marshalling buffer for scalar dispatch. DuckDB calls
+    /// `invoke` once per data chunk, possibly from several threads; each thread
+    /// keeps its own `Vec<Vec<WitVal>>` whose inner row Vecs retain capacity
+    /// between chunks, so steady-state scalar evaluation allocates no per-row
+    /// marshalling memory. Borrowed only for the duration of one `invoke`.
+    static SCALAR_SCRATCH: RefCell<Vec<Vec<WitVal>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One `VScalar` impl serving every component scalar. The argument / return
@@ -151,47 +264,92 @@ impl VScalar for WasmScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let len = input.len();
-        let cols: Vec<FlatVector> = (0..state.arg_codes.len())
-            .map(|j| input.flat_vector(j))
-            .collect();
-        let mut out = output.flat_vector();
+        // Never let a panic in marshalling/dispatch unwind into DuckDB's C call.
+        guard("scalar dispatch", || {
+            let len = input.len();
+            let cols: Vec<FlatVector> = (0..state.arg_codes.len())
+                .map(|j| input.flat_vector(j))
+                .collect();
+            let mut out = output.flat_vector();
+            // Raw chunk handle, so each column's validity mask can be fetched once
+            // (FlatVector exposes only a per-row null check, which would re-fetch the
+            // mask every cell). NULL-free columns -> null mask -> branch-free reads.
+            let raw_chunk = input.get_ptr();
 
-        // Marshal the whole chunk, then cross into the component once. DuckDB
-        // hands us a chunk of up to STANDARD_VECTOR_SIZE rows; dispatching each
-        // row individually pays a WIT boundary crossing per row, which dominates
-        // for cheap scalars. Build every row's argument tuple up front and call
-        // the batched dispatcher a single time.
-        let rows: Vec<Vec<reg::DuckValue>> = (0..len)
-            .map(|i| {
-                state
-                    .arg_codes
-                    .iter()
-                    .enumerate()
-                    .map(|(j, &code)| read_arg(code, &cols[j], i, len))
-                    .collect()
-            })
-            .collect();
+            // Marshal the whole chunk into a reused per-thread scratch, then cross
+            // into the component once. DuckDB hands us a chunk of up to
+            // STANDARD_VECTOR_SIZE rows; dispatching each row individually pays a WIT
+            // boundary crossing per row, which dominates for cheap scalars, so we
+            // build every row's argument tuple up front and call the batched
+            // dispatcher a single time. The scratch's inner row Vecs keep their
+            // capacity across chunks, so steady-state evaluation allocates no per-row
+            // marshalling memory.
+            let arity = state.arg_codes.len();
+            // DuckDB does not propagate input NULLs to the output for these scalars
+            // (it invokes the function on NULL rows and keeps the result), so the
+            // bridge enforces SQL semantics itself: any row with a NULL input yields
+            // a NULL result, overriding whatever the component computed from the
+            // placeholder it was fed. `None` until a NULL-bearing column is seen, so
+            // the all-valid common case allocates nothing and skips the scan.
+            let mut null_mask: Option<Vec<bool>> = None;
+            let results = SCALAR_SCRATCH.with(|cell| {
+                let mut rows = cell.borrow_mut();
+                // Shape the scratch to exactly `len` rows of `arity` slots, reusing
+                // the existing inner Vecs' capacity. The slots are overwritten in
+                // full by the column fills below, so the placeholder value is never
+                // observed.
+                if rows.len() < len {
+                    rows.resize_with(len, Vec::new);
+                } else {
+                    rows.truncate(len);
+                }
+                for row in rows.iter_mut() {
+                    // Shape to `arity` slots, reusing capacity. Each slot is
+                    // overwritten in full by the column fills below (which drop the
+                    // prior value), so surviving entries need not be cleared first.
+                    row.resize(arity, WitVal::Null);
+                }
+                for (j, &code) in state.arg_codes.iter().enumerate() {
+                    // Fetch the column's validity mask once (null when no NULLs).
+                    let validity = unsafe {
+                        let v = ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
+                        ffi::duckdb_vector_get_validity(v) as *const u64
+                    };
+                    read_col_into(code, &cols[j], validity, len, &mut rows, j);
+                    if !validity.is_null() {
+                        let nm = null_mask.get_or_insert_with(|| vec![false; len]);
+                        for (i, slot) in nm.iter_mut().enumerate() {
+                            if unsafe { !row_valid(validity, i) } {
+                                *slot = true;
+                            }
+                        }
+                    }
+                }
+                let mut engine = state.engine.lock().expect("engine mutex poisoned");
+                engine
+                    .dispatch_scalar_batch(state.callback_handle, 0, &rows)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
+                // `&rows` (RefMut) deref-coerces to `&Vec<Vec<WitVal>>`.
+            })?;
 
-        let mut engine = state.engine.lock().expect("engine mutex poisoned");
-        let results = engine
-            .dispatch_scalar_batch(state.callback_handle, 0, rows)
-            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-        drop(engine);
-
-        if results.len() != len {
-            return Err(format!(
-                "scalar (callback {}) returned {} results for {} input rows",
-                state.callback_handle,
-                results.len(),
-                len
-            )
-            .into());
-        }
-        for (i, result) in results.into_iter().enumerate() {
-            write_ret(state.ret_code, &mut out, i, len, result)?;
-        }
-        Ok(())
+            if results.len() != len {
+                return Err(format!(
+                    "scalar (callback {}) returned {} results for {} input rows",
+                    state.callback_handle,
+                    results.len(),
+                    len
+                )
+                .into());
+            }
+            for (i, result) in results.into_iter().enumerate() {
+                if null_mask.as_ref().is_some_and(|nm| nm[i]) {
+                    out.set_null(i);
+                } else {
+                    write_ret(state.ret_code, &mut out, i, len, result)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -293,25 +451,27 @@ impl VTab for WasmTable {
     type BindData = WasmTableBind;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        let extra = unsafe { &*bind.get_extra_info::<WasmTableExtra>() };
-        for (name, &code) in extra.col_names.iter().zip(&extra.col_codes) {
-            bind.add_result_column(name, logical_type(code));
-        }
-        let args: Vec<reg::DuckValue> = extra
-            .arg_codes
-            .iter()
-            .enumerate()
-            .map(|(j, &code)| param_to_neutral(code, &bind.get_parameter(j as u64)))
-            .collect();
-        let rows = {
-            let mut engine = extra.engine.lock().expect("engine mutex poisoned");
-            engine
-                .dispatch_table(extra.callback_handle, args)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
-        };
-        Ok(WasmTableBind {
-            rows,
-            col_codes: extra.col_codes.clone(),
+        guard("table bind", || {
+            let extra = unsafe { &*bind.get_extra_info::<WasmTableExtra>() };
+            for (name, &code) in extra.col_names.iter().zip(&extra.col_codes) {
+                bind.add_result_column(name, logical_type(code));
+            }
+            let args: Vec<reg::DuckValue> = extra
+                .arg_codes
+                .iter()
+                .enumerate()
+                .map(|(j, &code)| param_to_neutral(code, &bind.get_parameter(j as u64)))
+                .collect();
+            let rows = {
+                let mut engine = extra.engine.lock().expect("engine mutex poisoned");
+                engine
+                    .dispatch_table(extra.callback_handle, args)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
+            };
+            Ok(WasmTableBind {
+                rows,
+                col_codes: extra.col_codes.clone(),
+            })
         })
     }
 
@@ -325,24 +485,26 @@ impl VTab for WasmTable {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bind = func.get_bind_data();
-        let init = func.get_init_data();
-        let start = init.cursor.load(Ordering::Relaxed);
-        let n = bind.rows.len().saturating_sub(start).min(2048);
-        if n == 0 {
-            output.set_len(0);
-            return Ok(());
-        }
-        for (c, &code) in bind.col_codes.iter().enumerate() {
-            let mut col = output.flat_vector(c);
-            for r in 0..n {
-                let val = bind.rows[start + r][c].clone();
-                write_ret(code, &mut col, r, n, val)?;
+        guard("table scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
             }
-        }
-        init.cursor.store(start + n, Ordering::Relaxed);
-        output.set_len(n);
-        Ok(())
+            for (c, &code) in bind.col_codes.iter().enumerate() {
+                let mut col = output.flat_vector(c);
+                for r in 0..n {
+                    let val = neutral_to_wit(bind.rows[start + r][c].clone());
+                    write_ret(code, &mut col, r, n, val)?;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
@@ -373,8 +535,8 @@ pub fn register_tables(
             col_names,
         };
         PENDING_TABLE_PARAMS.with(|s| *s.borrow_mut() = Some(arg_codes));
-        let result =
-            con.register_table_function_with_extra_info::<WasmTable, WasmTableExtra>(&t.name, &extra);
+        let result = con
+            .register_table_function_with_extra_info::<WasmTable, WasmTableExtra>(&t.name, &extra);
         PENDING_TABLE_PARAMS.with(|s| *s.borrow_mut() = None);
         result?;
         registered += 1;
@@ -399,6 +561,22 @@ use duckdb::ffi;
 /// Per-group aggregate state: the input rows accumulated for this group, each a
 /// tuple of the function's argument values.
 type AggState = Vec<Vec<reg::DuckValue>>;
+
+/// Run an aggregate FFI-callback body, converting a panic into a DuckDB
+/// aggregate error rather than letting it unwind across the `extern "C"`
+/// boundary (which would abort the host process). Mirrors [`guard`] for the
+/// raw aggregate callbacks, which return `void` and report failure via the
+/// function info.
+///
+/// # Safety
+/// `info` must be the valid `duckdb_function_info` for the running aggregate.
+unsafe fn agg_guard(info: ffi::duckdb_function_info, what: &str, f: impl FnOnce()) {
+    if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        if let Ok(c) = CString::new(panic_msg(p, what)) {
+            ffi::duckdb_aggregate_function_set_error(info, c.as_ptr());
+        }
+    }
+}
 
 /// Per-function data DuckDB hands to the aggregate callbacks via extra-info.
 struct AggExtra {
@@ -492,7 +670,10 @@ unsafe extern "C" fn agg_state_size(_info: ffi::duckdb_function_info) -> ffi::id
     std::mem::size_of::<*mut AggState>() as ffi::idx_t
 }
 
-unsafe extern "C" fn agg_init(_info: ffi::duckdb_function_info, state: ffi::duckdb_aggregate_state) {
+unsafe extern "C" fn agg_init(
+    _info: ffi::duckdb_function_info,
+    state: ffi::duckdb_aggregate_state,
+) {
     let slot = state as *mut *mut AggState;
     *slot = Box::into_raw(Box::new(AggState::new()));
 }
@@ -502,34 +683,38 @@ unsafe extern "C" fn agg_update(
     input: ffi::duckdb_data_chunk,
     states: *mut ffi::duckdb_aggregate_state,
 ) {
-    let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const AggExtra);
-    let n = ffi::duckdb_data_chunk_get_size(input) as usize;
-    let ncols = extra.arg_codes.len();
-    let vectors: Vec<ffi::duckdb_vector> = (0..ncols)
-        .map(|c| ffi::duckdb_data_chunk_get_vector(input, c as u64))
-        .collect();
-    for row in 0..n {
-        // The state for this input row (states is parallel to the input chunk).
-        let st = *states.add(row);
-        let group = &mut **(st as *mut *mut AggState);
-        let argrow: Vec<reg::DuckValue> = (0..ncols)
-            .map(|c| read_arg_raw(extra.arg_codes[c], vectors[c], row))
+    agg_guard(info, "aggregate update", || {
+        let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const AggExtra);
+        let n = ffi::duckdb_data_chunk_get_size(input) as usize;
+        let ncols = extra.arg_codes.len();
+        let vectors: Vec<ffi::duckdb_vector> = (0..ncols)
+            .map(|c| ffi::duckdb_data_chunk_get_vector(input, c as u64))
             .collect();
-        group.push(argrow);
-    }
+        for row in 0..n {
+            // The state for this input row (states is parallel to the input chunk).
+            let st = *states.add(row);
+            let group = &mut **(st as *mut *mut AggState);
+            let argrow: Vec<reg::DuckValue> = (0..ncols)
+                .map(|c| read_arg_raw(extra.arg_codes[c], vectors[c], row))
+                .collect();
+            group.push(argrow);
+        }
+    });
 }
 
 unsafe extern "C" fn agg_combine(
-    _info: ffi::duckdb_function_info,
+    info: ffi::duckdb_function_info,
     source: *mut ffi::duckdb_aggregate_state,
     target: *mut ffi::duckdb_aggregate_state,
     count: ffi::idx_t,
 ) {
-    for i in 0..count as usize {
-        let s = &mut **(*source.add(i) as *mut *mut AggState);
-        let t = &mut **(*target.add(i) as *mut *mut AggState);
-        t.append(s);
-    }
+    agg_guard(info, "aggregate combine", || {
+        for i in 0..count as usize {
+            let s = &mut **(*source.add(i) as *mut *mut AggState);
+            let t = &mut **(*target.add(i) as *mut *mut AggState);
+            t.append(s);
+        }
+    });
 }
 
 unsafe extern "C" fn agg_finalize(
@@ -539,25 +724,27 @@ unsafe extern "C" fn agg_finalize(
     count: ffi::idx_t,
     offset: ffi::idx_t,
 ) {
-    let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const AggExtra);
-    for i in 0..count as usize {
-        let group = &mut **(*source.add(i) as *mut *mut AggState);
-        let rows = std::mem::take(group);
-        let dispatched = {
-            let mut engine = extra.engine.lock().expect("engine mutex poisoned");
-            engine.dispatch_aggregate(extra.callback_handle, rows)
-        };
-        let out = offset as usize + i;
-        let write = dispatched
-            .map_err(|e| e.to_string())
-            .and_then(|v| write_ret_raw(extra.ret_code, result, out, v));
-        if let Err(msg) = write {
-            if let Ok(c) = CString::new(msg) {
-                ffi::duckdb_aggregate_function_set_error(info, c.as_ptr());
+    agg_guard(info, "aggregate finalize", || {
+        let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const AggExtra);
+        for i in 0..count as usize {
+            let group = &mut **(*source.add(i) as *mut *mut AggState);
+            let rows = std::mem::take(group);
+            let dispatched = {
+                let mut engine = extra.engine.lock().expect("engine mutex poisoned");
+                engine.dispatch_aggregate(extra.callback_handle, rows)
+            };
+            let out = offset as usize + i;
+            let write = dispatched
+                .map_err(|e| e.to_string())
+                .and_then(|v| write_ret_raw(extra.ret_code, result, out, v));
+            if let Err(msg) = write {
+                if let Ok(c) = CString::new(msg) {
+                    ffi::duckdb_aggregate_function_set_error(info, c.as_ptr());
+                }
+                return;
             }
-            return;
         }
-    }
+    });
 }
 
 unsafe extern "C" fn agg_destroy(states: *mut ffi::duckdb_aggregate_state, count: ffi::idx_t) {
@@ -722,7 +909,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn sample_component() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/extensions/sample_extension.wasm")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../artifacts/extensions/sample_extension.wasm")
     }
 
     /// End-to-end: load the sample wasm component, register its
@@ -738,7 +926,10 @@ mod tests {
 
         let con = Connection::open_in_memory().expect("open duckdb");
         let n = register_scalars(&con, engine.clone(), &loaded.scalars).expect("register");
-        assert!(n >= 1, "expected at least one BIGINT->BIGINT scalar, got {n}");
+        assert!(
+            n >= 1,
+            "expected at least one BIGINT->BIGINT scalar, got {n}"
+        );
 
         let v: i64 = con
             .query_row("SELECT sample_plus_one(41)", [], |r| r.get(0))
@@ -796,11 +987,9 @@ mod tests {
         assert_eq!(count, 5, "sample_emit_sequence(5) emits 5 rows");
 
         let sum: i64 = con
-            .query_row(
-                "SELECT sum(value) FROM sample_emit_sequence(5)",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT sum(value) FROM sample_emit_sequence(5)", [], |r| {
+                r.get(0)
+            })
             .expect("sum query");
         assert_eq!(sum, 0 + 1 + 2 + 3 + 4, "sum of values 0..5");
     }
@@ -842,6 +1031,39 @@ mod tests {
         let v: i64 = con2
             .query_row("SELECT sample_plus_one(41)", [], |r| r.get(0))
             .expect("query on cloned connection");
-        assert_eq!(v, 42, "C-API function should be visible on a sibling connection");
+        assert_eq!(
+            v, 42,
+            "C-API function should be visible on a sibling connection"
+        );
+    }
+
+    // --- FFI panic guard ---------------------------------------------------
+
+    #[test]
+    fn guard_passes_through_ok() {
+        let r: Result<i32, Box<dyn std::error::Error>> = guard("scalar dispatch", || Ok(7));
+        assert_eq!(r.expect("ok"), 7);
+    }
+
+    #[test]
+    fn guard_passes_through_declared_error_verbatim() {
+        // A normal Err is returned unchanged — only panics get the wrapper prefix.
+        let r: Result<(), Box<dyn std::error::Error>> =
+            guard("scalar dispatch", || Err("declared failure".into()));
+        assert_eq!(r.unwrap_err().to_string(), "declared failure");
+    }
+
+    #[test]
+    fn guard_converts_panic_to_error() {
+        // The crux: a panic in the body becomes an Err (carrying the message)
+        // instead of unwinding across the C FFI boundary and aborting the host.
+        let r: Result<(), Box<dyn std::error::Error>> =
+            guard("scalar dispatch", || panic!("kaboom {}", 42));
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("internal panic in wasm scalar dispatch"),
+            "missing context, got: {msg}"
+        );
+        assert!(msg.contains("kaboom 42"), "missing payload, got: {msg}");
     }
 }

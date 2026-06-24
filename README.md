@@ -37,35 +37,48 @@ Scenario 1 is "embed WebAssembly into native DuckDB"; scenarios 2 and 3 are
 "run a WebAssembly DuckDB that hosts WebAssembly extensions" — natively and in
 the browser respectively.
 
-All three share the [`ducklink-runtime`](../../crates/ducklink-runtime) engine
-crate: the `duckdb:extension` wasmtime bindings, the neutral `reg::*`
-registration model, and the callback registry. A component therefore loads
-identically in every scenario.
+All three share the
+[`ducklink-runtime`](https://github.com/tegmentum/ducklink/tree/main/crates/ducklink-runtime)
+engine crate (consumed here as a pinned git dependency): the `duckdb:extension`
+wasmtime bindings, the neutral `reg::*` registration model, and the callback
+registry. A component therefore loads identically in every scenario.
 
 ## Layout
 
 - `src/engine.rs` — the direction-agnostic engine glue: `Engine2::load` loads a
-  component, runs its `load()`, and returns the `ScalarFunc`s it registered;
-  `Engine2::dispatch_scalar` routes a DuckDB invocation back into the component
-  through the shared callback registry. Depends only on `ducklink-runtime` +
-  wasmtime, so it builds and is checked **without** the DuckDB toolchain.
-- `src/lib.rs` — the `loadable` module (behind the `loadable` feature) holds the
-  DuckDB C-API binding: the extension entry point and the per-function
-  registration that maps a `ScalarFunc` onto a DuckDB scalar function.
+  component, runs its `load()`, and returns the functions it registered;
+  `dispatch_scalar_batch` / `dispatch_table` / `dispatch_aggregate` route a DuckDB
+  invocation back into the component through the shared callback registry. Depends
+  only on `ducklink-runtime` + wasmtime, so it builds and is checked **without**
+  the DuckDB toolchain.
+- `src/reg_duckdb.rs` — the DuckDB sink (behind the `duckdb-api` feature): turns
+  the functions a component registered into real DuckDB scalar / table / aggregate
+  functions and marshals each call across the WIT boundary. Scalars and tables use
+  the safe duckdb-rs `VScalar` / `VTab` APIs; aggregates use the raw C aggregate
+  API (duckdb-rs has no safe wrapper). Every FFI entry point is wrapped so a panic
+  surfaces as a query error rather than aborting the host process.
+- `src/lib.rs` — the `loadable` module (behind the `loadable` feature): the
+  `ducklink_init_c_api` entry point plus a built-in `ducklink_version()` scalar.
+- `tests/` — `bridge_coverage.rs` (end-to-end against an in-process DuckDB) and
+  `scenario1_corpus.rs` (the prebuilt component corpus).
+- `benches/` — criterion benchmarks of the scalar dispatch hot path
+  (`scalar_dispatch`, `scalar_query`).
 
 ## Build
 
-The default build checks the engine glue against `ducklink-runtime`:
+The `loadable` feature is on by default, so a plain release build produces the
+loadable artifact for the **native** host triple via the DuckDB Rust C Extension
+API (`build: cargo`) — exactly what the community-extensions CI runs:
 
 ```
-cargo check          # engine.rs, no DuckDB toolchain needed
+cargo build --release
 ```
 
-The loadable artifact builds for the **native** host triple via the DuckDB Rust
-C Extension API (`build: cargo`), separately from the wasm component workspace:
+To check just the direction-agnostic engine glue against `ducklink-runtime` —
+without the DuckDB toolchain — disable the default feature:
 
 ```
-cargo build --features loadable --release
+cargo check --no-default-features    # engine.rs only, no DuckDB
 ```
 
 The community-extensions CI builds it with the `rust` and `python3` toolchains.
@@ -76,19 +89,34 @@ static-musl / mingw triples.
 
 Working and verified end-to-end against a real in-process DuckDB (the `bundled`
 test): `LOAD ducklink` loads each `DUCKLINK_COMPONENTS` entry, registers its
-scalar functions, and `SELECT fn(x)` dispatches every row into the wasm
-component (`SELECT sample_plus_one(41)` → 42, computed in wasm).
+functions, and `SELECT fn(x)` dispatches every row into the wasm component
+(`SELECT sample_plus_one(41)` → 42, computed in wasm). `SELECT ducklink_version()`
+is a built-in that needs no component, so it confirms the extension loaded.
 
 Coverage:
 - **Scalar functions** — any arity, all logical types
   (`INT64`/`UINT64`/`DOUBLE`/`BOOLEAN`/`VARCHAR`/`BLOB`). One dynamic `WasmScalar`
   serves every signature (the per-function signature is fed to the static
-  `VScalar::signatures()` via a thread-local set during registration).
-- **Table functions** — verified end to end (`SELECT * FROM sample_emit_sequence(5)`
-  streams rows from the component through a `VTab` bridge).
-- **Aggregate functions** — not bridged: duckdb-rs exposes no safe aggregate API
-  (would require raw C-FFI). Components' aggregate registrations are captured but
-  not registered; this is the one known gap.
+  `VScalar::signatures()` via a thread-local set during registration). NULL
+  inputs follow SQL semantics — a row with any NULL argument yields NULL — and the
+  chunk is marshalled column-major into a reused buffer, so steady-state
+  evaluation allocates no per-row memory.
+- **Table functions** — `SELECT * FROM sample_emit_sequence(5)` streams rows from
+  the component through a `VTab` bridge.
+- **Aggregate functions** — bridged through the raw C aggregate API
+  (init/update/combine/finalize over per-group state). The loadable entry point
+  takes the `duckdb_database` DuckDB hands it and opens a raw sibling connection
+  on it, so aggregates register database-wide alongside scalars and tables. NULL
+  inputs are skipped, per SQL aggregate semantics.
+
+The bridge is covered by a bundled test suite (per-type marshalling, NULL
+propagation, multi-chunk evaluation, multi-component registration, concurrency,
+and the aggregate path) and dispatch benchmarks:
+
+```
+cargo test  --no-default-features --features bundled        # full suite
+cargo bench --no-default-features --bench scalar_dispatch   # hot-path micro-bench
+```
 
 Packaging the `loadable` cdylib (which exports `ducklink_init_c_api`) as a
 loadable `.duckdb_extension` — the metadata footer + a DuckDB-version-matched

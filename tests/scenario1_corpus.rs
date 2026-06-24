@@ -252,7 +252,8 @@ fn run_inner(case: &Case) -> Result<Option<String>, String> {
     // The duckdb-rs `Connection` (for scalars/tables/queries) and the raw
     // connection are siblings on the same db, so functions register db-wide.
     let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
-    if unsafe { duckdb::ffi::duckdb_open(std::ptr::null(), &mut db) } != duckdb::ffi::DuckDBSuccess {
+    if unsafe { duckdb::ffi::duckdb_open(std::ptr::null(), &mut db) } != duckdb::ffi::DuckDBSuccess
+    {
         return Err("duckdb_open failed".into());
     }
     let con = unsafe { Connection::open_from_raw(db) }.map_err(|e| format!("open: {e}"))?;

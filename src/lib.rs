@@ -25,13 +25,14 @@ pub mod reg_duckdb;
 #[cfg(feature = "loadable")]
 mod loadable {
     use std::error::Error;
+    use std::ffi::CString;
     use std::sync::{Arc, Mutex};
 
     use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeId};
+    use duckdb::ffi;
     use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
     use duckdb::vtab::arrow::WritableVector;
     use duckdb::Connection;
-    use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 
     use crate::engine::Engine2;
     use crate::reg_duckdb::{component_specs_from_env, register_components};
@@ -51,7 +52,7 @@ mod loadable {
             output: &mut dyn WritableVector,
         ) -> Result<(), Box<dyn Error>> {
             let len = input.len();
-            let mut out = output.flat_vector();
+            let out = output.flat_vector();
             let version = concat!("ducklink ", env!("CARGO_PKG_VERSION"));
             for i in 0..len {
                 out.insert(i, version);
@@ -67,12 +68,41 @@ mod loadable {
         }
     }
 
-    /// Loadable-extension entry point. DuckDB calls this `ducklink_init_c_api`
-    /// when `LOAD ducklink` runs.
+    /// Loadable-extension entry point, named `ducklink_init_c_api` as DuckDB
+    /// expects. Mirrors what the `duckdb_entrypoint_c_api` macro generates, but
+    /// keeps the `duckdb_database` handle DuckDB hands us so it can open BOTH a
+    /// duckdb-rs [`Connection`] (the safe scalar / table registration path) and a
+    /// raw sibling `duckdb_connection` (for aggregates, which duckdb-rs has no
+    /// safe API to register). Registrations are database-wide, so every
+    /// connection — including the user's — sees the functions.
+    ///
+    /// # Safety
+    /// Called by DuckDB during `LOAD` with a valid `info` / `access` pair.
+    #[no_mangle]
+    pub unsafe extern "C" fn ducklink_init_c_api(
+        info: ffi::duckdb_extension_info,
+        access: *const ffi::duckdb_extension_access,
+    ) -> bool {
+        match init(info, access) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                // Surface the failure to DuckDB as a load error rather than just
+                // returning false with no explanation.
+                if let Some(set_error) = (*access).set_error {
+                    if let Ok(c) = CString::new(e.to_string()) {
+                        set_error(info, c.as_ptr());
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// The fallible body of [`ducklink_init_c_api`].
     ///
     /// Loads every component named in the `DUCKLINK_COMPONENTS` environment
-    /// variable (a `:`-separated list of `name=path` or `path`) and registers
-    /// their scalar functions into the catalog, so they are usable from SQL:
+    /// variable (a `:`-separated list of `name=path` or `path`) and registers the
+    /// scalar / table / aggregate functions it declares:
     ///
     /// ```sh
     /// DUCKLINK_COMPONENTS=sample=/path/sample_extension.wasm \
@@ -81,24 +111,61 @@ mod loadable {
     ///
     /// The shared `Engine2` is kept alive by the `Arc` cloned into each
     /// registered function's state.
-    #[duckdb_entrypoint_c_api(ext_name = "ducklink", min_duckdb_version = "v1.5.4")]
-    pub fn ducklink_init(con: Connection) -> Result<(), Box<dyn Error>> {
+    ///
+    /// # Safety
+    /// `info` / `access` must be the valid handles DuckDB passes to the entry
+    /// point.
+    unsafe fn init(
+        info: ffi::duckdb_extension_info,
+        access: *const ffi::duckdb_extension_access,
+    ) -> Result<bool, Box<dyn Error>> {
+        // Populate the loadable C-API function-pointer table. Returns false on an
+        // API-version mismatch, in which case loading aborts cleanly.
+        if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.4").map_err(stringify)? {
+            return Ok(false);
+        }
+        let get_database = (*access)
+            .get_database
+            .ok_or_else(|| stringify("get_database is null in duckdb_extension_access"))?;
+        let db_ptr = get_database(info);
+        if db_ptr.is_null() {
+            return Ok(false);
+        }
+        let db: ffi::duckdb_database = *db_ptr;
+
+        // duckdb-rs Connection for the safe scalar / table registration paths.
+        let con = Connection::open_from_raw(db.cast())?;
+        // A raw sibling connection on the SAME database for aggregates (no safe
+        // duckdb-rs wrapper exists). Registrations are catalog-wide, so it only
+        // needs to outlive the registration call.
+        let mut raw_con: ffi::duckdb_connection = std::ptr::null_mut();
+        let have_raw =
+            ffi::duckdb_connect(db, &mut raw_con) == ffi::DuckDBSuccess && !raw_con.is_null();
+
         // Always-available built-in, so the extension is usable (and testable)
         // even before any component is configured.
         con.register_scalar_function::<DucklinkVersion>("ducklink_version")
             .map_err(stringify)?;
         let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
         let specs = component_specs_from_env();
-        let registered =
-            // No raw connection here (the entry point only receives a duckdb-rs
-            // Connection), so aggregate functions are skipped with a note; scalar
-            // and table functions register fine.
-            register_components(&con, None, engine, &specs).map_err(stringify)?;
+        let registered = register_components(&con, have_raw.then_some(raw_con), engine, &specs)
+            .map_err(stringify)?;
+
+        // The aggregate functions are now in the database catalog; the sibling
+        // connection has served its purpose.
+        if !raw_con.is_null() {
+            ffi::duckdb_disconnect(&mut raw_con);
+        }
         eprintln!(
-            "[ducklink] loaded {} component(s); registered {registered} scalar function(s)",
-            specs.len()
+            "[ducklink] loaded {} component(s); registered {registered} function(s){}",
+            specs.len(),
+            if have_raw {
+                ""
+            } else {
+                " (no raw connection; aggregates skipped)"
+            }
         );
-        Ok(())
+        Ok(true)
     }
 
     fn stringify(err: impl std::fmt::Display) -> Box<dyn Error> {

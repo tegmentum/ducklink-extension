@@ -21,9 +21,7 @@ use std::sync::{Arc, Mutex};
 use duckdb::Connection;
 
 use ducklink::engine::Engine2;
-use ducklink::reg_duckdb::{
-    register_components, register_scalars, register_tables, ComponentSpec,
-};
+use ducklink::reg_duckdb::{register_components, register_scalars, register_tables, ComponentSpec};
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -118,11 +116,7 @@ fn scalar_int64_value_and_type() {
     // Column TYPE is BIGINT.
     let ty: String = db
         .con
-        .query_row(
-            "SELECT typeof(sample_plus_one(1))",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT typeof(sample_plus_one(1))", [], |r| r.get(0))
         .expect("typeof");
     assert_eq!(ty, "BIGINT");
 }
@@ -199,11 +193,9 @@ fn scalar_float64_value_and_type() {
 
     let ty: String = db
         .con
-        .query_row(
-            "SELECT typeof(haversine_km(1.0, 2.0, 3.0, 4.0))",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT typeof(haversine_km(1.0, 2.0, 3.0, 4.0))", [], |r| {
+            r.get(0)
+        })
         .expect("typeof");
     assert_eq!(ty, "DOUBLE");
 }
@@ -328,9 +320,11 @@ fn table_large_chunked() {
     // sum(0..5000) = 5000*4999/2.
     let sum: i64 = db
         .con
-        .query_row("SELECT sum(value) FROM sample_emit_sequence(5000)", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT sum(value) FROM sample_emit_sequence(5000)",
+            [],
+            |r| r.get(0),
+        )
         .expect("sum");
     assert_eq!(sum, 5000 * 4999 / 2);
 
@@ -398,7 +392,10 @@ fn aggregate_group_by_per_group_state() {
         .expect("query_map")
         .map(|r| r.unwrap())
         .collect();
-    assert_eq!(rows, vec![("a".to_string(), 1.714286), ("b".to_string(), 3.2)]);
+    assert_eq!(
+        rows,
+        vec![("a".to_string(), 1.714286), ("b".to_string(), 3.2)]
+    );
 }
 
 #[test]
@@ -423,11 +420,9 @@ fn aggregate_large_input_multi_chunk() {
     // chunks (and DuckDB may parallelize -> `combine`). sum(1..=10000).
     let sum: i64 = db
         .con
-        .query_row(
-            "SELECT sample_sum(i) FROM range(1, 10001) t(i)",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT sample_sum(i) FROM range(1, 10001) t(i)", [], |r| {
+            r.get(0)
+        })
         .expect("sum");
     assert_eq!(sum, 10000 * 10001 / 2);
 }
@@ -474,7 +469,10 @@ fn aggregate_varchar_roundtrip_through_scalar() {
         .expect("query");
     assert!(has_apple, "inserted item present");
     assert!(has_banana, "inserted item present");
-    assert!(!has_durian, "absent item reported absent (no false negatives)");
+    assert!(
+        !has_durian,
+        "absent item reported absent (no false negatives)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -501,9 +499,11 @@ fn multiple_components_one_db() {
     // And a single statement using both.
     let combined: bool = db
         .con
-        .query_row("SELECT rot13('x') = 'k' AND slugify('A B') = 'a-b'", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT rot13('x') = 'k' AND slugify('A B') = 'a-b'",
+            [],
+            |r| r.get(0),
+        )
         .expect("combined");
     assert!(combined);
 }
@@ -617,9 +617,7 @@ fn dispatch_error_surfaces_as_duckdb_error() {
 #[test]
 fn concurrent_scalar_under_threads() {
     let (db, _) = setup("sample_extension");
-    db.con
-        .execute_batch("SET threads=4;")
-        .expect("set threads");
+    db.con.execute_batch("SET threads=4;").expect("set threads");
 
     // A large scalar query so DuckDB schedules the per-row dispatch across
     // worker threads (validates Mutex<Engine2> under parallelism).
@@ -638,9 +636,7 @@ fn concurrent_scalar_under_threads() {
 #[test]
 fn concurrent_grouped_aggregate_under_threads() {
     let (db, _) = setup("sample_extension");
-    db.con
-        .execute_batch("SET threads=4;")
-        .expect("set threads");
+    db.con.execute_batch("SET threads=4;").expect("set threads");
 
     // Many groups over many rows under parallelism: exercises per-group state
     // plus `combine` when DuckDB merges partial aggregates across threads.
@@ -700,4 +696,229 @@ fn register_components_all_kinds_end_to_end() {
         })
         .expect("agg");
     assert_eq!(a, 1 + 2 + 3 + 4);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Scalar hot path — column-major reads, NULL-input validity, and the
+//     per-thread scratch reused/resized across chunks. Targets the marshalling
+//     rewrite directly: prior tests mostly evaluate single-value scalars, which
+//     never cross a chunk boundary or exercise a real input validity mask.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scalar_multichunk_reuses_scratch() {
+    let (db, _) = setup("sample_extension");
+    // range(5000) spans three STANDARD_VECTOR_SIZE chunks (2048 + 2048 + 904),
+    // so the per-thread scratch is reused and the final partial chunk resizes
+    // it. Result must still be exact end to end.
+    let sum: i64 = db
+        .con
+        .query_row(
+            "SELECT sum(sample_plus_one(i)) FROM range(5000) t(i)",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    let expected: i64 = (0..5000i64).map(|i| i + 1).sum();
+    assert_eq!(sum, expected);
+}
+
+#[test]
+fn scalar_column_scattered_nulls() {
+    let (db, _) = setup("sample_extension");
+    // A real input column (not a constant-folded NULL) with NULLs interleaved
+    // exercises the column-major read's per-row validity check on the numeric
+    // path: NULL rows stay NULL, others map to i + 1, in order.
+    let rows: Vec<Option<i64>> = db
+        .con
+        .prepare(
+            "SELECT sample_plus_one(v) FROM \
+             (SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE i END AS v FROM range(9) t(i))",
+        )
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query_map")
+        .collect::<Result<Vec<Option<i64>>, duckdb::Error>>()
+        .expect("collect");
+    let expected: Vec<Option<i64>> = (0..9i64)
+        .map(|i| if i % 3 == 0 { None } else { Some(i + 1) })
+        .collect();
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn scalar_text_input_null_is_safe() {
+    let (db, _) = setup("isin");
+    // A VARCHAR column with a NULL row must NOT be read as a string for that row
+    // (its duckdb_string_t slot holds no valid pointer). The bridge marshals it
+    // as WitVal::Null; the validator is applied to the real strings only. This
+    // is the regression guard for the TEXT/BLOB validity check.
+    let rows: Vec<Option<bool>> = db
+        .con
+        .prepare(
+            "SELECT isin_validate(s) FROM \
+             (VALUES (1, 'US0378331005'), (2, NULL), (3, 'not an isin')) t(k, s) ORDER BY k",
+        )
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query_map")
+        .collect::<Result<Vec<Option<bool>>, duckdb::Error>>()
+        .expect("collect");
+    assert_eq!(rows, vec![Some(true), None, Some(false)]);
+}
+
+#[test]
+fn scalar_shared_scratch_arity_changes() {
+    // Two scalars of different arity (sample_plus_one: 1 arg, haversine_km: 4
+    // args) evaluated in the same query over multiple chunks. They share the
+    // per-thread SCALAR_SCRATCH, so it is resized between arities every chunk.
+    let (db, _) = setup_with(&["sample_extension", "haversine"]);
+    let (sum, hav): (i64, f64) = db
+        .con
+        .query_row(
+            "SELECT sum(sample_plus_one(i)), \
+                    sum(haversine_km(i * 1.0, i * 1.0, i * 1.0, i * 1.0)) \
+             FROM range(3000) t(i)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("query");
+    assert_eq!(sum, (0..3000i64).map(|i| i + 1).sum::<i64>());
+    // Distance between identical points is zero for every row.
+    assert!(
+        hav.abs() < 1e-6,
+        "haversine of identical points is ~0, got {hav}"
+    );
+}
+
+#[test]
+fn scalar_empty_chunk_no_panic() {
+    let (db, _) = setup("sample_extension");
+    // A scalar whose input chunk is empty (filtered to zero rows) must not panic
+    // on the zero-length scratch / dispatch.
+    let n: i64 = db
+        .con
+        .query_row(
+            "SELECT count(*) FROM (SELECT sample_plus_one(i) FROM range(5) t(i) WHERE i > 100)",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    assert_eq!(n, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 11. NULL semantics across paths + marshalling edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aggregate_skips_null_inputs() {
+    let (db, _) = setup("sample_extension");
+    // SQL aggregates ignore NULL inputs: SUM of {1, 2, NULL, 4} is 7 — not an
+    // error, and not a NULL-poisoned total. Exercises the raw-C aggregate update
+    // path over a NULL-bearing column.
+    let sum: Option<i64> = db
+        .con
+        .query_row(
+            "SELECT sample_sum(v::BIGINT) FROM (VALUES (1), (2), (NULL), (4)) t(v)",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    assert_eq!(sum, Some(7));
+}
+
+#[test]
+fn scalar_multiarg_partial_null_is_null() {
+    let (db, _) = setup("haversine");
+    // A row where ANY argument is NULL yields NULL even if the other three are
+    // valid — `null_mask` ORs every input column.
+    let rows: Vec<Option<f64>> = db
+        .con
+        .prepare(
+            "SELECT haversine_km(lat1, 0.0, 0.0, 0.0) FROM \
+             (SELECT CASE WHEN i = 1 THEN NULL ELSE 0.0 END AS lat1 FROM range(3) t(i))",
+        )
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query_map")
+        .collect::<Result<Vec<Option<f64>>, duckdb::Error>>()
+        .expect("collect");
+    assert_eq!(rows, vec![Some(0.0), None, Some(0.0)]);
+}
+
+#[test]
+fn scalar_all_null_column() {
+    let (db, _) = setup("sample_extension");
+    // Every row NULL: the whole output column is NULL (validity all-zero, so
+    // every row hits null_mask).
+    let rows: Vec<Option<i64>> = db
+        .con
+        .prepare("SELECT sample_plus_one(v) FROM (SELECT CAST(NULL AS BIGINT) AS v FROM range(4))")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query_map")
+        .collect::<Result<Vec<Option<i64>>, duckdb::Error>>()
+        .expect("collect");
+    assert_eq!(rows, vec![None, None, None, None]);
+}
+
+#[test]
+fn scalar_large_text_roundtrip() {
+    let (db, _) = setup("rot13");
+    // A ~10 KB string exercises the heap-allocated TEXT marshalling path, well
+    // past any inlined-string representation. rot13 is its own inverse.
+    let s: String = db
+        .con
+        .query_row("SELECT rot13(rot13(repeat('Hello', 2000)))", [], |r| {
+            r.get(0)
+        })
+        .expect("query");
+    assert_eq!(s.len(), 10_000);
+    assert_eq!(s, "Hello".repeat(2000));
+}
+
+#[test]
+fn scalar_empty_string_distinct_from_null() {
+    let (db, _) = setup("rot13");
+    // An empty (but non-NULL) string round-trips as '', NOT confused with NULL by
+    // the TEXT null-placeholder path; the genuine NULL row still yields NULL.
+    let rows: Vec<Option<String>> = db
+        .con
+        .prepare("SELECT rot13(s) FROM (VALUES (''), ('abc'), (NULL)) t(s)")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query_map")
+        .collect::<Result<Vec<Option<String>>, duckdb::Error>>()
+        .expect("collect");
+    assert_eq!(
+        rows,
+        vec![Some(String::new()), Some("nop".to_string()), None]
+    );
+}
+
+#[test]
+fn scalar_text_lengths_and_unicode_roundtrip() {
+    let (db, _) = setup("rot13");
+    // Cover the duckdb_string_t inline (<= 12 bytes) vs pointer (> 12 bytes)
+    // representations and multi-byte UTF-8. rot13 is its own inverse for every
+    // input (non-letters pass through unchanged), so a double application must
+    // reproduce the bytes exactly.
+    let cases = vec![
+        String::new(),
+        "a".to_string(),
+        "twelve bytes".to_string(),   // exactly 12 -> inline boundary
+        "thirteen bytes".to_string(), // 14 -> pointer representation
+        "héllo wörld ☃ ".to_string(), // multi-byte UTF-8
+        "Z".repeat(5000),             // large -> pointer
+    ];
+    for s in &cases {
+        let got: String = db
+            .con
+            .query_row("SELECT rot13(rot13(s)) FROM (SELECT ? AS s)", [s], |r| {
+                r.get(0)
+            })
+            .expect("query");
+        assert_eq!(&got, s, "round-trip failed for input of len {}", s.len());
+    }
 }

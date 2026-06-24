@@ -261,8 +261,14 @@ impl Engine2 {
         &mut self,
         callback_handle: u32,
         base_row_index: u64,
-        rows: Vec<Vec<reg::DuckValue>>,
-    ) -> Result<Vec<reg::DuckValue>> {
+        wit_rows: &Vec<Vec<extension_types::Duckvalue>>,
+    ) -> Result<Vec<extension_types::Duckvalue>> {
+        // Hot path: the chunk arrives already in the WIT value type (the bridge's
+        // read_arg produces it directly) and is borrowed, not consumed, so the
+        // caller reuses one scratch buffer across chunks -- no per-chunk
+        // Vec<Vec<>> allocation. The canonical-ABI lowering reads `wit_rows`
+        // straight into the guest; the result comes back in the WIT type too, so
+        // nothing on this path rebuilds or converts the value vectors.
         let entry = {
             let registry = self.callbacks.lock().expect("callback registry poisoned");
             registry
@@ -273,18 +279,13 @@ impl Engine2 {
             .instances
             .get_mut(&entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
-        let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
-            .into_iter()
-            .map(|row| row.into_iter().map(neutral_to_wit).collect())
-            .collect();
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
             iswindow: false,
         };
-        let result = instance
-            .dispatch_scalar_batch(entry.dispatcher_handle, &wit_rows, ctx)
-            .map_err(|e| anyhow!("scalar batch dispatch failed: {e:?}"))?;
-        Ok(result.into_iter().map(wit_to_neutral).collect())
+        instance
+            .dispatch_scalar_batch(entry.dispatcher_handle, wit_rows, ctx)
+            .map_err(|e| anyhow!("scalar batch dispatch failed: {e:?}"))
     }
 
     /// Invoke a component table function with the given call arguments, returning
