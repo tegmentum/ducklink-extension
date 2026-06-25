@@ -348,25 +348,68 @@ impl Engine2 {
 }
 
 fn neutral_to_wit(v: reg::DuckValue) -> extension_types::Duckvalue {
+    use extension_types::Duckvalue as W;
     match v {
-        reg::DuckValue::Null => extension_types::Duckvalue::Null,
-        reg::DuckValue::Boolean(b) => extension_types::Duckvalue::Boolean(b),
-        reg::DuckValue::Int64(i) => extension_types::Duckvalue::Int64(i),
-        reg::DuckValue::Uint64(u) => extension_types::Duckvalue::Uint64(u),
-        reg::DuckValue::Float64(f) => extension_types::Duckvalue::Float64(f),
-        reg::DuckValue::Text(s) => extension_types::Duckvalue::Text(s),
-        reg::DuckValue::Blob(b) => extension_types::Duckvalue::Blob(b),
+        reg::DuckValue::Null => W::Null,
+        reg::DuckValue::Boolean(b) => W::Boolean(b),
+        reg::DuckValue::Int64(i) => W::Int64(i),
+        reg::DuckValue::Uint64(u) => W::Uint64(u),
+        reg::DuckValue::Float64(f) => W::Float64(f),
+        reg::DuckValue::Text(s) => W::Text(s),
+        reg::DuckValue::Blob(b) => W::Blob(b),
+        reg::DuckValue::Int8(i) => W::Int8(i),
+        reg::DuckValue::Int16(i) => W::Int16(i),
+        reg::DuckValue::Int32(i) => W::Int32(i),
+        reg::DuckValue::Uint8(u) => W::Uint8(u),
+        reg::DuckValue::Uint16(u) => W::Uint16(u),
+        reg::DuckValue::Uint32(u) => W::Uint32(u),
+        reg::DuckValue::Float32(f) => W::Float32(f),
+        reg::DuckValue::Date(d) => W::Date(d),
+        reg::DuckValue::Time(t) => W::Time(t),
+        reg::DuckValue::Timestamp(t) => W::Timestamp(t),
+        reg::DuckValue::Timestamptz(t) => W::Timestamptz(t),
+        reg::DuckValue::Decimal { lower, upper, width, scale } => {
+            W::Decimal(extension_types::Decimalvalue { lower, upper, width, scale })
+        }
+        reg::DuckValue::Interval { months, days, micros } => {
+            W::Interval(extension_types::Intervalvalue { months, days, micros })
+        }
+        reg::DuckValue::Uuid { hi, lo } => W::Uuid(extension_types::Uuidvalue { hi, lo }),
     }
 }
 
 fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
+    use extension_types::Duckvalue as W;
     match v {
-        extension_types::Duckvalue::Null => reg::DuckValue::Null,
-        extension_types::Duckvalue::Boolean(b) => reg::DuckValue::Boolean(b),
-        extension_types::Duckvalue::Int64(i) => reg::DuckValue::Int64(i),
-        extension_types::Duckvalue::Uint64(u) => reg::DuckValue::Uint64(u),
-        extension_types::Duckvalue::Float64(f) => reg::DuckValue::Float64(f),
-        extension_types::Duckvalue::Text(s) => reg::DuckValue::Text(s),
-        extension_types::Duckvalue::Blob(b) => reg::DuckValue::Blob(b),
+        W::Null => reg::DuckValue::Null,
+        W::Boolean(b) => reg::DuckValue::Boolean(b),
+        W::Int64(i) => reg::DuckValue::Int64(i),
+        W::Uint64(u) => reg::DuckValue::Uint64(u),
+        W::Float64(f) => reg::DuckValue::Float64(f),
+        W::Text(s) => reg::DuckValue::Text(s),
+        W::Blob(b) => reg::DuckValue::Blob(b),
+        W::Int8(i) => reg::DuckValue::Int8(i),
+        W::Int16(i) => reg::DuckValue::Int16(i),
+        W::Int32(i) => reg::DuckValue::Int32(i),
+        W::Uint8(u) => reg::DuckValue::Uint8(u),
+        W::Uint16(u) => reg::DuckValue::Uint16(u),
+        W::Uint32(u) => reg::DuckValue::Uint32(u),
+        W::Float32(f) => reg::DuckValue::Float32(f),
+        W::Date(d) => reg::DuckValue::Date(d),
+        W::Time(t) => reg::DuckValue::Time(t),
+        W::Timestamp(t) => reg::DuckValue::Timestamp(t),
+        W::Timestamptz(t) => reg::DuckValue::Timestamptz(t),
+        W::Decimal(d) => reg::DuckValue::Decimal {
+            lower: d.lower,
+            upper: d.upper,
+            width: d.width,
+            scale: d.scale,
+        },
+        W::Interval(iv) => reg::DuckValue::Interval {
+            months: iv.months,
+            days: iv.days,
+            micros: iv.micros,
+        },
+        W::Uuid(u) => reg::DuckValue::Uuid { hi: u.hi, lo: u.lo },
     }
 }

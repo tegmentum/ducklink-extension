@@ -77,16 +77,36 @@ const T_BOOL: u8 = 3;
 const T_TEXT: u8 = 4;
 const T_BLOB: u8 = 5;
 
-/// Map a neutral logical type to a bridge type code. All current `reg`
-/// logical types are supported.
+/// Map a neutral logical type to a bridge type code.
+///
+/// The native bridge's scalar fast path exchanges six physical type codes. The
+/// `reg::LogicalType` enum carries finer-grained DuckDB types (narrower ints,
+/// temporal, decimal, uuid); for SQL-signature purposes those are widened to the
+/// nearest supported code so a function declaring such an argument still
+/// registers (rather than panicking on a non-exhaustive match). Signed/temporal
+/// types -> BIGINT, unsigned -> UBIGINT, floats -> DOUBLE, decimal/uuid -> TEXT.
 fn type_code(lt: reg::LogicalType) -> u8 {
     match lt {
-        reg::LogicalType::Int64 => T_I64,
-        reg::LogicalType::Uint64 => T_U64,
-        reg::LogicalType::Float64 => T_F64,
         reg::LogicalType::Boolean => T_BOOL,
         reg::LogicalType::Text => T_TEXT,
         reg::LogicalType::Blob => T_BLOB,
+        // Signed integers + temporal types fit a 64-bit signed slot.
+        reg::LogicalType::Int8
+        | reg::LogicalType::Int16
+        | reg::LogicalType::Int32
+        | reg::LogicalType::Int64
+        | reg::LogicalType::Date
+        | reg::LogicalType::Time
+        | reg::LogicalType::Timestamp
+        | reg::LogicalType::Timestamptz => T_I64,
+        // Unsigned integers fit a 64-bit unsigned slot.
+        reg::LogicalType::Uint8
+        | reg::LogicalType::Uint16
+        | reg::LogicalType::Uint32
+        | reg::LogicalType::Uint64 => T_U64,
+        reg::LogicalType::Float32 | reg::LogicalType::Float64 => T_F64,
+        // No native physical slot in the bridge; carried as text.
+        reg::LogicalType::Decimal | reg::LogicalType::Interval | reg::LogicalType::Uuid => T_TEXT,
     }
 }
 
@@ -185,6 +205,7 @@ fn read_col_into(
 /// path skips it entirely -- `read_arg` yields `WitVal` and the dispatcher
 /// returns `WitVal`, so nothing on that path touches `reg::DuckValue`.
 fn neutral_to_wit(v: reg::DuckValue) -> WitVal {
+    use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types as wt;
     match v {
         reg::DuckValue::Null => WitVal::Null,
         reg::DuckValue::Boolean(b) => WitVal::Boolean(b),
@@ -193,6 +214,24 @@ fn neutral_to_wit(v: reg::DuckValue) -> WitVal {
         reg::DuckValue::Float64(f) => WitVal::Float64(f),
         reg::DuckValue::Text(s) => WitVal::Text(s),
         reg::DuckValue::Blob(b) => WitVal::Blob(b),
+        reg::DuckValue::Int8(i) => WitVal::Int8(i),
+        reg::DuckValue::Int16(i) => WitVal::Int16(i),
+        reg::DuckValue::Int32(i) => WitVal::Int32(i),
+        reg::DuckValue::Uint8(u) => WitVal::Uint8(u),
+        reg::DuckValue::Uint16(u) => WitVal::Uint16(u),
+        reg::DuckValue::Uint32(u) => WitVal::Uint32(u),
+        reg::DuckValue::Float32(f) => WitVal::Float32(f),
+        reg::DuckValue::Date(d) => WitVal::Date(d),
+        reg::DuckValue::Time(t) => WitVal::Time(t),
+        reg::DuckValue::Timestamp(t) => WitVal::Timestamp(t),
+        reg::DuckValue::Timestamptz(t) => WitVal::Timestamptz(t),
+        reg::DuckValue::Decimal { lower, upper, width, scale } => {
+            WitVal::Decimal(wt::Decimalvalue { lower, upper, width, scale })
+        }
+        reg::DuckValue::Interval { months, days, micros } => {
+            WitVal::Interval(wt::Intervalvalue { months, days, micros })
+        }
+        reg::DuckValue::Uuid { hi, lo } => WitVal::Uuid(wt::Uuidvalue { hi, lo }),
     }
 }
 
@@ -1066,4 +1105,78 @@ mod tests {
         );
         assert!(msg.contains("kaboom 42"), "missing payload, got: {msg}");
     }
+
+    // --- mutation-testing survivors (cargo-mutants on reg_duckdb.rs) --------
+    // The end-to-end sample component is BIGINT-only, so the per-type marshalling
+    // arms (and the type<->code maps) were untested -- cargo-mutants survived
+    // mutations that delete/alter them. These direct unit tests pin the mapping
+    // and the NULL-bitmask logic, killing those survivors without an FFI fixture.
+
+    /// Kills `type_code -> 0` and exercises every `reg::LogicalType` arm: each
+    /// logical type must widen to its documented bridge code.
+    #[test]
+    fn type_code_maps_every_logical_type() {
+        use reg::LogicalType as L;
+        // Signed + temporal -> BIGINT slot.
+        for lt in [L::Int8, L::Int16, L::Int32, L::Int64, L::Date, L::Time, L::Timestamp, L::Timestamptz] {
+            assert_eq!(type_code(lt), T_I64, "{lt:?} should map to T_I64");
+        }
+        // Unsigned -> UBIGINT slot.
+        for lt in [L::Uint8, L::Uint16, L::Uint32, L::Uint64] {
+            assert_eq!(type_code(lt), T_U64, "{lt:?} should map to T_U64");
+        }
+        assert_eq!(type_code(L::Float32), T_F64);
+        assert_eq!(type_code(L::Float64), T_F64);
+        assert_eq!(type_code(L::Boolean), T_BOOL);
+        assert_eq!(type_code(L::Text), T_TEXT);
+        assert_eq!(type_code(L::Blob), T_BLOB);
+        // No native slot -> carried as text.
+        assert_eq!(type_code(L::Decimal), T_TEXT);
+        assert_eq!(type_code(L::Interval), T_TEXT);
+        assert_eq!(type_code(L::Uuid), T_TEXT);
+        // The codes are distinct (so a single-constant mutant can't pass).
+        let codes = [T_I64, T_U64, T_F64, T_BOOL, T_TEXT, T_BLOB];
+        for (a, x) in codes.iter().enumerate() {
+            for (b, y) in codes.iter().enumerate() {
+                assert_eq!(a == b, x == y, "bridge type codes must be distinct");
+            }
+        }
+    }
+
+    /// Kills the `delete match arm T_*` survivors in `logical_type`: each bridge
+    /// code must resolve to the right DuckDB LogicalTypeId.
+    #[test]
+    fn logical_type_maps_every_code() {
+        assert_eq!(logical_type(T_I64).id(), LogicalTypeId::Bigint);
+        assert_eq!(logical_type(T_U64).id(), LogicalTypeId::UBigint);
+        assert_eq!(logical_type(T_F64).id(), LogicalTypeId::Double);
+        assert_eq!(logical_type(T_BOOL).id(), LogicalTypeId::Boolean);
+        assert_eq!(logical_type(T_TEXT).id(), LogicalTypeId::Varchar);
+        assert_eq!(logical_type(T_BLOB).id(), LogicalTypeId::Blob);
+    }
+
+    /// Kills the `read_col_into` is-null-predicate survivors (the `&&`/`!`
+    /// mutations at the NULL detection in TEXT/BLOB column reads). `row_valid`
+    /// reads a DuckDB validity bitmask; a 0-bit means NULL, a 1-bit means valid.
+    #[test]
+    fn row_valid_reads_validity_bitmask() {
+        // Mask: rows 0,2,3 valid (bits 0,2,3 set), row 1 NULL (bit 1 clear).
+        // Bit 65 set, bit 64 clear -> exercises the second u64 word (r/64, r%64).
+        let mask: [u64; 2] = [0b1101, 0b10];
+        let p = mask.as_ptr();
+        unsafe {
+            assert!(row_valid(p, 0), "bit 0 set -> valid");
+            assert!(!row_valid(p, 1), "bit 1 clear -> NULL");
+            assert!(row_valid(p, 2), "bit 2 set -> valid");
+            assert!(row_valid(p, 3), "bit 3 set -> valid");
+            assert!(!row_valid(p, 64), "bit 64 clear -> NULL (second word)");
+            assert!(row_valid(p, 65), "bit 65 set -> valid (second word)");
+        }
+    }
+
+    // NOTE: the `param_to_neutral` per-type arm survivors are NOT killed here:
+    // `duckdb::vtab::Value` is an opaque FFI wrapper with no public constructors,
+    // so its arms can only be exercised through a real table-function call with
+    // typed parameters (an end-to-end fixture with a multi-type component), not a
+    // pure unit test. Left documented rather than forced.
 }
