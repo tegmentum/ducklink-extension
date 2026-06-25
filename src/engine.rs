@@ -375,6 +375,9 @@ fn neutral_to_wit(v: reg::DuckValue) -> extension_types::Duckvalue {
             W::Interval(extension_types::Intervalvalue { months, days, micros })
         }
         reg::DuckValue::Uuid { hi, lo } => W::Uuid(extension_types::Uuidvalue { hi, lo }),
+        reg::DuckValue::Complex { type_expr, json } => {
+            W::Complex(extension_types::Complexvalue { type_expr, json })
+        }
     }
 }
 
@@ -411,5 +414,9 @@ fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
             micros: iv.micros,
         },
         W::Uuid(u) => reg::DuckValue::Uuid { hi: u.hi, lo: u.lo },
+        W::Complex(c) => reg::DuckValue::Complex {
+            type_expr: c.type_expr,
+            json: c.json,
+        },
     }
 }

@@ -85,7 +85,7 @@ const T_BLOB: u8 = 5;
 /// nearest supported code so a function declaring such an argument still
 /// registers (rather than panicking on a non-exhaustive match). Signed/temporal
 /// types -> BIGINT, unsigned -> UBIGINT, floats -> DOUBLE, decimal/uuid -> TEXT.
-fn type_code(lt: reg::LogicalType) -> u8 {
+fn type_code(lt: &reg::LogicalType) -> u8 {
     match lt {
         reg::LogicalType::Boolean => T_BOOL,
         reg::LogicalType::Text => T_TEXT,
@@ -107,6 +107,8 @@ fn type_code(lt: reg::LogicalType) -> u8 {
         reg::LogicalType::Float32 | reg::LogicalType::Float64 => T_F64,
         // No native physical slot in the bridge; carried as text.
         reg::LogicalType::Decimal | reg::LogicalType::Interval | reg::LogicalType::Uuid => T_TEXT,
+        // ESCAPE-HATCH: the bridge has no nested-type slot; carry as text.
+        reg::LogicalType::Complex(_) => T_TEXT,
     }
 }
 
@@ -232,6 +234,9 @@ fn neutral_to_wit(v: reg::DuckValue) -> WitVal {
             WitVal::Interval(wt::Intervalvalue { months, days, micros })
         }
         reg::DuckValue::Uuid { hi, lo } => WitVal::Uuid(wt::Uuidvalue { hi, lo }),
+        reg::DuckValue::Complex { type_expr, json } => {
+            WitVal::Complex(wt::Complexvalue { type_expr, json })
+        }
     }
 }
 
@@ -411,8 +416,8 @@ pub fn register_scalars(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for f in scalars {
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(a.logical)).collect();
-        let ret_code = type_code(f.returns);
+        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        let ret_code = type_code(&f.returns);
         let state = WasmScalarState {
             callback_handle: f.callback_handle,
             engine: engine.clone(),
@@ -563,8 +568,8 @@ pub fn register_tables(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for t in tables {
-        let arg_codes: Vec<u8> = t.arguments.iter().map(|a| type_code(a.logical)).collect();
-        let col_codes: Vec<u8> = t.columns.iter().map(|c| type_code(c.logical)).collect();
+        let arg_codes: Vec<u8> = t.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        let col_codes: Vec<u8> = t.columns.iter().map(|c| type_code(&c.logical)).collect();
         let col_names: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
         let extra = WasmTableExtra {
             callback_handle: t.callback_handle,
@@ -815,8 +820,8 @@ pub unsafe fn register_aggregates(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for f in aggregates {
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(a.logical)).collect();
-        let ret_code = type_code(f.returns);
+        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        let ret_code = type_code(&f.returns);
 
         let func = ffi::duckdb_create_aggregate_function();
         let cname = CString::new(f.name.as_str())
@@ -1119,21 +1124,21 @@ mod tests {
         use reg::LogicalType as L;
         // Signed + temporal -> BIGINT slot.
         for lt in [L::Int8, L::Int16, L::Int32, L::Int64, L::Date, L::Time, L::Timestamp, L::Timestamptz] {
-            assert_eq!(type_code(lt), T_I64, "{lt:?} should map to T_I64");
+            assert_eq!(type_code(&lt), T_I64, "{lt:?} should map to T_I64");
         }
         // Unsigned -> UBIGINT slot.
         for lt in [L::Uint8, L::Uint16, L::Uint32, L::Uint64] {
-            assert_eq!(type_code(lt), T_U64, "{lt:?} should map to T_U64");
+            assert_eq!(type_code(&lt), T_U64, "{lt:?} should map to T_U64");
         }
-        assert_eq!(type_code(L::Float32), T_F64);
-        assert_eq!(type_code(L::Float64), T_F64);
-        assert_eq!(type_code(L::Boolean), T_BOOL);
-        assert_eq!(type_code(L::Text), T_TEXT);
-        assert_eq!(type_code(L::Blob), T_BLOB);
+        assert_eq!(type_code(&L::Float32), T_F64);
+        assert_eq!(type_code(&L::Float64), T_F64);
+        assert_eq!(type_code(&L::Boolean), T_BOOL);
+        assert_eq!(type_code(&L::Text), T_TEXT);
+        assert_eq!(type_code(&L::Blob), T_BLOB);
         // No native slot -> carried as text.
-        assert_eq!(type_code(L::Decimal), T_TEXT);
-        assert_eq!(type_code(L::Interval), T_TEXT);
-        assert_eq!(type_code(L::Uuid), T_TEXT);
+        assert_eq!(type_code(&L::Decimal), T_TEXT);
+        assert_eq!(type_code(&L::Interval), T_TEXT);
+        assert_eq!(type_code(&L::Uuid), T_TEXT);
         // The codes are distinct (so a single-constant mutant can't pass).
         let codes = [T_I64, T_U64, T_F64, T_BOOL, T_TEXT, T_BLOB];
         for (a, x) in codes.iter().enumerate() {
