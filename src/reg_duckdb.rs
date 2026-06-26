@@ -27,9 +27,21 @@ use ducklink_runtime::reg;
 // path marshals DuckDB vectors straight to/from this type, so no per-chunk
 // neutral(reg::DuckValue) <-> WIT rebuild happens inside the engine (measured at
 // ~15% of dispatch). The cold table/aggregate paths still use reg::DuckValue.
-use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Duckvalue as WitVal;
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
+    Complexvalue as WitComplex, Decimalvalue as WitDecimal, Duckvalue as WitVal,
+    Intervalvalue as WitInterval, Uuidvalue as WitUuid,
+};
 
 use crate::engine::{AggregateFunc, Engine2, ScalarFunc, TableFunc};
+
+/// Convert DuckDB's physical UUID hugeint storage (sign-flipped: the high bit is
+/// inverted so values sort correctly as a signed i128) into the logical 128-bit
+/// UUID value the WIT contract carries. Self-inverse, so the same function maps
+/// logical -> physical.
+#[inline]
+fn uuid_storage_to_logical(stored: i128) -> u128 {
+    (stored as u128) ^ (1u128 << 127)
+}
 
 /// Format a caught panic payload as a one-line message.
 fn panic_msg(p: Box<dyn std::any::Any + Send>, what: &str) -> String {
@@ -76,10 +88,30 @@ const T_F64: u8 = 2;
 const T_BOOL: u8 = 3;
 const T_TEXT: u8 = 4;
 const T_BLOB: u8 = 5;
+const T_I8: u8 = 6;
+const T_I16: u8 = 7;
+const T_I32: u8 = 8;
+const T_U8: u8 = 9;
+const T_U16: u8 = 10;
+const T_U32: u8 = 11;
+const T_F32: u8 = 12;
+const T_TIMESTAMP: u8 = 13;
+const T_DATE: u8 = 14;
+const T_TIME: u8 = 15;
+const T_TIMESTAMPTZ: u8 = 16;
+const T_DECIMAL: u8 = 17;
+const T_INTERVAL: u8 = 18;
+const T_UUID: u8 = 19;
+// ESCAPE-HATCH: a component-declared composite type (LIST/STRUCT/...). The
+// native bridge has no full nested-vector marshaller yet, so a Complex value is
+// carried as its JSON rendering in a VARCHAR column (best-effort). The declared
+// type-expression is not reconstructed into a real LIST/STRUCT vector here.
+const T_COMPLEX: u8 = 20;
 
 /// Map a neutral logical type to a bridge type code. All current `reg`
-/// logical types are supported.
-fn type_code(lt: reg::LogicalType) -> u8 {
+/// logical types are supported. Borrows `lt` because the `Complex` arm carries
+/// an owned `String`, so `reg::LogicalType` is no longer `Copy`.
+fn type_code(lt: &reg::LogicalType) -> u8 {
     match lt {
         reg::LogicalType::Int64 => T_I64,
         reg::LogicalType::Uint64 => T_U64,
@@ -87,6 +119,21 @@ fn type_code(lt: reg::LogicalType) -> u8 {
         reg::LogicalType::Boolean => T_BOOL,
         reg::LogicalType::Text => T_TEXT,
         reg::LogicalType::Blob => T_BLOB,
+        reg::LogicalType::Int8 => T_I8,
+        reg::LogicalType::Int16 => T_I16,
+        reg::LogicalType::Int32 => T_I32,
+        reg::LogicalType::Uint8 => T_U8,
+        reg::LogicalType::Uint16 => T_U16,
+        reg::LogicalType::Uint32 => T_U32,
+        reg::LogicalType::Float32 => T_F32,
+        reg::LogicalType::Timestamp => T_TIMESTAMP,
+        reg::LogicalType::Date => T_DATE,
+        reg::LogicalType::Time => T_TIME,
+        reg::LogicalType::Timestamptz => T_TIMESTAMPTZ,
+        reg::LogicalType::Decimal => T_DECIMAL,
+        reg::LogicalType::Interval => T_INTERVAL,
+        reg::LogicalType::Uuid => T_UUID,
+        reg::LogicalType::Complex(_) => T_COMPLEX,
     }
 }
 
@@ -98,6 +145,26 @@ fn logical_type(code: u8) -> LogicalTypeHandle {
         T_BOOL => LogicalTypeId::Boolean,
         T_TEXT => LogicalTypeId::Varchar,
         T_BLOB => LogicalTypeId::Blob,
+        T_I8 => LogicalTypeId::Tinyint,
+        T_I16 => LogicalTypeId::Smallint,
+        T_I32 => LogicalTypeId::Integer,
+        T_U8 => LogicalTypeId::UTinyint,
+        T_U16 => LogicalTypeId::USmallint,
+        T_U32 => LogicalTypeId::UInteger,
+        T_F32 => LogicalTypeId::Float,
+        T_TIMESTAMP => LogicalTypeId::Timestamp,
+        T_DATE => LogicalTypeId::Date,
+        T_TIME => LogicalTypeId::Time,
+        T_TIMESTAMPTZ => LogicalTypeId::TimestampTZ,
+        T_INTERVAL => LogicalTypeId::Interval,
+        T_UUID => LogicalTypeId::Uuid,
+        // Complex crosses as JSON text -> declare a VARCHAR column.
+        T_COMPLEX => LogicalTypeId::Varchar,
+        // DECIMAL needs a (width, scale) and is built directly below; the value's
+        // own width/scale is only known per-value, so the column is declared with
+        // DuckDB's default-precision DECIMAL(18, 3). A column whose values carry a
+        // different width/scale is a known limitation (see write_ret Decimal arm).
+        T_DECIMAL => return LogicalTypeHandle::decimal(18, 3),
         _ => unreachable!("type code out of range"),
     };
     LogicalTypeHandle::from(id)
@@ -154,6 +221,77 @@ fn read_col_into(
         T_U64 => fill!(u64, Uint64),
         T_F64 => fill!(f64, Float64),
         T_BOOL => fill!(bool, Boolean),
+        T_I8 => fill!(i8, Int8),
+        T_I16 => fill!(i16, Int16),
+        T_I32 => fill!(i32, Int32),
+        T_U8 => fill!(u8, Uint8),
+        T_U16 => fill!(u16, Uint16),
+        T_U32 => fill!(u32, Uint32),
+        T_F32 => fill!(f32, Float32),
+        // Temporal types are stored as plain integers (Date = i32 days, the rest
+        // = i64 micros), so they marshal exactly like the numeric arms above.
+        T_TIMESTAMP => fill!(i64, Timestamp),
+        T_DATE => fill!(i32, Date),
+        T_TIME => fill!(i64, Time),
+        T_TIMESTAMPTZ => fill!(i64, Timestamptz),
+        // INTERVAL is a {months: i32, days: i32, micros: i64} struct in storage
+        // (duckdb_interval). Read the three components per row.
+        T_INTERVAL => {
+            let s = unsafe { vec.as_slice_with_len::<ffi::duckdb_interval>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                row[j] = WitVal::Interval(WitInterval {
+                    months: s[i].months,
+                    days: s[i].days,
+                    micros: s[i].micros,
+                });
+            }
+        }
+        // DECIMAL and UUID are both HUGEINT-backed (i128) in storage. UUID's
+        // physical storage is the sign-flipped hugeint; convert to the logical
+        // big-endian hi/lo halves the WIT contract expects.
+        T_DECIMAL => {
+            let s = unsafe { vec.as_slice_with_len::<i128>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                let raw = s[i] as u128;
+                row[j] = WitVal::Decimal(WitDecimal {
+                    lower: raw as u64,
+                    upper: (raw >> 64) as u64,
+                    // The value's width/scale is not available from the flat
+                    // vector here; the registration declared DECIMAL(18, 3).
+                    width: 18,
+                    scale: 3,
+                });
+            }
+        }
+        T_UUID => {
+            let s = unsafe { vec.as_slice_with_len::<i128>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                let logical = uuid_storage_to_logical(s[i]);
+                row[j] = WitVal::Uuid(WitUuid {
+                    hi: (logical >> 64) as u64,
+                    lo: logical as u64,
+                });
+            }
+        }
+        T_COMPLEX => {
+            // No nested-vector reader: surface the VARCHAR/JSON form as a Complex
+            // value with an empty (unknown) type-expression.
+            let s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                row[j] = if is_null(i) {
+                    WitVal::Complex(WitComplex {
+                        type_expr: String::new(),
+                        json: String::new(),
+                    })
+                } else {
+                    let mut t = s[i];
+                    WitVal::Complex(WitComplex {
+                        type_expr: String::new(),
+                        json: DuckString::new(&mut t).as_str().into_owned(),
+                    })
+                };
+            }
+        }
         T_TEXT => {
             let s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) };
             for (i, row) in rows.iter_mut().enumerate() {
@@ -193,6 +331,41 @@ fn neutral_to_wit(v: reg::DuckValue) -> WitVal {
         reg::DuckValue::Float64(f) => WitVal::Float64(f),
         reg::DuckValue::Text(s) => WitVal::Text(s),
         reg::DuckValue::Blob(b) => WitVal::Blob(b),
+        reg::DuckValue::Int8(i) => WitVal::Int8(i),
+        reg::DuckValue::Int16(i) => WitVal::Int16(i),
+        reg::DuckValue::Int32(i) => WitVal::Int32(i),
+        reg::DuckValue::Uint8(u) => WitVal::Uint8(u),
+        reg::DuckValue::Uint16(u) => WitVal::Uint16(u),
+        reg::DuckValue::Uint32(u) => WitVal::Uint32(u),
+        reg::DuckValue::Float32(f) => WitVal::Float32(f),
+        reg::DuckValue::Timestamp(t) => WitVal::Timestamp(t),
+        reg::DuckValue::Date(d) => WitVal::Date(d),
+        reg::DuckValue::Time(t) => WitVal::Time(t),
+        reg::DuckValue::Timestamptz(t) => WitVal::Timestamptz(t),
+        reg::DuckValue::Decimal {
+            lower,
+            upper,
+            width,
+            scale,
+        } => WitVal::Decimal(WitDecimal {
+            lower,
+            upper,
+            width,
+            scale,
+        }),
+        reg::DuckValue::Interval {
+            months,
+            days,
+            micros,
+        } => WitVal::Interval(WitInterval {
+            months,
+            days,
+            micros,
+        }),
+        reg::DuckValue::Uuid { hi, lo } => WitVal::Uuid(WitUuid { hi, lo }),
+        reg::DuckValue::Complex { type_expr, json } => {
+            WitVal::Complex(WitComplex { type_expr, json })
+        }
     }
 }
 
@@ -224,6 +397,73 @@ fn write_ret(
             let s = unsafe { vec.as_mut_slice_with_len::<bool>(len) };
             s[i] = x;
         }
+        (T_I8, WitVal::Int8(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i8>(len) };
+            s[i] = x;
+        }
+        (T_I16, WitVal::Int16(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i16>(len) };
+            s[i] = x;
+        }
+        (T_I32, WitVal::Int32(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i32>(len) };
+            s[i] = x;
+        }
+        (T_U8, WitVal::Uint8(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<u8>(len) };
+            s[i] = x;
+        }
+        (T_U16, WitVal::Uint16(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<u16>(len) };
+            s[i] = x;
+        }
+        (T_U32, WitVal::Uint32(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<u32>(len) };
+            s[i] = x;
+        }
+        (T_F32, WitVal::Float32(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<f32>(len) };
+            s[i] = x;
+        }
+        // Temporal types share their underlying integer storage.
+        (T_TIMESTAMP, WitVal::Timestamp(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
+            s[i] = x;
+        }
+        (T_DATE, WitVal::Date(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i32>(len) };
+            s[i] = x;
+        }
+        (T_TIME, WitVal::Time(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
+            s[i] = x;
+        }
+        (T_TIMESTAMPTZ, WitVal::Timestamptz(x)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
+            s[i] = x;
+        }
+        (T_INTERVAL, WitVal::Interval(iv)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<ffi::duckdb_interval>(len) };
+            s[i] = ffi::duckdb_interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            };
+        }
+        (T_DECIMAL, WitVal::Decimal(d)) => {
+            // HUGEINT-backed. The declared column is DECIMAL(18, 3); a value whose
+            // width/scale differ would be misinterpreted (known limitation).
+            let s = unsafe { vec.as_mut_slice_with_len::<i128>(len) };
+            s[i] = (((d.upper as u128) << 64) | d.lower as u128) as i128;
+        }
+        (T_UUID, WitVal::Uuid(u)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i128>(len) };
+            let logical = ((u.hi as u128) << 64) | u.lo as u128;
+            // logical -> physical sign-flipped hugeint storage.
+            s[i] = uuid_storage_to_logical(logical as i128) as i128;
+        }
+        // No nested-vector writer: emit the JSON rendering into the VARCHAR column.
+        (T_COMPLEX, WitVal::Complex(c)) => vec.insert(i, c.json.as_str()),
         (T_TEXT, WitVal::Text(x)) => vec.insert(i, x.as_str()),
         (T_BLOB, WitVal::Blob(x)) => vec.insert(i, x.as_slice()),
         (_, other) => {
@@ -372,8 +612,8 @@ pub fn register_scalars(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for f in scalars {
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(a.logical)).collect();
-        let ret_code = type_code(f.returns);
+        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        let ret_code = type_code(&f.returns);
         let state = WasmScalarState {
             callback_handle: f.callback_handle,
             engine: engine.clone(),
@@ -524,8 +764,8 @@ pub fn register_tables(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for t in tables {
-        let arg_codes: Vec<u8> = t.arguments.iter().map(|a| type_code(a.logical)).collect();
-        let col_codes: Vec<u8> = t.columns.iter().map(|c| type_code(c.logical)).collect();
+        let arg_codes: Vec<u8> = t.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        let col_codes: Vec<u8> = t.columns.iter().map(|c| type_code(&c.logical)).collect();
         let col_names: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
         let extra = WasmTableExtra {
             callback_handle: t.callback_handle,
@@ -594,6 +834,23 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
         T_BOOL => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
         T_TEXT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
         T_BLOB => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+        T_I8 => ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT,
+        T_I16 => ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT,
+        T_I32 => ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER,
+        T_U8 => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT,
+        T_U16 => ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT,
+        T_U32 => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER,
+        T_F32 => ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT,
+        T_TIMESTAMP => ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP,
+        T_DATE => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE,
+        T_TIME => ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME,
+        T_TIMESTAMPTZ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ,
+        T_INTERVAL => ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL,
+        T_UUID => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID,
+        // DECIMAL via this enum has no width/scale; aggregates over DECIMAL are a
+        // known limitation (the scalar/table path declares DECIMAL(18, 3) via a
+        // dedicated constructor instead). COMPLEX falls back to VARCHAR/JSON.
+        T_COMPLEX => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
         _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
     }
 }
@@ -618,6 +875,34 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
             let mut s = *(data as *const duckdb_string_t).add(i);
             reg::DuckValue::Blob(DuckString::new(&mut s).as_bytes().to_vec())
         }
+        T_I8 => reg::DuckValue::Int8(*(data as *const i8).add(i)),
+        T_I16 => reg::DuckValue::Int16(*(data as *const i16).add(i)),
+        T_I32 => reg::DuckValue::Int32(*(data as *const i32).add(i)),
+        T_U8 => reg::DuckValue::Uint8(*(data as *const u8).add(i)),
+        T_U16 => reg::DuckValue::Uint16(*(data as *const u16).add(i)),
+        T_U32 => reg::DuckValue::Uint32(*(data as *const u32).add(i)),
+        T_F32 => reg::DuckValue::Float32(*(data as *const f32).add(i)),
+        T_TIMESTAMP => reg::DuckValue::Timestamp(*(data as *const i64).add(i)),
+        T_DATE => reg::DuckValue::Date(*(data as *const i32).add(i)),
+        T_TIME => reg::DuckValue::Time(*(data as *const i64).add(i)),
+        T_TIMESTAMPTZ => reg::DuckValue::Timestamptz(*(data as *const i64).add(i)),
+        T_INTERVAL => {
+            let iv = *(data as *const ffi::duckdb_interval).add(i);
+            reg::DuckValue::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            }
+        }
+        T_UUID => {
+            let logical = uuid_storage_to_logical(*(data as *const i128).add(i));
+            reg::DuckValue::Uuid {
+                hi: (logical >> 64) as u64,
+                lo: logical as u64,
+            }
+        }
+        // DECIMAL (needs per-value width/scale) and COMPLEX (nested) over the raw
+        // aggregate path are not yet marshalled; surface as NULL.
         _ => reg::DuckValue::Null,
     }
 }
@@ -655,6 +940,36 @@ unsafe fn write_ret_raw(
                 i as u64,
                 b.as_ptr() as *const c_char,
                 b.len() as u64,
+            );
+        }
+        (T_I8, reg::DuckValue::Int8(x)) => *(data as *mut i8).add(i) = x,
+        (T_I16, reg::DuckValue::Int16(x)) => *(data as *mut i16).add(i) = x,
+        (T_I32, reg::DuckValue::Int32(x)) => *(data as *mut i32).add(i) = x,
+        (T_U8, reg::DuckValue::Uint8(x)) => *(data as *mut u8).add(i) = x,
+        (T_U16, reg::DuckValue::Uint16(x)) => *(data as *mut u16).add(i) = x,
+        (T_U32, reg::DuckValue::Uint32(x)) => *(data as *mut u32).add(i) = x,
+        (T_F32, reg::DuckValue::Float32(x)) => *(data as *mut f32).add(i) = x,
+        (T_TIMESTAMP, reg::DuckValue::Timestamp(x)) => *(data as *mut i64).add(i) = x,
+        (T_DATE, reg::DuckValue::Date(x)) => *(data as *mut i32).add(i) = x,
+        (T_TIME, reg::DuckValue::Time(x)) => *(data as *mut i64).add(i) = x,
+        (T_TIMESTAMPTZ, reg::DuckValue::Timestamptz(x)) => *(data as *mut i64).add(i) = x,
+        (T_INTERVAL, reg::DuckValue::Interval { months, days, micros }) => {
+            *(data as *mut ffi::duckdb_interval).add(i) = ffi::duckdb_interval {
+                months,
+                days,
+                micros,
+            };
+        }
+        (T_UUID, reg::DuckValue::Uuid { hi, lo }) => {
+            let logical = ((hi as u128) << 64) | lo as u128;
+            *(data as *mut i128).add(i) = uuid_storage_to_logical(logical as i128) as i128;
+        }
+        (T_COMPLEX, reg::DuckValue::Complex { json, .. }) => {
+            ffi::duckdb_vector_assign_string_element_len(
+                vector,
+                i as u64,
+                json.as_ptr() as *const c_char,
+                json.len() as u64,
             );
         }
         (_, other) => {
@@ -776,8 +1091,8 @@ pub unsafe fn register_aggregates(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for f in aggregates {
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(a.logical)).collect();
-        let ret_code = type_code(f.returns);
+        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        let ret_code = type_code(&f.returns);
 
         let func = ffi::duckdb_create_aggregate_function();
         let cname = CString::new(f.name.as_str())

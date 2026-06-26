@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "ducklink-extension"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1016,7 +1016,6 @@ dependencies = [
 [[package]]
 name = "ducklink-runtime"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/ducklink?rev=fb4e228#fb4e228b9738550d1cc5c7b145aee6055521d92a"
 dependencies = [
  "wasmtime",
  "wasmtime-wasi",

@@ -5,7 +5,7 @@
 # git dependency so this repo builds on its own under the community-extensions CI.
 [package]
 name = "ducklink-extension"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Run WebAssembly component extensions inside DuckDB"
@@ -38,7 +38,7 @@ bundled = ["duckdb-api", "duckdb/bundled"]
 # model, the callback registry, and the load_component loader. Consumed from the
 # public ducklink monorepo so this extension loads components identically to the
 # Direction-1 host.
-ducklink-runtime = { git = "https://github.com/tegmentum/ducklink", rev = "fb4e228" }
+ducklink-runtime = { path = "runtime" }
 # wasmtime to run the component. MUST match ducklink-runtime's pinned rev so the
 # WasiCtx / generated bindings are the same types across the crate boundary.
 wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", rev = "1ec866079720e573fc2aa06947c84f6132010993", features = ["component-model"] }
@@ -54,7 +54,7 @@ libduckdb-sys = { version = "1.10504.0", features = ["loadable-extension"], opti
 criterion = "0.5"
 # For constructing reg::DuckValue chunks in the dispatch benchmark (benches are
 # separate compilation units, so the engine's runtime dep must be a dev-dep too).
-ducklink-runtime = { git = "https://github.com/tegmentum/ducklink", rev = "fb4e228" }
+ducklink-runtime = { path = "runtime" }
 
 # Micro-benchmark of the Direction-2 scalar dispatch hot path (Engine2 only --
 # no DuckDB, so it builds with --no-default-features). Run:

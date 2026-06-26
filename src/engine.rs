@@ -356,6 +356,43 @@ fn neutral_to_wit(v: reg::DuckValue) -> extension_types::Duckvalue {
         reg::DuckValue::Float64(f) => extension_types::Duckvalue::Float64(f),
         reg::DuckValue::Text(s) => extension_types::Duckvalue::Text(s),
         reg::DuckValue::Blob(b) => extension_types::Duckvalue::Blob(b),
+        reg::DuckValue::Int32(i) => extension_types::Duckvalue::Int32(i),
+        reg::DuckValue::Timestamp(t) => extension_types::Duckvalue::Timestamp(t),
+        reg::DuckValue::Int8(i) => extension_types::Duckvalue::Int8(i),
+        reg::DuckValue::Int16(i) => extension_types::Duckvalue::Int16(i),
+        reg::DuckValue::Uint8(u) => extension_types::Duckvalue::Uint8(u),
+        reg::DuckValue::Uint16(u) => extension_types::Duckvalue::Uint16(u),
+        reg::DuckValue::Uint32(u) => extension_types::Duckvalue::Uint32(u),
+        reg::DuckValue::Float32(f) => extension_types::Duckvalue::Float32(f),
+        reg::DuckValue::Date(d) => extension_types::Duckvalue::Date(d),
+        reg::DuckValue::Time(t) => extension_types::Duckvalue::Time(t),
+        reg::DuckValue::Timestamptz(t) => extension_types::Duckvalue::Timestamptz(t),
+        reg::DuckValue::Decimal {
+            lower,
+            upper,
+            width,
+            scale,
+        } => extension_types::Duckvalue::Decimal(extension_types::Decimalvalue {
+            lower,
+            upper,
+            width,
+            scale,
+        }),
+        reg::DuckValue::Interval {
+            months,
+            days,
+            micros,
+        } => extension_types::Duckvalue::Interval(extension_types::Intervalvalue {
+            months,
+            days,
+            micros,
+        }),
+        reg::DuckValue::Uuid { hi, lo } => {
+            extension_types::Duckvalue::Uuid(extension_types::Uuidvalue { hi, lo })
+        }
+        reg::DuckValue::Complex { type_expr, json } => {
+            extension_types::Duckvalue::Complex(extension_types::Complexvalue { type_expr, json })
+        }
     }
 }
 
@@ -368,5 +405,32 @@ fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
         extension_types::Duckvalue::Float64(f) => reg::DuckValue::Float64(f),
         extension_types::Duckvalue::Text(s) => reg::DuckValue::Text(s),
         extension_types::Duckvalue::Blob(b) => reg::DuckValue::Blob(b),
+        extension_types::Duckvalue::Int32(i) => reg::DuckValue::Int32(i),
+        extension_types::Duckvalue::Timestamp(t) => reg::DuckValue::Timestamp(t),
+        extension_types::Duckvalue::Int8(i) => reg::DuckValue::Int8(i),
+        extension_types::Duckvalue::Int16(i) => reg::DuckValue::Int16(i),
+        extension_types::Duckvalue::Uint8(u) => reg::DuckValue::Uint8(u),
+        extension_types::Duckvalue::Uint16(u) => reg::DuckValue::Uint16(u),
+        extension_types::Duckvalue::Uint32(u) => reg::DuckValue::Uint32(u),
+        extension_types::Duckvalue::Float32(f) => reg::DuckValue::Float32(f),
+        extension_types::Duckvalue::Date(d) => reg::DuckValue::Date(d),
+        extension_types::Duckvalue::Time(t) => reg::DuckValue::Time(t),
+        extension_types::Duckvalue::Timestamptz(t) => reg::DuckValue::Timestamptz(t),
+        extension_types::Duckvalue::Decimal(d) => reg::DuckValue::Decimal {
+            lower: d.lower,
+            upper: d.upper,
+            width: d.width,
+            scale: d.scale,
+        },
+        extension_types::Duckvalue::Interval(iv) => reg::DuckValue::Interval {
+            months: iv.months,
+            days: iv.days,
+            micros: iv.micros,
+        },
+        extension_types::Duckvalue::Uuid(u) => reg::DuckValue::Uuid { hi: u.hi, lo: u.lo },
+        extension_types::Duckvalue::Complex(c) => reg::DuckValue::Complex {
+            type_expr: c.type_expr,
+            json: c.json,
+        },
     }
 }

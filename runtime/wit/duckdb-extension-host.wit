@@ -1,0 +1,95 @@
+package duckdb:extension-host;
+
+use duckdb:extension/runtime@2.0.0;
+use duckdb:extension/callback-dispatch@2.0.0;
+use duckdb:extension/config@2.0.0;
+use duckdb:extension/logging@2.0.0;
+use duckdb:extension/catalog@2.0.0;
+use duckdb:extension/files@2.0.0;
+use duckdb:extension/storage@2.0.0;
+use duckdb:extension/storage-dispatch@2.0.0;
+use duckdb:extension/index@2.0.0;
+use duckdb:extension/index-dispatch@2.0.0;
+use duckdb:extension/collation@2.0.0;
+use duckdb:extension/files-reg@2.0.0;
+use duckdb:extension/file-dispatch@2.0.0;
+use duckdb:extension/query@2.0.0;
+use duckdb:extension/guest@2.0.0;
+
+// Base extension world: every loadable extension exports these. storage-dispatch
+// is NOT mandated here (non-storage extensions like geohash don't export it);
+// storage backends are driven through the separate `duckdb-extension-storage`
+// world below, instantiated from the SAME component instance on demand. The
+// `index` import is satisfied by the host so index-capable components (hnswfns)
+// instantiate against this base world; index-dispatch is driven through the
+// separate `duckdb-extension-index` world.
+world duckdb-extension {
+  import duckdb:extension/runtime@2.0.0;
+  import duckdb:extension/config@2.0.0;
+  import duckdb:extension/logging@2.0.0;
+  import duckdb:extension/catalog@2.0.0;
+  import duckdb:extension/files@2.0.0;
+  import duckdb:extension/storage@2.0.0;
+  import duckdb:extension/index@2.0.0;
+  import duckdb:extension/collation@2.0.0;
+  import duckdb:extension/files-reg@2.0.0;
+  // v1.1 live-query host import (catalog completion). The host always PROVIDES it
+  // in the extension linker; query-capable components (autocomplete) import it,
+  // others don't. Listed here so the host bindings generate the `query::Host`
+  // trait + `add_to_linker`.
+  import duckdb:extension/query@2.0.0;
+  export duckdb:extension/guest@2.0.0;
+  export callback-dispatch;
+}
+
+// Storage-capable world: additionally exports storage-dispatch. Only storage
+// backend components (e.g. sqlitewasm) satisfy this; the runtime instantiates
+// its bindings lazily from an already-loaded ExtensionInstance.
+world duckdb-extension-storage {
+  import duckdb:extension/runtime@2.0.0;
+  import duckdb:extension/config@2.0.0;
+  import duckdb:extension/logging@2.0.0;
+  import duckdb:extension/catalog@2.0.0;
+  import duckdb:extension/files@2.0.0;
+  import duckdb:extension/storage@2.0.0;
+  import duckdb:extension/index@2.0.0;
+  import duckdb:extension/collation@2.0.0;
+  export duckdb:extension/guest@2.0.0;
+  export callback-dispatch;
+  export storage-dispatch;
+}
+
+// Index-capable world: additionally exports index-dispatch. Only custom-index
+// backend components (e.g. hnswfns) satisfy this; the runtime instantiates its
+// bindings lazily from an already-loaded ExtensionInstance.
+world duckdb-extension-index {
+  import duckdb:extension/runtime@2.0.0;
+  import duckdb:extension/config@2.0.0;
+  import duckdb:extension/logging@2.0.0;
+  import duckdb:extension/catalog@2.0.0;
+  import duckdb:extension/files@2.0.0;
+  import duckdb:extension/storage@2.0.0;
+  import duckdb:extension/index@2.0.0;
+  import duckdb:extension/collation@2.0.0;
+  export duckdb:extension/guest@2.0.0;
+  export callback-dispatch;
+  export index-dispatch;
+}
+
+// Files-capable world: additionally exports file-dispatch. Only files backend
+// components (e.g. webfs) satisfy this; the runtime instantiates its bindings
+// lazily from an already-loaded ExtensionInstance.
+world duckdb-extension-files {
+  import duckdb:extension/runtime@2.0.0;
+  import duckdb:extension/config@2.0.0;
+  import duckdb:extension/logging@2.0.0;
+  import duckdb:extension/catalog@2.0.0;
+  import duckdb:extension/files@2.0.0;
+  import duckdb:extension/storage@2.0.0;
+  import duckdb:extension/index@2.0.0;
+  import duckdb:extension/collation@2.0.0;
+  import duckdb:extension/files-reg@2.0.0;
+  export duckdb:extension/guest@2.0.0;
+  export callback-dispatch;
+  export file-dispatch;
+}
