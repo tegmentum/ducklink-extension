@@ -44,7 +44,11 @@ fn build_engine() -> Result<Engine> {
             eprintln!("[ducklink] wasmtime compile cache unavailable: {err}");
         }
     }
-    Engine::new(&config).context("failed to create wasmtime engine")
+    // wasmtime 46's `wasmtime::Error` is its own type (no longer an alias of
+    // `anyhow::Error`), so map it into anyhow before attaching context.
+    Engine::new(&config)
+        .map_err(anyhow::Error::from)
+        .context("failed to create wasmtime engine")
 }
 
 /// Config/logging sink for native DuckDB. Logging goes to stderr; config reads
@@ -160,6 +164,7 @@ impl Engine2 {
     /// functions it registered. The instance is retained for dispatch.
     pub fn load(&mut self, extension: &str, path: &Path) -> Result<LoadedComponent> {
         let component = Component::from_file(&self.engine, path)
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("loading component at {}", path.display()))?;
         // Grant outbound network + name lookup so network-using components (dns,
         // http, httpfs, ...) work. Best-effort, not a sandbox: a component that

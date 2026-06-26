@@ -39,10 +39,10 @@ bundled = ["duckdb-api", "duckdb/bundled"]
 # public ducklink monorepo so this extension loads components identically to the
 # Direction-1 host.
 ducklink-runtime = { path = "runtime" }
-# wasmtime to run the component. MUST match ducklink-runtime's pinned rev so the
-# WasiCtx / generated bindings are the same types across the crate boundary.
-wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", rev = "1ec866079720e573fc2aa06947c84f6132010993", features = ["component-model"] }
-wasmtime-wasi = { git = "https://github.com/bytecodealliance/wasmtime", rev = "1ec866079720e573fc2aa06947c84f6132010993" }
+# wasmtime to run the component. MUST match ducklink-runtime's pinned version so
+# the WasiCtx / generated bindings are the same types across the crate boundary.
+wasmtime = { version = "46.0.1", features = ["component-model"] }
+wasmtime-wasi = "46.0.1"
 anyhow = "1"
 
 # DuckDB C Extension API (loadable-extension build). Pinned to the DuckDB version
