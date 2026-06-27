@@ -183,4 +183,81 @@ mod loadable {
     fn stringify(err: impl std::fmt::Display) -> Box<dyn Error> {
         err.to_string().into()
     }
+
+    // -----------------------------------------------------------------------
+    // The DuckLink SHIM entrypoint (transparent-LOAD spike, design "D").
+    //
+    // A DuckLink "shim" is a `.duckdb_extension` named after a LOGICAL extension
+    // (here `aba`). Stock DuckDB derives the init symbol from the FILENAME
+    // (`<filebase>_init_c_api`), so the file `aba.duckdb_extension` must export
+    // `aba_init_c_api`. When the user runs `LOAD aba` on a STOCK duckdb (after a
+    // one-time `INSTALL aba FROM '<ducklink-repo>'`), DuckDB calls this symbol,
+    // and the shim runs the multi-provider resolver IN-PROCESS and dual-loads the
+    // chosen provider via the proven bridge (here the wasm `aba` component).
+    //
+    // The wasm artifact location comes from `DUCKLINK_ABA_WASM` (a real install
+    // would resolve it from DuckLink's local store / manifest).
+    // -----------------------------------------------------------------------
+
+    /// SHIM init for the logical extension `aba`. Resolves + dual-loads via
+    /// [`crate::passthrough::ducklink_load`] so `aba_validate` becomes available
+    /// after a plain `LOAD aba` on stock DuckDB.
+    ///
+    /// # Safety
+    /// Called by DuckDB during `LOAD aba` with a valid `info` / `access` pair.
+    #[no_mangle]
+    pub unsafe extern "C" fn aba_init_c_api(
+        info: ffi::duckdb_extension_info,
+        access: *const ffi::duckdb_extension_access,
+    ) -> bool {
+        match aba_shim_init(info, access) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                if let Some(set_error) = (*access).set_error {
+                    if let Ok(c) = CString::new(e.to_string()) {
+                        set_error(info, c.as_ptr());
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    unsafe fn aba_shim_init(
+        info: ffi::duckdb_extension_info,
+        access: *const ffi::duckdb_extension_access,
+    ) -> Result<bool, Box<dyn Error>> {
+        use std::path::PathBuf;
+
+        if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.4").map_err(stringify)? {
+            return Ok(false);
+        }
+        let get_database = (*access)
+            .get_database
+            .ok_or_else(|| stringify("get_database is null in duckdb_extension_access"))?;
+        let db_ptr = get_database(info);
+        if db_ptr.is_null() {
+            return Ok(false);
+        }
+        let db: ffi::duckdb_database = *db_ptr;
+        let con = Connection::open_from_raw(db.cast())?;
+
+        let wasm = std::env::var("DUCKLINK_ABA_WASM")
+            .map_err(|_| stringify("DUCKLINK_ABA_WASM not set (path to aba.wasm component)"))?;
+        let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
+        let entry = crate::passthrough::aba_manifest(PathBuf::from(wasm), None);
+        let report = crate::passthrough::ducklink_load(
+            &con,
+            engine,
+            &entry,
+            &crate::resolver::Env::default(),
+            &crate::resolver::ResolvePolicy::default(),
+        )
+        .map_err(stringify)?;
+        eprintln!(
+            "[ducklink-shim:aba] resolved provider '{}' [{}]; registered {} fn(s); reasoning: {}",
+            report.chosen_id, report.chosen_kind, report.registered, report.reasoning
+        );
+        Ok(true)
+    }
 }
