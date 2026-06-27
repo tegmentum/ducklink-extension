@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};

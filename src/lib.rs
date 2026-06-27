@@ -43,6 +43,7 @@ mod loadable {
     use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeId};
     use duckdb::ffi;
     use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
+    use duckdb::types::DuckString;
     use duckdb::vtab::arrow::WritableVector;
     use duckdb::Connection;
 
@@ -185,32 +186,30 @@ mod loadable {
     }
 
     // -----------------------------------------------------------------------
-    // The DuckLink SHIM entrypoint (transparent-LOAD spike, design "D").
+    // The DuckLink SHIM entrypoint (transparent LOAD, design "D" first-cut).
     //
     // A DuckLink "shim" is a `.duckdb_extension` named after a LOGICAL extension
-    // (here `aba`). Stock DuckDB derives the init symbol from the FILENAME
-    // (`<filebase>_init_c_api`), so the file `aba.duckdb_extension` must export
-    // `aba_init_c_api`. When the user runs `LOAD aba` on a STOCK duckdb (after a
-    // one-time `INSTALL aba FROM '<ducklink-repo>'`), DuckDB calls this symbol,
-    // and the shim runs the multi-provider resolver IN-PROCESS and dual-loads the
-    // chosen provider via the proven bridge (here the wasm `aba` component).
+    // (e.g. `aba`). Stock DuckDB derives the init symbol from the FILENAME
+    // (`<filebase>_init_c_api`), so `aba.duckdb_extension` must export
+    // `aba_init_c_api`. After a one-time `ducklink install aba` (INSTALL FROM the
+    // DuckLink repo), plain `LOAD aba` on STOCK duckdb calls this symbol; the
+    // shim runs the multi-provider resolver IN-PROCESS (reading the manifest) and
+    // dual-loads the chosen provider (native passthrough, or the wasm bridge).
     //
-    // The wasm artifact location comes from `DUCKLINK_ABA_WASM` (a real install
-    // would resolve it from DuckLink's local store / manifest).
+    // The shim is identical for every name -- the NAME is the only variable -- so
+    // the generator emits one `ducklink_shim!("<name>", <name>_init_c_api);` line
+    // per managed extension (all share one cdylib; each copy is renamed +
+    // footer-stamped to `<name>.duckdb_extension`).
     // -----------------------------------------------------------------------
 
-    /// SHIM init for the logical extension `aba`. Resolves + dual-loads via
-    /// [`crate::passthrough::ducklink_load`] so `aba_validate` becomes available
-    /// after a plain `LOAD aba` on stock DuckDB.
-    ///
-    /// # Safety
-    /// Called by DuckDB during `LOAD aba` with a valid `info` / `access` pair.
-    #[no_mangle]
-    pub unsafe extern "C" fn aba_init_c_api(
+    /// Shared shim entry. `name` is the logical extension; provider selection is
+    /// manifest-driven (`DUCKLINK_HOME/index.json`) via [`crate::passthrough::shim_load`].
+    unsafe fn shim_entry(
+        name: &str,
         info: ffi::duckdb_extension_info,
         access: *const ffi::duckdb_extension_access,
     ) -> bool {
-        match aba_shim_init(info, access) {
+        match shim_entry_inner(name, info, access) {
             Ok(loaded) => loaded,
             Err(e) => {
                 if let Some(set_error) = (*access).set_error {
@@ -223,41 +222,154 @@ mod loadable {
         }
     }
 
-    unsafe fn aba_shim_init(
+    unsafe fn shim_entry_inner(
+        name: &str,
         info: ffi::duckdb_extension_info,
         access: *const ffi::duckdb_extension_access,
     ) -> Result<bool, Box<dyn Error>> {
-        use std::path::PathBuf;
+        let con = match open_connection(info, access)? {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+        let report = crate::passthrough::shim_load(&con, name).map_err(stringify)?;
+        eprintln!(
+            "[ducklink-shim:{name}] resolved provider '{}' [{}]; registered {} fn(s); reasoning: {}",
+            report.chosen_id, report.chosen_kind, report.registered, report.reasoning
+        );
+        Ok(true)
+    }
 
+    /// Common entrypoint boilerplate: init the C-API table, open a duckdb-rs
+    /// `Connection` on the database DuckDB handed us. `None` => abort cleanly.
+    unsafe fn open_connection(
+        info: ffi::duckdb_extension_info,
+        access: *const ffi::duckdb_extension_access,
+    ) -> Result<Option<Connection>, Box<dyn Error>> {
         if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.4").map_err(stringify)? {
-            return Ok(false);
+            return Ok(None);
         }
         let get_database = (*access)
             .get_database
             .ok_or_else(|| stringify("get_database is null in duckdb_extension_access"))?;
         let db_ptr = get_database(info);
         if db_ptr.is_null() {
-            return Ok(false);
+            return Ok(None);
         }
         let db: ffi::duckdb_database = *db_ptr;
-        let con = Connection::open_from_raw(db.cast())?;
+        Ok(Some(Connection::open_from_raw(db.cast())?))
+    }
 
-        let wasm = std::env::var("DUCKLINK_ABA_WASM")
-            .map_err(|_| stringify("DUCKLINK_ABA_WASM not set (path to aba.wasm component)"))?;
-        let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
-        let entry = crate::passthrough::aba_manifest(PathBuf::from(wasm), None);
-        let report = crate::passthrough::ducklink_load(
-            &con,
-            engine,
-            &entry,
-            &crate::resolver::Env::default(),
-            &crate::resolver::ResolvePolicy::default(),
-        )
-        .map_err(stringify)?;
-        eprintln!(
-            "[ducklink-shim:aba] resolved provider '{}' [{}]; registered {} fn(s); reasoning: {}",
-            report.chosen_id, report.chosen_kind, report.registered, report.reasoning
-        );
+    /// Emit a `<name>_init_c_api` shim entrypoint. The generator adds one line
+    /// per managed logical extension; the body is the shared, manifest-driven
+    /// [`shim_entry`].
+    macro_rules! ducklink_shim {
+        ($name:literal, $init:ident) => {
+            // DuckLink shim entrypoint (auto-generated by `ducklink_shim!`).
+            // Safety: called by DuckDB during `LOAD` with a valid info/access pair.
+            #[no_mangle]
+            pub unsafe extern "C" fn $init(
+                info: ffi::duckdb_extension_info,
+                access: *const ffi::duckdb_extension_access,
+            ) -> bool {
+                shim_entry($name, info, access)
+            }
+        };
+    }
+
+    // ---- The managed-extension shim table (the generator owns this list) ----
+    ducklink_shim!("aba", aba_init_c_api);
+
+    // -----------------------------------------------------------------------
+    // The NATIVE provider implementation for `aba` (a real native
+    // `.duckdb_extension`). Served as `aba_native.duckdb_extension` (exports
+    // `aba_native_init_c_api`); the shim's native arm `LOAD`s it. This is the
+    // native-speed passthrough: `aba_validate` computed in compiled Rust, no wasm.
+    // -----------------------------------------------------------------------
+
+    /// ABA routing-number checksum, native Rust (mirrors the wasm component's
+    /// semantics: 9 digits, weights 3,7,1,..., sum % 10 == 0; spaces/hyphens
+    /// ignored). The provider-neutral conformance suite certifies the two agree.
+    fn aba_checksum_valid(s: &str) -> bool {
+        let mut digits: Vec<u32> = Vec::with_capacity(s.len());
+        for c in s.chars() {
+            if c.is_whitespace() || c == '-' {
+                continue;
+            }
+            match c.to_digit(10) {
+                Some(d) => digits.push(d),
+                None => return false,
+            }
+        }
+        if digits.len() != 9 {
+            return false;
+        }
+        let w = [3u32, 7, 1, 3, 7, 1, 3, 7, 1];
+        let sum: u32 = digits.iter().zip(w).map(|(&d, k)| d * k).sum();
+        sum % 10 == 0
+    }
+
+    struct AbaValidateNative;
+
+    impl VScalar for AbaValidateNative {
+        type State = ();
+        fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn Error>> {
+            let len = input.len();
+            let in_vec = input.flat_vector(0);
+            let strs = unsafe { in_vec.as_slice_with_len::<ffi::duckdb_string_t>(len) };
+            let mut out = output.flat_vector();
+            let out_slice = unsafe { out.as_mut_slice_with_len::<bool>(len) };
+            for i in 0..len {
+                let mut t = strs[i];
+                let s = DuckString::new(&mut t).as_str();
+                out_slice[i] = aba_checksum_valid(&s);
+            }
+            Ok(())
+        }
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Varchar.into()],
+                LogicalTypeId::Boolean.into(),
+            )]
+        }
+    }
+
+    /// NATIVE provider entrypoint for `aba` (file `aba_native.duckdb_extension`).
+    ///
+    /// # Safety
+    /// Called by DuckDB during `LOAD 'aba_native...'` with a valid pair.
+    #[no_mangle]
+    pub unsafe extern "C" fn aba_native_init_c_api(
+        info: ffi::duckdb_extension_info,
+        access: *const ffi::duckdb_extension_access,
+    ) -> bool {
+        match aba_native_init(info, access) {
+            Ok(b) => b,
+            Err(e) => {
+                if let Some(set_error) = (*access).set_error {
+                    if let Ok(c) = CString::new(e.to_string()) {
+                        set_error(info, c.as_ptr());
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    unsafe fn aba_native_init(
+        info: ffi::duckdb_extension_info,
+        access: *const ffi::duckdb_extension_access,
+    ) -> Result<bool, Box<dyn Error>> {
+        let con = match open_connection(info, access)? {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+        con.register_scalar_function::<AbaValidateNative>("aba_validate")
+            .map_err(stringify)?;
+        eprintln!("[ducklink-native:aba] registered native aba_validate");
         Ok(true)
     }
 }

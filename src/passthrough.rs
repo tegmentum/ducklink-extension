@@ -60,7 +60,23 @@ pub fn ducklink_load(
     env: &Env,
     policy: &ResolvePolicy,
 ) -> Result<LoadReport> {
-    let res = resolver::resolve(entry, env, policy, None).map_err(|e| anyhow!(e.to_string()))?;
+    ducklink_load_gated(con, engine, entry, env, policy, None)
+}
+
+/// As [`ducklink_load`], but with the conformance HARD GATE's canonical
+/// suite-digest wired in: a non-reference provider is admitted only if its
+/// `conformance.suite_digest` equals `canonical_suite_digest` (anti-forgery), on
+/// top of passed + contract match. `None` skips the suite-digest sub-check.
+pub fn ducklink_load_gated(
+    con: &Connection,
+    engine: Arc<Mutex<Engine2>>,
+    entry: &ManifestEntry,
+    env: &Env,
+    policy: &ResolvePolicy,
+    canonical_suite_digest: Option<&str>,
+) -> Result<LoadReport> {
+    let res = resolver::resolve(entry, env, policy, canonical_suite_digest)
+        .map_err(|e| anyhow!(e.to_string()))?;
     let reasoning = resolver::render_reasoning(&res.reasoning);
 
     let registered = match res.chosen_kind {
@@ -145,6 +161,119 @@ pub fn aba_manifest(wasm_artifact: PathBuf, native_artifact: Option<PathBuf>) ->
         name: "aba".into(),
         wit_contract: CONTRACT.into(),
         providers,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The productionized SHIM body (manifest-driven; design "D" first-cut).
+//
+// A shim named `<name>.duckdb_extension` (exporting `<name>_init_c_api`) calls
+// `shim_load(con, "<name>")`. It is the same for every logical extension -- the
+// NAME is the only variable -- so one body + one macro generate every shim.
+//
+// Provider selection comes from the MULTI-PROVIDER MANIFEST (the generalized
+// `registry/index.json` `providers[]`), NOT from an env var. The manifest +
+// suite live under `DUCKLINK_HOME` (the DuckLink install dir):
+//   $DUCKLINK_HOME/index.json
+//   $DUCKLINK_HOME/<wasm/native artifact paths, relative to home>
+//   $DUCKLINK_HOME/suites/<name>.sql   (the conformance suite; its content
+//                                       digest is the canonical suite_digest)
+//
+// Policy OVERRIDES are env-driven on STOCK duckdb, because the stable C
+// extension API has no runtime-setting registration (no `duckdb_add_extension_
+// option`; only open-time `duckdb_set_config`), so `SET extension_provider=...`
+// cannot be honored by a C-API shim. The equivalents:
+//   DUCKLINK_ALLOW_NATIVE=0     -> deny the native arm (== SET allow_native_providers=false)
+//   DUCKLINK_PROVIDER=<id>      -> force a provider id (== SET extension_provider=<id>)
+//   DUCKLINK_DENY=<id>,<id>     -> exclude provider ids
+// (See the report: `SET`-based overrides need a C++ base extension /
+// DuckDB exposing add_extension_option in the C API -- roadmap.)
+// ---------------------------------------------------------------------------
+
+/// The shared, manifest-driven shim body. Reads `DUCKLINK_HOME/index.json`,
+/// resolves the best certified provider for `name`, and dual-loads it.
+pub fn shim_load(con: &Connection, name: &str) -> Result<LoadReport> {
+    let home = std::env::var("DUCKLINK_HOME")
+        .map(PathBuf::from)
+        .map_err(|_| anyhow!("DUCKLINK_HOME not set (the DuckLink install dir with index.json)"))?;
+
+    let index_path = home.join("index.json");
+    let index_bytes = std::fs::read(&index_path)
+        .map_err(|e| anyhow!("reading {}: {e}", index_path.display()))?;
+    let index: serde_json::Value = serde_json::from_slice(&index_bytes)
+        .map_err(|e| anyhow!("parsing {}: {e}", index_path.display()))?;
+
+    let mut entry = resolver::read_manifest_entry(&index, name)
+        .ok_or_else(|| anyhow!("no manifest entry for '{name}' in {}", index_path.display()))?;
+    absolutize_artifacts(&mut entry, &home);
+
+    // Canonical suite digest = content digest of the suite the resolver holds.
+    let canonical = canonical_suite_digest(&home, name);
+
+    let env = env_from_environment();
+    let policy = policy_from_environment();
+    let engine = Arc::new(Mutex::new(Engine2::new()?));
+    ducklink_load_gated(con, engine, &entry, &env, &policy, canonical.as_deref())
+}
+
+/// Rewrite each provider's artifact (relative in the manifest) to an absolute
+/// path under `home`. Leaves remote URLs (`oci://`, `http`) untouched.
+fn absolutize_artifacts(entry: &mut ManifestEntry, home: &std::path::Path) {
+    fn fix(r: &ContentRef, home: &std::path::Path) -> ContentRef {
+        match r {
+            ContentRef::Path(p) if p.is_relative() => ContentRef::Path(home.join(p)),
+            ContentRef::Oci(s) if !s.contains("://") => {
+                ContentRef::Oci(home.join(s).to_string_lossy().into_owned())
+            }
+            other => other.clone(),
+        }
+    }
+    for p in &mut entry.providers {
+        match &mut p.kind {
+            ProviderKind::Wasm { artifact, .. } => *artifact = fix(artifact, home),
+            ProviderKind::Native { artifact, .. } => *artifact = fix(artifact, home),
+            ProviderKind::Remote { .. } => {}
+        }
+    }
+}
+
+/// Content digest of the conformance suite for `name` (sha256 hex of
+/// `$home/suites/<name>.sql`). `None` if absent -> the gate's suite-digest
+/// sub-check is skipped (passed + contract still enforced).
+fn canonical_suite_digest(home: &std::path::Path, name: &str) -> Option<String> {
+    let suite = home.join("suites").join(format!("{name}.sql"));
+    let bytes = std::fs::read(suite).ok()?;
+    Some(sha256_hex(&bytes))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Native arm allowed unless `DUCKLINK_ALLOW_NATIVE=0`. Default ON -- the native
+/// passthrough is the headline: plain `LOAD aba` prefers native (precedence).
+fn env_from_environment() -> Env {
+    let allow_native = std::env::var("DUCKLINK_ALLOW_NATIVE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    Env {
+        wasm_runtime: true,
+        allow_native,
+    }
+}
+
+fn policy_from_environment() -> ResolvePolicy {
+    let forced_provider = std::env::var("DUCKLINK_PROVIDER").ok().filter(|s| !s.is_empty());
+    let denied = std::env::var("DUCKLINK_DENY")
+        .ok()
+        .map(|s| s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect())
+        .unwrap_or_default();
+    ResolvePolicy {
+        forced_provider,
+        denied,
     }
 }
 

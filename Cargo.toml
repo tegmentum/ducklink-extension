@@ -38,7 +38,7 @@ bundled = ["duckdb-api", "duckdb/bundled"]
 # model, the callback registry, and the load_component loader. Consumed from the
 # public ducklink monorepo so this extension loads components identically to the
 # Direction-1 host.
-ducklink-runtime = { git = "https://github.com/tegmentum/ducklink", rev = "fb4e228" }
+ducklink-runtime = { git = "https://github.com/tegmentum/ducklink", rev = "6f6b200" }
 # wasmtime to run the component. MUST match ducklink-runtime's wasmtime version so
 # the WasiCtx / generated bindings are the same types across the crate boundary.
 # SPIKE (design "D"): bumped from the old git rev 1ec8660 (=39.0.0) to 46.0.1 to
@@ -49,6 +49,9 @@ wasmtime-wasi = "46.0.1"
 anyhow = "1"
 # Manifest parsing for the lifted resolver (de-risk spike for design "D").
 serde_json = "1"
+# Conformance suite content-digest (the canonical suite_digest the resolver gate
+# checks against the manifest's recorded digest).
+sha2 = "0.10"
 
 # DuckDB C Extension API (loadable-extension build). Pinned to the DuckDB version
 # the community-extensions CI builds against (v1.5.4); bumped per release.
@@ -59,7 +62,7 @@ libduckdb-sys = { version = "1.10504.0", features = ["loadable-extension"], opti
 criterion = "0.5"
 # For constructing reg::DuckValue chunks in the dispatch benchmark (benches are
 # separate compilation units, so the engine's runtime dep must be a dev-dep too).
-ducklink-runtime = { git = "https://github.com/tegmentum/ducklink", rev = "fb4e228" }
+ducklink-runtime = { git = "https://github.com/tegmentum/ducklink", rev = "6f6b200" }
 
 # Micro-benchmark of the Direction-2 scalar dispatch hot path (Engine2 only --
 # no DuckDB, so it builds with --no-default-features). Run:
