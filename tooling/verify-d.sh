@@ -83,6 +83,18 @@ echo "== 3: deny native -> wasm =="
 DUCKLINK_HOME="$DLHOME" DUCKLINK_ALLOW_NATIVE=0 "$CLI" -unsigned :memory: <<SQL
 SET extension_directory='$EXTDIR'; LOAD aba; SELECT aba_validate('021000021') AS chase;
 SQL
+echo "== 4: tampered native suite_digest -> gate rejects native -> wasm =="
+DLBAD=$WORK/home-tampered; rm -rf "$DLBAD"; cp -R "$DLHOME" "$DLBAD"
+python3 - "$DLBAD/index.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p))
+for pr in d["extensions"][0]["providers"]:
+    if pr["kind"]=="native": pr["conformance"]["suite_digest"]="DEADBEEF-forged"
+json.dump(d,open(p,"w"),indent=1)
+PY
+DUCKLINK_HOME="$DLBAD" "$CLI" -unsigned :memory: <<SQL
+SET extension_directory='$EXTDIR'; LOAD aba; SELECT aba_validate('021000021') AS chase;
+SQL
 echo "## native conformance"
 bash "$HERE/tooling/native-conformance.sh" aba "$DLHOME/artifacts/aba_native.duckdb_extension" "$SUITE" "$CONTRACT" "$CLI"
 echo "## verify-d complete"
