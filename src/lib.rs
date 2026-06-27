@@ -16,11 +16,23 @@
 
 pub mod engine;
 
+/// The multi-provider resolver spine (design A), lifted VERBATIM from
+/// `crates/ducklink-host/src/resolver.rs` to prove it drops into a native
+/// extension crate unchanged (de-risk spike for design "D"). Self-contained: no
+/// wasmtime / no engine types.
+pub mod resolver;
+
 /// The Direction-2 DuckDB sink (registration + dispatch). Present whenever the
 /// duckdb crate is available (the `loadable` and `bundled` features both enable
 /// it); the `bundled` end-to-end test lives in this module.
 #[cfg(feature = "duckdb-api")]
 pub mod reg_duckdb;
+
+/// The native-passthrough hook (de-risk spike): `ducklink_load('aba')` resolves a
+/// provider via [`resolver`] and dual-loads it (wasm arm via the Route-A bridge /
+/// native arm via DuckDB's own `LOAD`).
+#[cfg(feature = "duckdb-api")]
+pub mod passthrough;
 
 #[cfg(feature = "loadable")]
 mod loadable {

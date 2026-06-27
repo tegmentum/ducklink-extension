@@ -39,11 +39,16 @@ bundled = ["duckdb-api", "duckdb/bundled"]
 # public ducklink monorepo so this extension loads components identically to the
 # Direction-1 host.
 ducklink-runtime = { git = "https://github.com/tegmentum/ducklink", rev = "fb4e228" }
-# wasmtime to run the component. MUST match ducklink-runtime's pinned rev so the
-# WasiCtx / generated bindings are the same types across the crate boundary.
-wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", rev = "1ec866079720e573fc2aa06947c84f6132010993", features = ["component-model"] }
-wasmtime-wasi = { git = "https://github.com/bytecodealliance/wasmtime", rev = "1ec866079720e573fc2aa06947c84f6132010993" }
+# wasmtime to run the component. MUST match ducklink-runtime's wasmtime version so
+# the WasiCtx / generated bindings are the same types across the crate boundary.
+# SPIKE (design "D"): bumped from the old git rev 1ec8660 (=39.0.0) to 46.0.1 to
+# match the local crates/ducklink-runtime (consumed via the monorepo path override),
+# which moved to wasmtime 46.0.1. The committed git rev had drifted out of sync.
+wasmtime = { version = "46.0.1", features = ["component-model"] }
+wasmtime-wasi = "46.0.1"
 anyhow = "1"
+# Manifest parsing for the lifted resolver (de-risk spike for design "D").
+serde_json = "1"
 
 # DuckDB C Extension API (loadable-extension build). Pinned to the DuckDB version
 # the community-extensions CI builds against (v1.5.4); bumped per release.

@@ -44,7 +44,9 @@ fn build_engine() -> Result<Engine> {
             eprintln!("[ducklink] wasmtime compile cache unavailable: {err}");
         }
     }
-    Engine::new(&config).context("failed to create wasmtime engine")
+    // wasmtime 46's Error no longer impls std::error::Error, so anyhow's
+    // `.context()` (which requires StdError) doesn't apply; map via Display.
+    Engine::new(&config).map_err(|e| anyhow!("failed to create wasmtime engine: {e}"))
 }
 
 /// Config/logging sink for native DuckDB. Logging goes to stderr; config reads
@@ -160,7 +162,7 @@ impl Engine2 {
     /// functions it registered. The instance is retained for dispatch.
     pub fn load(&mut self, extension: &str, path: &Path) -> Result<LoadedComponent> {
         let component = Component::from_file(&self.engine, path)
-            .with_context(|| format!("loading component at {}", path.display()))?;
+            .map_err(|e| anyhow!("loading component at {}: {e}", path.display()))?;
         // Grant outbound network + name lookup so network-using components (dns,
         // http, httpfs, ...) work. Best-effort, not a sandbox: a component that
         // does not use sockets is unaffected. (A future opt-in gate could mirror
