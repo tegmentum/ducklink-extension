@@ -19,12 +19,19 @@ use wasmtime::{AsContextMut, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::duckdb_extension_bindings::duckdb::extension::{
-    catalog as extension_catalog, config as extension_config, files as extension_files,
-    collation as extension_collation, files_reg as extension_files_reg, index as extension_index,
-    logging as extension_logging, query as extension_query, runtime as extension_runtime,
-    storage as extension_storage, types as extension_types,
+    arrow_ext as extension_arrow_ext, catalog as extension_catalog,
+    compression as extension_compression, config as extension_config,
+    coordinate_system as extension_coordinate_system, encoding as extension_encoding,
+    files as extension_files, collation as extension_collation, files_reg as extension_files_reg,
+    index as extension_index, lifecycle as extension_lifecycle, logging as extension_logging,
+    macro_ext as extension_macro_ext, optimizer as extension_optimizer, parser as extension_parser,
+    query as extension_query, runtime as extension_runtime,
+    runtime_ext as extension_runtime_ext, secret as extension_secret,
+    settings as extension_settings, storage as extension_storage,
+    table_stream as extension_table_stream, types as extension_types,
+    types_ext as extension_types_ext,
 };
-use crate::duckdb_extension_bindings::DuckdbExtension;
+use crate::duckdb_extension_bindings::{DuckdbExtension, DuckdbExtensionPre};
 use crate::reg;
 use crate::{CallbackKind, CallbackRegistry};
 
@@ -127,6 +134,25 @@ type PendingIndex = reg::IndexReg;
 type PendingFiles = reg::FilesReg;
 type PendingCollation = reg::CollationReg;
 type PendingPragma = reg::PragmaReg;
+// 2.1.0 additive captures.
+type PendingCopyHandler = reg::CopyHandlerReg;
+type PendingSecret = reg::SecretReg;
+type PendingSetting = reg::SettingReg;
+type PendingTableMacro = reg::TableMacroReg;
+type PendingModifiedType = reg::ModifiedTypeReg;
+type PendingEnumType = reg::EnumTypeReg;
+// 2.2.0 additive captures (Items 6-7).
+type PendingScalarEx = reg::ScalarExReg;
+type PendingConnCallback = reg::ConnCallbackReg;
+type PendingCoordinateSystem = reg::CoordinateSystemReg;
+type PendingArrowTable = reg::ArrowTableReg;
+type PendingEncoding = reg::EncodingReg;
+type PendingCompression = reg::CompressionReg;
+// 2.3.0 / v3 additive captures.
+type PendingParser = reg::ParserReg;
+type PendingOptimizer = reg::OptimizerReg;
+// 3.1.0 additive capture: streaming/filter-pushdown table function.
+type PendingFilterableTable = reg::FilterableTableReg;
 
 #[derive(Default)]
 struct PendingScalarRegistry {
@@ -218,6 +244,24 @@ pub struct ExtensionStoreState {
     pending_files: Vec<PendingFiles>,
     pending_collations: Vec<PendingCollation>,
     pending_pragmas: Vec<PendingPragma>,
+    // 2.1.0 additive capture buffers.
+    pending_copy_handlers: Vec<PendingCopyHandler>,
+    pending_secrets: Vec<PendingSecret>,
+    pending_settings: Vec<PendingSetting>,
+    pending_table_macros: Vec<PendingTableMacro>,
+    pending_modified_types: Vec<PendingModifiedType>,
+    pending_enum_types: Vec<PendingEnumType>,
+    // 2.2.0 additive capture buffers (Items 6-7).
+    pending_scalar_ex: Vec<PendingScalarEx>,
+    pending_conn_callbacks: Vec<PendingConnCallback>,
+    pending_coordinate_systems: Vec<PendingCoordinateSystem>,
+    pending_arrow_tables: Vec<PendingArrowTable>,
+    pending_encodings: Vec<PendingEncoding>,
+    pending_compressions: Vec<PendingCompression>,
+    // 2.3.0 / v3 additive capture buffers.
+    pending_parsers: Vec<PendingParser>,
+    pending_optimizers: Vec<PendingOptimizer>,
+    pending_filterable_tables: Vec<PendingFilterableTable>,
     /// Maps the handle returned from `table-registry.register` to the table
     /// function name, so `files.register-replacement-scan` can resolve it.
     table_handle_names: HashMap<u32, String>,
@@ -269,6 +313,21 @@ impl ExtensionStoreState {
             pending_files: Vec::new(),
             pending_collations: Vec::new(),
             pending_pragmas: Vec::new(),
+            pending_copy_handlers: Vec::new(),
+            pending_secrets: Vec::new(),
+            pending_settings: Vec::new(),
+            pending_table_macros: Vec::new(),
+            pending_modified_types: Vec::new(),
+            pending_enum_types: Vec::new(),
+            pending_scalar_ex: Vec::new(),
+            pending_conn_callbacks: Vec::new(),
+            pending_coordinate_systems: Vec::new(),
+            pending_arrow_tables: Vec::new(),
+            pending_encodings: Vec::new(),
+            pending_compressions: Vec::new(),
+            pending_parsers: Vec::new(),
+            pending_optimizers: Vec::new(),
+            pending_filterable_tables: Vec::new(),
             table_handle_names: HashMap::new(),
             callback_registry,
             extension_name,
@@ -344,6 +403,58 @@ impl ExtensionStoreState {
     /// via `pragma-host.pragma-list` and intercepts `PRAGMA <name>(...)`).
     fn take_pending_pragmas(&mut self) -> Vec<PendingPragma> {
         std::mem::take(&mut self.pending_pragmas)
+    }
+
+    // --- 2.1.0 additive drains (mirror take_pending_pragmas) ---
+    fn take_pending_copy_handlers(&mut self) -> Vec<PendingCopyHandler> {
+        std::mem::take(&mut self.pending_copy_handlers)
+    }
+    fn take_pending_secrets(&mut self) -> Vec<PendingSecret> {
+        std::mem::take(&mut self.pending_secrets)
+    }
+    fn take_pending_settings(&mut self) -> Vec<PendingSetting> {
+        std::mem::take(&mut self.pending_settings)
+    }
+    fn take_pending_table_macros(&mut self) -> Vec<PendingTableMacro> {
+        std::mem::take(&mut self.pending_table_macros)
+    }
+    fn take_pending_modified_types(&mut self) -> Vec<PendingModifiedType> {
+        std::mem::take(&mut self.pending_modified_types)
+    }
+    fn take_pending_enum_types(&mut self) -> Vec<PendingEnumType> {
+        std::mem::take(&mut self.pending_enum_types)
+    }
+
+    // --- 2.2.0 additive drains (Items 6-7; mirror the 2.1.0 drains) ---
+    fn take_pending_scalar_ex(&mut self) -> Vec<PendingScalarEx> {
+        std::mem::take(&mut self.pending_scalar_ex)
+    }
+    fn take_pending_conn_callbacks(&mut self) -> Vec<PendingConnCallback> {
+        std::mem::take(&mut self.pending_conn_callbacks)
+    }
+    fn take_pending_coordinate_systems(&mut self) -> Vec<PendingCoordinateSystem> {
+        std::mem::take(&mut self.pending_coordinate_systems)
+    }
+    fn take_pending_arrow_tables(&mut self) -> Vec<PendingArrowTable> {
+        std::mem::take(&mut self.pending_arrow_tables)
+    }
+    fn take_pending_encodings(&mut self) -> Vec<PendingEncoding> {
+        std::mem::take(&mut self.pending_encodings)
+    }
+    fn take_pending_compressions(&mut self) -> Vec<PendingCompression> {
+        std::mem::take(&mut self.pending_compressions)
+    }
+
+    // --- 2.3.0 / v3 additive drains ---
+    fn take_pending_parsers(&mut self) -> Vec<PendingParser> {
+        std::mem::take(&mut self.pending_parsers)
+    }
+    fn take_pending_optimizers(&mut self) -> Vec<PendingOptimizer> {
+        std::mem::take(&mut self.pending_optimizers)
+    }
+    // --- 3.1.0 additive drain ---
+    fn take_pending_filterable_tables(&mut self) -> Vec<PendingFilterableTable> {
+        std::mem::take(&mut self.pending_filterable_tables)
     }
 
     fn drain_pending(&mut self) -> PendingRegistrationsData {
@@ -1070,16 +1181,431 @@ impl extension_files::Host for ExtensionStoreState {
         &mut self,
         handler: extension_files::CopyHandler,
     ) -> Result<u32, String> {
-        // DuckDB's C API exposes no copy-function registration, so this cannot
-        // be honoured. Fail loudly rather than silently pretending it worked.
+        // 2.1.0 (Item 1): a COPY handler is captured into the neutral pending
+        // buffer; COPY TO / COPY FROM are driven through the component's exported
+        // `copy-dispatch` (see ExtensionInstance::copy_*). The `function` field is
+        // the copy-function-handle the host threads back into every dispatch call.
+        let id = self.alloc_resource_id();
         eprintln!(
-            "[extension-manager] files register-copy-handler ext='{}' for '{}' rejected: unsupported",
-            handler.extension, self.extension_name
+            "[extension-manager] files register-copy-handler ext='{}' (function={}) for '{}' -> id {id}",
+            handler.extension, handler.function, self.extension_name
         );
-        Err(
-            "copy handlers are not supported: DuckDB's C API has no copy-function registration"
-                .to_string(),
-        )
+        self.pending_copy_handlers.push(PendingCopyHandler {
+            extension: self.extension_name.clone(),
+            file_extension: handler.extension,
+            function_handle: handler.function,
+        });
+        Ok(id)
+    }
+}
+
+// 2.1.0 (Item 2): the `secret` interface lets a component declare a secret TYPE
+// and named PROVIDERs in `load()`. The host satisfies the import so
+// secret-capable components instantiate; the declaration is captured into the
+// neutral pending buffer. Materializing a concrete secret is driven through the
+// component's exported `secret-dispatch`.
+impl extension_secret::Host for ExtensionStoreState {
+    fn register_secret_type(
+        &mut self,
+        type_name: String,
+        params: BindgenVec<extension_secret::SecretParam>,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered secret type '{type_name}' ({} params, callback={callback_handle})",
+            self.extension_name,
+            params.len()
+        );
+        self.pending_secrets.push(PendingSecret {
+            extension: self.extension_name.clone(),
+            type_name,
+            provider: None,
+            params: params.into_iter().map(|p| (p.name, p.redacted)).collect(),
+            callback_handle,
+        });
+        Ok(self.alloc_resource_id())
+    }
+
+    fn register_secret_provider(
+        &mut self,
+        type_name: String,
+        provider: String,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered secret provider '{type_name}'/'{provider}' (callback={callback_handle})",
+            self.extension_name
+        );
+        self.pending_secrets.push(PendingSecret {
+            extension: self.extension_name.clone(),
+            type_name,
+            provider: Some(provider),
+            params: Vec::new(),
+            callback_handle,
+        });
+        Ok(self.alloc_resource_id())
+    }
+}
+
+// 2.1.0 (Item 3): the `settings` interface lets a component DECLARE a config
+// option (distinct from reading config via `config`). Captured into the neutral
+// pending buffer; the direction-specific sink surfaces it to the database.
+impl extension_settings::Host for ExtensionStoreState {
+    fn register_option(
+        &mut self,
+        name: String,
+        description: String,
+        ty: extension_settings::SettingType,
+        default_value: Option<String>,
+        scope: extension_settings::SettingScope,
+    ) -> Result<(), extension_types::Duckerror> {
+        let ty = match ty {
+            extension_settings::SettingType::Boolean => "boolean",
+            extension_settings::SettingType::Varchar => "varchar",
+            extension_settings::SettingType::Bigint => "bigint",
+            extension_settings::SettingType::Double => "double",
+        }
+        .to_string();
+        let scope = match scope {
+            extension_settings::SettingScope::Local => "local",
+            extension_settings::SettingScope::Global => "global",
+        }
+        .to_string();
+        eprintln!(
+            "[extension-runtime:{}] registered option '{name}' (type={ty}, scope={scope})",
+            self.extension_name
+        );
+        self.pending_settings.push(PendingSetting {
+            extension: self.extension_name.clone(),
+            name,
+            description,
+            ty,
+            default_value,
+            scope,
+        });
+        Ok(())
+    }
+}
+
+// 2.3.0 / v3: the `parser` interface declares a parser extension. Captured into a
+// neutral pending buffer; the core shim drains it and wires a DuckDB
+// `ParserExtension` that forwards unrecognized statement text to the component's
+// `parser-dispatch.call-parse` and applies the returned string->SQL rewrite.
+impl extension_parser::Host for ExtensionStoreState {
+    fn register_parser_extension(
+        &mut self,
+        name: String,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        let registry_id = self.alloc_resource_id();
+        eprintln!(
+            "[extension-runtime:{}] registered parser extension '{name}' (registry={registry_id}, callback={callback_handle})",
+            self.extension_name
+        );
+        self.pending_parsers.push(PendingParser {
+            extension: self.extension_name.clone(),
+            name,
+            callback_handle,
+        });
+        Ok(registry_id)
+    }
+}
+
+// 2.3.0 / v3: the `optimizer` interface declares a general optimizer rule.
+// Captured into a neutral pending buffer; the core shim drains it and wires a
+// DuckDB `OptimizerExtension` that offers the flattened plan-shape to the
+// component's `optimizer-dispatch.call-optimize` and applies the rewrite directive.
+impl extension_optimizer::Host for ExtensionStoreState {
+    fn register_optimizer_rule(
+        &mut self,
+        rule_name: String,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        let registry_id = self.alloc_resource_id();
+        eprintln!(
+            "[extension-runtime:{}] registered optimizer rule '{rule_name}' (registry={registry_id}, callback={callback_handle})",
+            self.extension_name
+        );
+        self.pending_optimizers.push(PendingOptimizer {
+            extension: self.extension_name.clone(),
+            rule_name,
+            callback_handle,
+        });
+        Ok(registry_id)
+    }
+}
+
+// 3.1.0 (the first additive MINOR off the frozen major-3 baseline): the
+// `table-stream` interface declares a STREAMING + FILTER-PUSHDOWN-capable table
+// function. Captured into a neutral pending buffer; the core shim drains it and
+// wires a C++ streaming `TableFunction` with `filter_pushdown = true` that pushes
+// the conjunctive filter set down (as a neutral, by-value-safe descriptor) to the
+// component's `table-stream-dispatch.call-table-open-filtered` export.
+//
+// FREEZE-COMPLIANT: this is a brand-new interface (`table-stream`) in a new opt-in
+// world; the shared `runtime`/`types` enums are untouched, so every existing
+// @3.0.0 component keeps loading un-rebuilt.
+impl extension_table_stream::Host for ExtensionStoreState {
+    fn register_filterable_table(
+        &mut self,
+        name: String,
+        arguments: BindgenVec<extension_table_stream::Funcarg>,
+        columns: BindgenVec<extension_table_stream::Columndef>,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        let converted_arguments = convert_extension_funcargs(arguments.into());
+        let converted_columns = convert_extension_columndefs(columns.into());
+        // Allocate a GLOBALLY-ROUTABLE handle (mapping global -> this extension +
+        // the component-local `callback_handle` dispatcher) so the core can carry
+        // ONE u32 in the C++ TableFunction and the host routes every streaming
+        // dispatch call (open-filtered / next / close) back to the owning
+        // component, exactly as the regular table-callback path routes call-table.
+        let global = self.allocate_callback_handle(callback_handle, CallbackKind::Table);
+        eprintln!(
+            "[extension-runtime:{}] registered filterable streaming table fn '{name}' (global={global}, dispatcher={callback_handle}, args={}, cols={})",
+            self.extension_name,
+            converted_arguments.len(),
+            converted_columns.len(),
+        );
+        self.pending_filterable_tables.push(PendingFilterableTable {
+            extension: self.extension_name.clone(),
+            name,
+            arguments: converted_arguments,
+            columns: converted_columns,
+            callback_handle: global,
+        });
+        Ok(global)
+    }
+}
+
+// 2.1.0 (Item 5): the `macro-ext` interface adds TABLE macros (a relation body)
+// on top of the existing scalar-macro registration.
+impl extension_macro_ext::Host for ExtensionStoreState {
+    fn register_table_macro(
+        &mut self,
+        schema: String,
+        name: String,
+        parameters: BindgenVec<String>,
+        body_sql: String,
+    ) -> Result<(), extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered table macro '{schema}.{name}' ({} params)",
+            self.extension_name,
+            parameters.len()
+        );
+        self.pending_table_macros.push(PendingTableMacro {
+            extension: self.extension_name.clone(),
+            schema,
+            name,
+            parameters: parameters.into_iter().collect(),
+            body_sql,
+        });
+        Ok(())
+    }
+}
+
+// 2.1.0 (Item 5): the `types-ext` interface adds modified logical types (over a
+// type-expression, riding the escape hatch) and ENUM types. `types` stays FROZEN.
+impl extension_types_ext::Host for ExtensionStoreState {
+    fn register_logical_type_modified(
+        &mut self,
+        name: String,
+        type_expr: String,
+    ) -> Result<u32, extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered modified logical type '{name}' = {type_expr}",
+            self.extension_name
+        );
+        self.pending_modified_types.push(PendingModifiedType {
+            extension: self.extension_name.clone(),
+            name,
+            type_expr,
+        });
+        Ok(self.alloc_resource_id())
+    }
+
+    fn register_enum(
+        &mut self,
+        name: String,
+        members: BindgenVec<String>,
+    ) -> Result<u32, extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered enum type '{name}' ({} members)",
+            self.extension_name,
+            members.len()
+        );
+        self.pending_enum_types.push(PendingEnumType {
+            extension: self.extension_name.clone(),
+            name,
+            members: members.into_iter().collect(),
+        });
+        Ok(self.alloc_resource_id())
+    }
+}
+
+// 2.2.0 (Item 6): the `runtime-ext` interface adds a RICHER scalar registration
+// (varargs + named args + NULL handling) without touching the frozen `runtime`
+// scalar-registry signature. Captured into the neutral pending buffer; the
+// direction-specific sink forwards it. A callback handle is allocated exactly
+// like the base scalar path so invocations route to the owning component.
+impl extension_runtime_ext::Host for ExtensionStoreState {
+    fn register_scalar_ex(
+        &mut self,
+        name: String,
+        arguments: BindgenVec<extension_runtime_ext::Funcarg>,
+        varargs: Option<extension_runtime_ext::Logicaltype>,
+        returns: extension_runtime_ext::Logicaltype,
+        null_handling: extension_runtime_ext::NullHandling,
+        callback_handle: u32,
+        options: Option<extension_runtime_ext::Funcopts>,
+    ) -> Result<u32, extension_types::Duckerror> {
+        let special_null = matches!(null_handling, extension_runtime_ext::NullHandling::Special);
+        let arguments = convert_extension_funcargs(arguments.into_iter().collect());
+        let varargs = varargs.map(convert_extension_logicaltype);
+        let returns = convert_extension_logicaltype(returns);
+        let options = options.map(convert_extension_funcopts);
+        let registry_id = self.alloc_resource_id();
+        eprintln!(
+            "[extension-runtime:{}] registered scalar-ex '{name}' (registry={registry_id}, callback={callback_handle}, varargs={}, special_null={special_null})",
+            self.extension_name,
+            varargs.is_some()
+        );
+        self.pending_scalar_ex.push(PendingScalarEx {
+            extension: self.extension_name.clone(),
+            name,
+            arguments,
+            varargs,
+            returns,
+            special_null,
+            callback_handle,
+            options,
+        });
+        Ok(registry_id)
+    }
+}
+
+// 2.2.0 (Item 7): the `lifecycle` interface lets a component subscribe to
+// connection open/close events; the host captures the subscription and drives the
+// notifications through the separate `conn-dispatch` export.
+impl extension_lifecycle::Host for ExtensionStoreState {
+    fn register_connection_callback(
+        &mut self,
+        events: extension_lifecycle::ConnEvents,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        let on_opened = events.contains(extension_lifecycle::ConnEvents::OPENED);
+        let on_closed = events.contains(extension_lifecycle::ConnEvents::CLOSED);
+        eprintln!(
+            "[extension-runtime:{}] registered connection callback (opened={on_opened}, closed={on_closed}, callback={callback_handle})",
+            self.extension_name
+        );
+        self.pending_conn_callbacks.push(PendingConnCallback {
+            extension: self.extension_name.clone(),
+            on_opened,
+            on_closed,
+            callback_handle,
+        });
+        Ok(self.alloc_resource_id())
+    }
+}
+
+// 2.2.0 (Item 7): the `coordinate-system` interface lets a spatial component
+// declare CRS definitions (authority + code + WKT2) in load(); the host captures
+// them so the core can resolve geometry SRIDs. Registration only -- reprojection
+// (GDAL/PROJ ST_Transform) is OUT OF SCOPE for 2.2.0.
+impl extension_coordinate_system::Host for ExtensionStoreState {
+    fn register_coordinate_system(
+        &mut self,
+        crs: extension_coordinate_system::CrsDef,
+    ) -> Result<u32, extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered coordinate system {}:{}",
+            self.extension_name, crs.auth_name, crs.code
+        );
+        self.pending_coordinate_systems.push(PendingCoordinateSystem {
+            extension: self.extension_name.clone(),
+            auth_name: crs.auth_name,
+            code: crs.code,
+            wkt: crs.wkt,
+        });
+        Ok(self.alloc_resource_id())
+    }
+}
+
+// 2.2.0 (Item 7): the `arrow-ext` interface lets a component declare an Arrow
+// table producer; the host captures the declaration and streams the batches via
+// the producer's callback handle (reusing the table cursor shape).
+impl extension_arrow_ext::Host for ExtensionStoreState {
+    fn register_arrow_table(
+        &mut self,
+        name: String,
+        schema: BindgenVec<extension_arrow_ext::Columndef>,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        let columns = convert_extension_columndefs(schema.into_iter().collect());
+        eprintln!(
+            "[extension-runtime:{}] registered arrow table '{name}' ({} columns, callback={callback_handle})",
+            self.extension_name,
+            columns.len()
+        );
+        self.pending_arrow_tables.push(PendingArrowTable {
+            extension: self.extension_name.clone(),
+            name,
+            columns,
+            callback_handle,
+        });
+        Ok(self.alloc_resource_id())
+    }
+}
+
+// 2.2.0 (Item 7): the `encoding` interface lets a component declare a text
+// encoding it can transcode to UTF-8; the host captures the declaration so the
+// CSV/text readers can route an `encoding=` option. Transcoding rides an
+// already-registered scalar, so no new dispatch export is needed.
+impl extension_encoding::Host for ExtensionStoreState {
+    fn register_encoding(
+        &mut self,
+        name: String,
+        aliases: BindgenVec<String>,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered text encoding '{name}' ({} aliases, callback={callback_handle})",
+            self.extension_name,
+            aliases.len()
+        );
+        self.pending_encodings.push(PendingEncoding {
+            extension: self.extension_name.clone(),
+            name,
+            aliases: aliases.into_iter().collect(),
+            callback_handle,
+        });
+        Ok(self.alloc_resource_id())
+    }
+}
+
+// 2.2.0 (Item 7): the `compression` interface lets a component declare a
+// compression codec keyed by a file extension; the host captures the declaration
+// so the file readers/writers can route a matching file. The (de)compression
+// rides an already-registered scalar, so no new dispatch export is needed.
+impl extension_compression::Host for ExtensionStoreState {
+    fn register_compression(
+        &mut self,
+        name: String,
+        file_extension: String,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        eprintln!(
+            "[extension-runtime:{}] registered compression codec '{name}' (.{file_extension}, callback={callback_handle})",
+            self.extension_name
+        );
+        self.pending_compressions.push(PendingCompression {
+            extension: self.extension_name.clone(),
+            name,
+            file_extension,
+            callback_handle,
+        });
+        Ok(self.alloc_resource_id())
     }
 }
 
@@ -1415,6 +1941,31 @@ pub struct ExtensionInstance {
     // httpfs M2: lazily-built files bindings (None until first file-dispatch
     // call or for non-files extensions).
     files_bindings: Option<crate::duckdb_extension_files_bindings::DuckdbExtensionFiles>,
+    // 2.3.0 / v3: lazily-built parser-dispatch bindings (None until first
+    // call-parse, or for non-parser extensions).
+    parser_bindings: Option<crate::duckdb_extension_parser_bindings::DuckdbExtensionParser>,
+    // 2.3.0 / v3: lazily-built optimizer-dispatch bindings (None until first
+    // call-optimize, or for non-optimizer extensions).
+    optimizer_bindings:
+        Option<crate::duckdb_extension_optimizer_bindings::DuckdbExtensionOptimizer>,
+    // 2.1.0: lazily-built copy / secret / writable-storage bindings.
+    copy_bindings: Option<crate::duckdb_extension_copy_bindings::DuckdbExtensionCopy>,
+    secret_bindings: Option<crate::duckdb_extension_secret_bindings::DuckdbExtensionSecret>,
+    storage_write_bindings:
+        Option<crate::duckdb_extension_storage_write_bindings::DuckdbExtensionStorageWrite>,
+    // 2.2.0 (Items 6-7): lazily-built dispatch bindings for the additive
+    // dispatch-only worlds. Each is built on first use from the SAME loaded
+    // component instance, exactly like the 2.1.0 copy/secret/storage-write path.
+    table_stream_bindings:
+        Option<crate::duckdb_extension_table_stream_bindings::DuckdbExtensionTableStream>,
+    aggregate_incr_bindings:
+        Option<crate::duckdb_extension_aggregate_incr_bindings::DuckdbExtensionAggregateIncr>,
+    conn_bindings: Option<crate::duckdb_extension_conn_bindings::DuckdbExtensionConn>,
+    file_write_bindings:
+        Option<crate::duckdb_extension_file_write_bindings::DuckdbExtensionFileWrite>,
+    index_write_bindings:
+        Option<crate::duckdb_extension_index_write_bindings::DuckdbExtensionIndexWrite>,
+    settings_bindings: Option<crate::duckdb_extension_settings_bindings::DuckdbExtensionSettings>,
 }
 
 fn map_extension_trap(err: wasmtime::Error) -> extension_types::Duckerror {
@@ -1540,6 +2091,31 @@ mod index_types {
 /// the host to surface up the index-host import.
 pub use crate::duckdb_extension_index_bindings::exports::duckdb::extension::index_dispatch::IndexHit;
 
+/// 2.1.0 (Item 1): result of binding a COPY FROM reader (reader handle +
+/// columns), re-exported for the host. `columns` is the base `extension_types`
+/// Columndef (the world's `types` is remapped to the base bindings).
+pub use crate::duckdb_extension_copy_bindings::exports::duckdb::extension::copy_dispatch::CopyFromBindResult;
+
+/// 2.1.0 (Item 2): one flat key=value entry of a materialized secret,
+/// re-exported for the host.
+pub use crate::duckdb_extension_secret_bindings::exports::duckdb::extension::secret_dispatch::SecretKv;
+
+/// 2.2.0 (Item 6): result of opening a streaming table cursor (cursor handle +
+/// projected column schema), re-exported for the host.
+pub use crate::duckdb_extension_table_stream_bindings::exports::duckdb::extension::table_stream_dispatch::TableOpenResult;
+
+/// 3.1.0: the neutral, by-value-safe pushed-down filter descriptor + its
+/// comparator enum (`table-stream-dispatch.table-filter` / `filter-op`),
+/// re-exported so the core<->host bridge can build the conjunctive filter set
+/// the streaming `TableFunction` pushes to `call-table-open-filtered`.
+pub use crate::duckdb_extension_table_stream_bindings::exports::duckdb::extension::table_stream_dispatch::{
+    FilterOp, TableFilter,
+};
+
+/// 2.2.0 (Item 7): metadata for one path returned by `file-write-dispatch.file-stat`,
+/// re-exported for the host.
+pub use crate::duckdb_extension_file_write_bindings::exports::duckdb::extension::file_write_dispatch::FileInfo;
+
 fn index_duckerror_to_ext(err: index_types::Duckerror) -> extension_types::Duckerror {
     match err {
         index_types::Duckerror::Invalidargument(m) => extension_types::Duckerror::Invalidargument(m),
@@ -1563,6 +2139,17 @@ impl ExtensionInstance {
             storage_bindings: None,
             index_bindings: None,
             files_bindings: None,
+            parser_bindings: None,
+            optimizer_bindings: None,
+            copy_bindings: None,
+            secret_bindings: None,
+            storage_write_bindings: None,
+            table_stream_bindings: None,
+            aggregate_incr_bindings: None,
+            conn_bindings: None,
+            file_write_bindings: None,
+            index_write_bindings: None,
+            settings_bindings: None,
         }
     }
 
@@ -1705,6 +2292,813 @@ impl ExtensionInstance {
         let mut ctx = self.store.as_context_mut();
         let data: *mut ExtensionStoreState = ctx.data_mut();
         unsafe { (*data).take_pending_pragmas() }
+    }
+
+    // --- 2.1.0 additive drains (mirror take_pending_pragmas) ---
+
+    /// 2.1.0 (Item 1): drains the captured COPY-handler registrations.
+    pub fn take_pending_copy_handlers(&mut self) -> Vec<crate::reg::CopyHandlerReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_copy_handlers() }
+    }
+
+    /// 2.1.0 (Item 2): drains the captured secret type/provider registrations.
+    pub fn take_pending_secrets(&mut self) -> Vec<crate::reg::SecretReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_secrets() }
+    }
+
+    /// 2.1.0 (Item 3): drains the captured option/settings registrations.
+    pub fn take_pending_settings(&mut self) -> Vec<crate::reg::SettingReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_settings() }
+    }
+
+    /// 2.1.0 (Item 5): drains the captured table-macro registrations.
+    pub fn take_pending_table_macros(&mut self) -> Vec<crate::reg::TableMacroReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_table_macros() }
+    }
+
+    /// 2.1.0 (Item 5): drains the captured modified-logical-type registrations.
+    pub fn take_pending_modified_types(&mut self) -> Vec<crate::reg::ModifiedTypeReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_modified_types() }
+    }
+
+    /// 2.1.0 (Item 5): drains the captured ENUM-type registrations.
+    pub fn take_pending_enum_types(&mut self) -> Vec<crate::reg::EnumTypeReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_enum_types() }
+    }
+
+    // --- 2.2.0 additive drains (Items 6-7; mirror the 2.1.0 drains) ---
+
+    /// 2.2.0 (Item 6): drains the captured richer scalar (scalar-ex) registrations.
+    pub fn take_pending_scalar_ex(&mut self) -> Vec<crate::reg::ScalarExReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_scalar_ex() }
+    }
+
+    /// 2.2.0 (Item 7): drains the captured connection-lifecycle subscriptions.
+    pub fn take_pending_conn_callbacks(&mut self) -> Vec<crate::reg::ConnCallbackReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_conn_callbacks() }
+    }
+
+    /// 2.2.0 (Item 7): drains the captured coordinate-system (CRS) registrations.
+    pub fn take_pending_coordinate_systems(&mut self) -> Vec<crate::reg::CoordinateSystemReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_coordinate_systems() }
+    }
+
+    /// 2.2.0 (Item 7): drains the captured Arrow-table-producer registrations.
+    pub fn take_pending_arrow_tables(&mut self) -> Vec<crate::reg::ArrowTableReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_arrow_tables() }
+    }
+
+    /// 2.2.0 (Item 7): drains the captured text-encoding registrations.
+    pub fn take_pending_encodings(&mut self) -> Vec<crate::reg::EncodingReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_encodings() }
+    }
+
+    /// 2.2.0 (Item 7): drains the captured compression-codec registrations.
+    pub fn take_pending_compressions(&mut self) -> Vec<crate::reg::CompressionReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_compressions() }
+    }
+
+    /// 2.3.0 / v3: drains the captured parser-extension registrations. The core
+    /// shim wires each into a DuckDB `ParserExtension`.
+    pub fn take_pending_parsers(&mut self) -> Vec<crate::reg::ParserReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_parsers() }
+    }
+
+    /// 2.3.0 / v3: drains the captured optimizer-rule registrations. The core shim
+    /// wires each into a DuckDB `OptimizerExtension`.
+    pub fn take_pending_optimizers(&mut self) -> Vec<crate::reg::OptimizerReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_optimizers() }
+    }
+
+    /// 3.1.0: drains the captured streaming/filter-pushdown table-fn registrations
+    /// (the first additive MINOR off the frozen major-3 baseline). The core shim
+    /// wires each into a C++ streaming `TableFunction` with `filter_pushdown = true`
+    /// that drives the component's `table-stream-dispatch.call-table-open-filtered`.
+    pub fn take_pending_filterable_tables(&mut self) -> Vec<crate::reg::FilterableTableReg> {
+        let mut ctx = self.store.as_context_mut();
+        let data: *mut ExtensionStoreState = ctx.data_mut();
+        unsafe { (*data).take_pending_filterable_tables() }
+    }
+
+    // --- 2.1.0 (Item 1): copy-dispatch re-entry ---
+    // Drives a registered COPY handler's exported `copy-dispatch`. Types are
+    // remapped to the base `extension_types` (see lib.rs `with`), so no per-world
+    // conversion is needed.
+
+    fn copy_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_copy_bindings::DuckdbExtensionCopy,
+        extension_types::Duckerror,
+    > {
+        if self.copy_bindings.is_none() {
+            let built = crate::duckdb_extension_copy_bindings::DuckdbExtensionCopy::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.copy_bindings = Some(built);
+        }
+        Ok(self.copy_bindings.as_ref().unwrap())
+    }
+
+    /// COPY TO: bind a writer for `path`; returns a writer handle.
+    pub fn copy_to_bind(
+        &mut self,
+        handle: u32,
+        path: &str,
+        columns: &[extension_types::Columndef],
+        options: &[(String, String)],
+    ) -> Result<u32, extension_types::Duckerror> {
+        self.copy_bindings()?;
+        let bindings = self.copy_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_copy_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_copy_to_bind(store.as_context_mut(), handle, path, columns, options)
+            .map_err(map_extension_trap)?
+    }
+
+    /// COPY TO: sink a batch of rows to the writer.
+    pub fn copy_to_sink(
+        &mut self,
+        handle: u32,
+        writer: u32,
+        rows: &[Vec<extension_types::Duckvalue>],
+    ) -> Result<(), extension_types::Duckerror> {
+        self.copy_bindings()?;
+        let bindings = self.copy_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_copy_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_copy_to_sink(store.as_context_mut(), handle, writer, rows)
+            .map_err(map_extension_trap)?
+    }
+
+    /// COPY TO: finalize + close; returns rows written.
+    pub fn copy_to_finalize(
+        &mut self,
+        handle: u32,
+        writer: u32,
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.copy_bindings()?;
+        let bindings = self.copy_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_copy_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_copy_to_finalize(store.as_context_mut(), handle, writer)
+            .map_err(map_extension_trap)?
+    }
+
+    /// COPY FROM: bind a reader for `path`; returns (reader handle, columns).
+    pub fn copy_from_bind(
+        &mut self,
+        handle: u32,
+        path: &str,
+        options: &[(String, String)],
+    ) -> Result<CopyFromBindResult, extension_types::Duckerror> {
+        self.copy_bindings()?;
+        let bindings = self.copy_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_copy_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_copy_from_bind(store.as_context_mut(), handle, path, options)
+            .map_err(map_extension_trap)?
+    }
+
+    /// COPY FROM: pull up to `max_rows`; empty resultset signals EOF.
+    pub fn copy_from_scan(
+        &mut self,
+        handle: u32,
+        reader: u32,
+        max_rows: u32,
+    ) -> Result<Vec<Vec<extension_types::Duckvalue>>, extension_types::Duckerror> {
+        self.copy_bindings()?;
+        let bindings = self.copy_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_copy_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_copy_from_scan(store.as_context_mut(), handle, reader, max_rows)
+            .map_err(map_extension_trap)?
+    }
+
+    /// COPY FROM: close the reader.
+    pub fn copy_from_close(
+        &mut self,
+        handle: u32,
+        reader: u32,
+    ) -> Result<bool, extension_types::Duckerror> {
+        self.copy_bindings()?;
+        let bindings = self.copy_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_copy_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_copy_from_close(store.as_context_mut(), handle, reader)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.1.0 (Item 2): secret-dispatch re-entry ---
+
+    fn secret_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_secret_bindings::DuckdbExtensionSecret,
+        extension_types::Duckerror,
+    > {
+        if self.secret_bindings.is_none() {
+            let built = crate::duckdb_extension_secret_bindings::DuckdbExtensionSecret::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.secret_bindings = Some(built);
+        }
+        Ok(self.secret_bindings.as_ref().unwrap())
+    }
+
+    /// Materialize a secret of `(type_name, provider)` from `params`; returns the
+    /// resolved flat key=value set the core stores.
+    pub fn create_secret(
+        &mut self,
+        handle: u32,
+        type_name: &str,
+        provider: &str,
+        params: &[SecretKv],
+    ) -> Result<Vec<SecretKv>, extension_types::Duckerror> {
+        self.secret_bindings()?;
+        let bindings = self.secret_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_secret_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_create_secret(store.as_context_mut(), handle, type_name, provider, params)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.1.0 (Item 4): storage-write-dispatch re-entry ---
+
+    fn storage_write_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_storage_write_bindings::DuckdbExtensionStorageWrite,
+        extension_types::Duckerror,
+    > {
+        if self.storage_write_bindings.is_none() {
+            let built =
+                crate::duckdb_extension_storage_write_bindings::DuckdbExtensionStorageWrite::new(
+                    self.store.as_context_mut(),
+                    &self.instance,
+                )
+                .map_err(map_extension_trap)?;
+            self.storage_write_bindings = Some(built);
+        }
+        Ok(self.storage_write_bindings.as_ref().unwrap())
+    }
+
+    /// Begin a write transaction on `catalog`; returns a transaction handle.
+    pub fn storage_begin_transaction(
+        &mut self,
+        handle: u32,
+        catalog: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_begin_transaction(store.as_context_mut(), handle, catalog)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_commit_transaction(
+        &mut self,
+        handle: u32,
+        txn: u32,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_commit_transaction(store.as_context_mut(), handle, txn)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_rollback_transaction(
+        &mut self,
+        handle: u32,
+        txn: u32,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_rollback_transaction(store.as_context_mut(), handle, txn)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_create_table(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        columns: &[extension_types::Columndef],
+    ) -> Result<(), extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_create_table(store.as_context_mut(), handle, txn, table, columns)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_insert_rows(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        rows: &[Vec<extension_types::Duckvalue>],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_insert_rows(store.as_context_mut(), handle, txn, table, rows)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_delete_rows(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        rowids: &[i64],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_delete_rows(store.as_context_mut(), handle, txn, table, rowids)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_update_rows(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        rowids: &[i64],
+        rows: &[Vec<extension_types::Duckvalue>],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_update_rows(store.as_context_mut(), handle, txn, table, rowids, rows)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.2.0 (Item 6): table-stream-dispatch re-entry ---
+    // Drives a registered streaming/pushdown table function's exported
+    // `table-stream-dispatch`. Types are remapped to base `extension_types` /
+    // `extension_runtime` (see lib.rs `with`), so no per-world conversion.
+
+    fn table_stream_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_table_stream_bindings::DuckdbExtensionTableStream,
+        extension_types::Duckerror,
+    > {
+        if self.table_stream_bindings.is_none() {
+            let built =
+                crate::duckdb_extension_table_stream_bindings::DuckdbExtensionTableStream::new(
+                    self.store.as_context_mut(),
+                    &self.instance,
+                )
+                .map_err(map_extension_trap)?;
+            self.table_stream_bindings = Some(built);
+        }
+        Ok(self.table_stream_bindings.as_ref().unwrap())
+    }
+
+    /// Open a streaming table cursor with bound `args` and a column `projection`
+    /// (empty = all columns); returns the cursor handle + projected schema.
+    pub fn table_open(
+        &mut self,
+        handle: u32,
+        args: &[extension_types::Duckvalue],
+        projection: &[u32],
+    ) -> Result<TableOpenResult, extension_types::Duckerror> {
+        self.table_stream_bindings()?;
+        let bindings = self.table_stream_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_table_stream_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_table_open(store.as_context_mut(), handle, args, projection)
+            .map_err(map_extension_trap)?
+    }
+
+    /// 3.1.0: open a streaming table cursor WITH pushed-down filters (and a column
+    /// `projection`, empty = all columns). `filters` is the conjunctive
+    /// (AND-of-clauses) neutral filter set the core's streaming `TableFunction`
+    /// extracted from the bound plan. A component that ignores the filters stays
+    /// correct (the core re-checks them above the scan); honoring them prunes at
+    /// the source. Drives the component's `call-table-open-filtered` export.
+    pub fn table_open_filtered(
+        &mut self,
+        handle: u32,
+        args: &[extension_types::Duckvalue],
+        projection: &[u32],
+        filters: &[TableFilter],
+    ) -> Result<TableOpenResult, extension_types::Duckerror> {
+        self.table_stream_bindings()?;
+        let bindings = self.table_stream_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_table_stream_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_table_open_filtered(store.as_context_mut(), handle, args, projection, filters)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Pull up to `max_rows` from the cursor; an empty resultset signals EOF.
+    pub fn table_next(
+        &mut self,
+        handle: u32,
+        cursor: u32,
+        max_rows: u32,
+    ) -> Result<extension_runtime::Resultset, extension_types::Duckerror> {
+        self.table_stream_bindings()?;
+        let bindings = self.table_stream_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_table_stream_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_table_next(store.as_context_mut(), handle, cursor, max_rows)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Close the streaming cursor and free its state.
+    pub fn table_close(
+        &mut self,
+        handle: u32,
+        cursor: u32,
+    ) -> Result<bool, extension_types::Duckerror> {
+        self.table_stream_bindings()?;
+        let bindings = self.table_stream_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_table_stream_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_table_close(store.as_context_mut(), handle, cursor)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.2.0 (Item 6): aggregate-incr-dispatch re-entry ---
+    // Drives a registered incremental aggregate's init/update/combine/finalize
+    // state machine.
+
+    fn aggregate_incr_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_aggregate_incr_bindings::DuckdbExtensionAggregateIncr,
+        extension_types::Duckerror,
+    > {
+        if self.aggregate_incr_bindings.is_none() {
+            let built =
+                crate::duckdb_extension_aggregate_incr_bindings::DuckdbExtensionAggregateIncr::new(
+                    self.store.as_context_mut(),
+                    &self.instance,
+                )
+                .map_err(map_extension_trap)?;
+            self.aggregate_incr_bindings = Some(built);
+        }
+        Ok(self.aggregate_incr_bindings.as_ref().unwrap())
+    }
+
+    /// Allocate a fresh incremental-aggregate state; returns a state handle.
+    pub fn aggregate_init(&mut self, handle: u32) -> Result<u32, extension_types::Duckerror> {
+        self.aggregate_incr_bindings()?;
+        let bindings = self.aggregate_incr_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_aggregate_incr_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_aggregate_init(store.as_context_mut(), handle)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Fold a batch of `rows` into the aggregation `state`.
+    pub fn aggregate_update(
+        &mut self,
+        handle: u32,
+        state: u32,
+        rows: &extension_runtime::Rowbatch,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.aggregate_incr_bindings()?;
+        let bindings = self.aggregate_incr_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_aggregate_incr_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_aggregate_update(store.as_context_mut(), handle, state, rows)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Merge the partial `source` state into `target` (parallel aggregation).
+    pub fn aggregate_combine(
+        &mut self,
+        handle: u32,
+        target: u32,
+        source: u32,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.aggregate_incr_bindings()?;
+        let bindings = self.aggregate_incr_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_aggregate_incr_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_aggregate_combine(store.as_context_mut(), handle, target, source)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Produce the final value from `state` and free it.
+    pub fn aggregate_finalize(
+        &mut self,
+        handle: u32,
+        state: u32,
+    ) -> Result<extension_types::Duckvalue, extension_types::Duckerror> {
+        self.aggregate_incr_bindings()?;
+        let bindings = self.aggregate_incr_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_aggregate_incr_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_aggregate_finalize(store.as_context_mut(), handle, state)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.2.0 (Item 7): conn-dispatch re-entry ---
+    // Notifies a component that subscribed via lifecycle.register-connection-callback
+    // when a connection is opened or closed.
+
+    fn conn_bindings(
+        &mut self,
+    ) -> Result<&crate::duckdb_extension_conn_bindings::DuckdbExtensionConn, extension_types::Duckerror>
+    {
+        if self.conn_bindings.is_none() {
+            let built = crate::duckdb_extension_conn_bindings::DuckdbExtensionConn::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.conn_bindings = Some(built);
+        }
+        Ok(self.conn_bindings.as_ref().unwrap())
+    }
+
+    /// Notify the component that connection `connection_id` was opened.
+    pub fn connection_opened(
+        &mut self,
+        handle: u32,
+        connection_id: u64,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.conn_bindings()?;
+        let bindings = self.conn_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_conn_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_on_connection_opened(store.as_context_mut(), handle, connection_id)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Notify the component that connection `connection_id` was closed.
+    pub fn connection_closed(
+        &mut self,
+        handle: u32,
+        connection_id: u64,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.conn_bindings()?;
+        let bindings = self.conn_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_conn_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_on_connection_closed(store.as_context_mut(), handle, connection_id)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.2.0 (Item 7): file-write-dispatch re-entry ---
+    // Drives the writable + glob + stat half of a files backend.
+
+    fn file_write_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_file_write_bindings::DuckdbExtensionFileWrite,
+        extension_types::Duckerror,
+    > {
+        if self.file_write_bindings.is_none() {
+            let built = crate::duckdb_extension_file_write_bindings::DuckdbExtensionFileWrite::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.file_write_bindings = Some(built);
+        }
+        Ok(self.file_write_bindings.as_ref().unwrap())
+    }
+
+    /// Write `data` at `offset` in `path`; returns the bytes written.
+    pub fn file_write(
+        &mut self,
+        handle: u32,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.file_write_bindings()?;
+        let bindings = self.file_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_file_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_file_write(store.as_context_mut(), handle, path, offset, data)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Expand a glob `pattern` to matching paths.
+    pub fn file_glob(
+        &mut self,
+        handle: u32,
+        pattern: &str,
+    ) -> Result<Vec<String>, extension_types::Duckerror> {
+        self.file_write_bindings()?;
+        let bindings = self.file_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_file_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_file_glob(store.as_context_mut(), handle, pattern)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Stat a single `path`.
+    pub fn file_stat(
+        &mut self,
+        handle: u32,
+        path: &str,
+    ) -> Result<FileInfo, extension_types::Duckerror> {
+        self.file_write_bindings()?;
+        let bindings = self.file_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_file_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_file_stat(store.as_context_mut(), handle, path)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.2.0 (Item 7): index-write-dispatch re-entry ---
+    // Drives the general (non-ANN) secondary-index operations: ranged scan,
+    // delete, unique-constraint check, and serialization.
+
+    fn index_write_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_index_write_bindings::DuckdbExtensionIndexWrite,
+        extension_types::Duckerror,
+    > {
+        if self.index_write_bindings.is_none() {
+            let built = crate::duckdb_extension_index_write_bindings::DuckdbExtensionIndexWrite::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.index_write_bindings = Some(built);
+        }
+        Ok(self.index_write_bindings.as_ref().unwrap())
+    }
+
+    /// Range scan: row-ids whose key is within [low, high] (empty = unbounded).
+    pub fn index_scan(
+        &mut self,
+        handle: u32,
+        index: u32,
+        low: &[extension_types::Duckvalue],
+        high: &[extension_types::Duckvalue],
+    ) -> Result<Vec<i64>, extension_types::Duckerror> {
+        self.index_write_bindings()?;
+        let bindings = self.index_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_index_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_index_scan(store.as_context_mut(), handle, index, low, high)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Delete the given `rowids` from the index; returns the number removed.
+    pub fn index_delete(
+        &mut self,
+        handle: u32,
+        index: u32,
+        rowids: &[i64],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.index_write_bindings()?;
+        let bindings = self.index_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_index_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_index_delete(store.as_context_mut(), handle, index, rowids)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Unique-constraint check: true iff inserting `keys` would violate uniqueness.
+    pub fn index_constraint(
+        &mut self,
+        handle: u32,
+        index: u32,
+        keys: &[extension_types::Duckvalue],
+    ) -> Result<bool, extension_types::Duckerror> {
+        self.index_write_bindings()?;
+        let bindings = self.index_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_index_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_index_constraint(store.as_context_mut(), handle, index, keys)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Serialize the built index to bytes for persistence.
+    pub fn index_serialize(
+        &mut self,
+        handle: u32,
+        index: u32,
+    ) -> Result<Vec<u8>, extension_types::Duckerror> {
+        self.index_write_bindings()?;
+        let bindings = self.index_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_index_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_index_serialize(store.as_context_mut(), handle, index)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 2.2.0 (Item 7): settings-dispatch re-entry ---
+    // Notifies a component that declared an option (via settings.register-option)
+    // and exported settings-dispatch when a user runs `SET <name> = <value>`.
+
+    fn settings_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_settings_bindings::DuckdbExtensionSettings,
+        extension_types::Duckerror,
+    > {
+        if self.settings_bindings.is_none() {
+            let built = crate::duckdb_extension_settings_bindings::DuckdbExtensionSettings::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.settings_bindings = Some(built);
+        }
+        Ok(self.settings_bindings.as_ref().unwrap())
+    }
+
+    /// Notify the component that option `name` was SET to `value` (rendered text).
+    pub fn setting_set(
+        &mut self,
+        handle: u32,
+        name: &str,
+        value: &str,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.settings_bindings()?;
+        let bindings = self.settings_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_settings_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_on_setting_set(store.as_context_mut(), handle, name, value)
+            .map_err(map_extension_trap)?
     }
 
     // --- M2a: storage-dispatch (foreign-catalog) re-entry ---
@@ -2005,6 +3399,107 @@ impl ExtensionInstance {
             .map_err(map_extension_trap)?
             .map_err(extension_types::Duckerror::Io)
     }
+
+    // 2.3.0 / v3: lazily-built parser-dispatch bindings.
+    fn parser_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_parser_bindings::DuckdbExtensionParser,
+        extension_types::Duckerror,
+    > {
+        if self.parser_bindings.is_none() {
+            let built = crate::duckdb_extension_parser_bindings::DuckdbExtensionParser::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.parser_bindings = Some(built);
+        }
+        Ok(self.parser_bindings.as_ref().unwrap())
+    }
+
+    /// Offer the unrecognized statement `query` to the parser extension `handle`.
+    /// Returns `Some(rewrite_sql)` if the component claims it (string->SQL rewrite),
+    /// or `None` if it declines. Drives `parser-dispatch.call-parse`.
+    pub fn call_parse(
+        &mut self,
+        handle: u32,
+        query: &str,
+    ) -> Result<Option<String>, extension_types::Duckerror> {
+        self.parser_bindings()?;
+        let bindings = self.parser_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_parser_dispatch();
+        let store = &mut self.store;
+        let outcome = guest
+            .call_call_parse(store.as_context_mut(), handle, query)
+            .map_err(map_extension_trap)??;
+        use crate::duckdb_extension_parser_bindings::exports::duckdb::extension::parser_dispatch::ParseOutcome;
+        Ok(match outcome {
+            ParseOutcome::Declined => None,
+            ParseOutcome::Rewrite(sql) => Some(sql),
+        })
+    }
+
+    // 2.3.0 / v3: lazily-built optimizer-dispatch bindings.
+    fn optimizer_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_optimizer_bindings::DuckdbExtensionOptimizer,
+        extension_types::Duckerror,
+    > {
+        if self.optimizer_bindings.is_none() {
+            let built = crate::duckdb_extension_optimizer_bindings::DuckdbExtensionOptimizer::new(
+                self.store.as_context_mut(),
+                &self.instance,
+            )
+            .map_err(map_extension_trap)?;
+            self.optimizer_bindings = Some(built);
+        }
+        Ok(self.optimizer_bindings.as_ref().unwrap())
+    }
+
+    /// Offer the flattened plan (`nodes` = (id, op-type, parent, params-json);
+    /// `query` = the source SQL or empty) to the optimizer rule `handle`. Returns
+    /// `Some(rewrite_sql)` for a `rewrite-query` directive, or `None` for declined /
+    /// a structured `apply` directive (not driven via SQL re-plan). Drives
+    /// `optimizer-dispatch.call-optimize`.
+    pub fn call_optimize(
+        &mut self,
+        handle: u32,
+        nodes: Vec<(u32, String, Option<u32>, String)>,
+        query: &str,
+    ) -> Result<Option<String>, extension_types::Duckerror> {
+        use crate::duckdb_extension_optimizer_bindings::exports::duckdb::extension::optimizer_dispatch::{
+            PlanNode, PlanShape, RewriteDirective,
+        };
+        self.optimizer_bindings()?;
+        let bindings = self.optimizer_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_optimizer_dispatch();
+        let plan_nodes: Vec<PlanNode> = nodes
+            .into_iter()
+            .map(|(id, op_type, parent, params_json)| PlanNode {
+                id,
+                op_type,
+                parent,
+                params_json,
+            })
+            .collect();
+        let plan = PlanShape {
+            nodes: plan_nodes,
+            query: query.to_string(),
+        };
+        let store = &mut self.store;
+        let directive = guest
+            .call_call_optimize(store.as_context_mut(), handle, &plan)
+            .map_err(map_extension_trap)??;
+        Ok(match directive {
+            RewriteDirective::Declined => None,
+            RewriteDirective::RewriteQuery(sql) => Some(sql),
+            // Structured rewrites are not (yet) applied via SQL re-plan; treat as
+            // declined so the core keeps the original plan.
+            RewriteDirective::Apply(_) => None,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2092,6 +3587,90 @@ mod tests {
             L::Uuid,
             L::Complex("STRUCT(a INTEGER, b VARCHAR)".to_string()),
         ]
+    }
+
+    /// Build a component-model engine (with wasm-exceptions) the way the host does.
+    fn test_engine() -> Engine {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        config.wasm_exceptions(true);
+        Engine::new(&config).expect("engine")
+    }
+
+    fn load_artifact(engine: &Engine, name: &str) -> wasmtime::Result<ExtensionInstance> {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest)
+            .join("../../artifacts/extensions")
+            .join(format!("{name}.wasm"));
+        let bytes = std::fs::read(&path).expect("read artifact");
+        let component = Component::new(engine, &bytes)?;
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new().inherit_stderr().build();
+        load_component(
+            engine,
+            &component,
+            wasi,
+            Box::new(NoopServices),
+            Arc::new(Mutex::new(CallbackRegistry::default())),
+            name.to_string(),
+        )
+    }
+
+    /// THE ADDITIVE-MINOR PROOF (3.1.0). The freeze policy's whole point: an
+    /// existing component built at the FROZEN @3.0.0 baseline loads UN-REBUILT on
+    /// the @3.1.0 host. The host now provides the new additive `table-stream`
+    /// import (CONTRACT_MINOR = 1); a @3.0.0 component imports a strict SUBSET of
+    /// what the host provides, so the wasmtime component linker semver-matches it
+    /// and `load()` runs. Only a component that OPTS INTO filter pushdown rebuilds.
+    ///
+    /// Loads the shipped @3.0.0 `aba` + `geohash` artifacts (scalar components that
+    /// do NOT import `table-stream`) against the 3.1.0 host. Skipped gracefully if
+    /// the artifacts are absent (the wasm toolchain-free CI subset).
+    #[test]
+    fn additive_minor_loads_frozen_3_0_0_components_unrebuilt() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let aba = std::path::Path::new(manifest).join("../../artifacts/extensions/aba.wasm");
+        if !aba.exists() {
+            eprintln!("skipping additive-load proof: artifacts/extensions/aba.wasm absent");
+            return;
+        }
+
+        // Sanity: this host is @3.MINOR with MINOR >= 1 (the additive bump landed).
+        assert_eq!(crate::CONTRACT_MAJOR, 3);
+        assert!(
+            crate::CONTRACT_MINOR >= 1,
+            "the additive minor must have bumped CONTRACT_MINOR to >= 1"
+        );
+
+        let engine = test_engine();
+        for name in ["aba", "geohash"] {
+            let path = std::path::Path::new(manifest)
+                .join("../../artifacts/extensions")
+                .join(format!("{name}.wasm"));
+            if !path.exists() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let component = Component::new(&engine, &bytes).unwrap();
+
+            // The artifact is a FROZEN @3.0.0 component (minor 0).
+            let ver = crate::component_contract_version(&engine, &component);
+            assert_eq!(
+                ver,
+                Some((3, 0)),
+                "{name} must be the frozen @3.0.0 baseline (un-rebuilt)"
+            );
+
+            // The contract guard ADMITS it on the 3.1.0 host (minor forward-compat).
+            crate::check_component_contract(&engine, &component, name)
+                .unwrap_or_else(|e| panic!("{name} rejected by the 3.1.0 contract guard: {e}"));
+
+            // And it INSTANTIATES + runs load() un-rebuilt against the 3.1.0 host
+            // linker (which now also provides the new `table-stream` import).
+            let inst = load_artifact(&engine, name)
+                .unwrap_or_else(|e| panic!("{name} failed to load on the 3.1.0 host: {e}"));
+            drop(inst);
+            eprintln!("[additive-load] @3.0.0 '{name}' loaded UN-REBUILT on the 3.1.0 host");
+        }
     }
 
     #[test]
@@ -2403,17 +3982,233 @@ mod tests {
     }
 
     #[test]
-    fn register_copy_handler_is_rejected_not_panicked() {
+    fn register_copy_handler_captures_into_pending() {
+        // 2.1.0 (Item 1): copy handlers are now CAPTURED (driven through
+        // copy-dispatch), not rejected. Registration succeeds and lands in the
+        // neutral pending buffer with the routing function-handle preserved.
         let mut state = test_state();
         let res = extension_files::Host::register_copy_handler(
             &mut state,
             extension_files::CopyHandler {
                 extension: "parquet".to_string(),
-                function: 0,
+                function: 7,
             },
         );
-        // Unsupported -> Err, never a panic.
-        assert!(res.is_err());
+        assert!(res.is_ok());
+        let captured = state.take_pending_copy_handlers();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].file_extension, "parquet");
+        assert_eq!(captured[0].function_handle, 7);
+    }
+
+    #[test]
+    fn registers_2_1_0_additive_capabilities_into_pending() {
+        // 2.1.0: secret type + provider, settings option, table macro, modified
+        // logical type, and enum all CAPTURE into their neutral pending buffers.
+        let mut state = test_state();
+
+        extension_secret::Host::register_secret_type(
+            &mut state,
+            "s3".to_string(),
+            vec![
+                extension_secret::SecretParam { name: "key_id".to_string(), redacted: false },
+                extension_secret::SecretParam { name: "secret".to_string(), redacted: true },
+            ]
+            .into(),
+            11,
+        )
+        .expect("register_secret_type");
+        extension_secret::Host::register_secret_provider(
+            &mut state,
+            "s3".to_string(),
+            "credential_chain".to_string(),
+            12,
+        )
+        .expect("register_secret_provider");
+
+        extension_settings::Host::register_option(
+            &mut state,
+            "my_threshold".to_string(),
+            "tuning knob".to_string(),
+            extension_settings::SettingType::Bigint,
+            Some("42".to_string()),
+            extension_settings::SettingScope::Global,
+        )
+        .expect("register_option");
+
+        extension_macro_ext::Host::register_table_macro(
+            &mut state,
+            "main".to_string(),
+            "series".to_string(),
+            vec!["n".to_string()].into(),
+            "SELECT * FROM range(n)".to_string(),
+        )
+        .expect("register_table_macro");
+
+        extension_types_ext::Host::register_logical_type_modified(
+            &mut state,
+            "price".to_string(),
+            "DECIMAL(18,3)".to_string(),
+        )
+        .expect("register_logical_type_modified");
+        extension_types_ext::Host::register_enum(
+            &mut state,
+            "mood".to_string(),
+            vec!["happy".to_string(), "sad".to_string()].into(),
+        )
+        .expect("register_enum");
+
+        let secrets = state.take_pending_secrets();
+        assert_eq!(secrets.len(), 2);
+        assert_eq!(secrets[0].type_name, "s3");
+        assert_eq!(secrets[0].params.len(), 2);
+        assert!(secrets[0].params[1].1, "secret param must be redacted");
+        assert_eq!(secrets[0].callback_handle, 11);
+        assert_eq!(secrets[1].provider.as_deref(), Some("credential_chain"));
+
+        let settings = state.take_pending_settings();
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].name, "my_threshold");
+        assert_eq!(settings[0].ty, "bigint");
+        assert_eq!(settings[0].scope, "global");
+        assert_eq!(settings[0].default_value.as_deref(), Some("42"));
+
+        let macros = state.take_pending_table_macros();
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].name, "series");
+
+        let modified = state.take_pending_modified_types();
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].type_expr, "DECIMAL(18,3)");
+
+        let enums = state.take_pending_enum_types();
+        assert_eq!(enums.len(), 1);
+        assert_eq!(enums[0].members, vec!["happy".to_string(), "sad".to_string()]);
+    }
+
+    #[test]
+    fn registers_2_2_0_additive_capabilities_into_pending() {
+        // 2.2.0 (Items 6-7): the richer scalar (scalar-ex), connection-lifecycle
+        // subscription, coordinate system, Arrow table, text encoding, and
+        // compression codec all CAPTURE into their neutral pending buffers.
+        use extension_runtime::Logicaltype as L;
+        let mut state = test_state();
+
+        // Item 6: register-scalar-ex with varargs + special NULL handling.
+        extension_runtime_ext::Host::register_scalar_ex(
+            &mut state,
+            "concat_ws".to_string(),
+            vec![extension_runtime_ext::Funcarg { name: Some("sep".to_string()), logical: L::Text }]
+                .into(),
+            Some(L::Text),
+            L::Text,
+            extension_runtime_ext::NullHandling::Special,
+            21,
+            None,
+        )
+        .expect("register_scalar_ex");
+
+        // Item 7: connection-lifecycle subscription (opened only).
+        extension_lifecycle::Host::register_connection_callback(
+            &mut state,
+            extension_lifecycle::ConnEvents::OPENED,
+            22,
+        )
+        .expect("register_connection_callback");
+
+        // Item 7: coordinate system.
+        extension_coordinate_system::Host::register_coordinate_system(
+            &mut state,
+            extension_coordinate_system::CrsDef {
+                auth_name: "EPSG".to_string(),
+                code: 4326,
+                wkt: "GEOGCRS[...]".to_string(),
+            },
+        )
+        .expect("register_coordinate_system");
+
+        // Item 7: Arrow table producer.
+        extension_arrow_ext::Host::register_arrow_table(
+            &mut state,
+            "feed".to_string(),
+            vec![extension_arrow_ext::Columndef { name: "v".to_string(), logical: L::Int64 }].into(),
+            23,
+        )
+        .expect("register_arrow_table");
+
+        // Item 7: text encoding.
+        extension_encoding::Host::register_encoding(
+            &mut state,
+            "latin-1".to_string(),
+            vec!["iso-8859-1".to_string()].into(),
+            24,
+        )
+        .expect("register_encoding");
+
+        // Item 7: compression codec.
+        extension_compression::Host::register_compression(
+            &mut state,
+            "zstd".to_string(),
+            "zst".to_string(),
+            25,
+        )
+        .expect("register_compression");
+
+        let scalar_ex = state.take_pending_scalar_ex();
+        assert_eq!(scalar_ex.len(), 1);
+        assert_eq!(scalar_ex[0].name, "concat_ws");
+        assert_eq!(scalar_ex[0].extension, "testext");
+        assert!(scalar_ex[0].special_null, "special NULL handling must be captured");
+        assert_eq!(scalar_ex[0].varargs, Some(reg::LogicalType::Text));
+        assert_eq!(scalar_ex[0].callback_handle, 21);
+
+        let conn = state.take_pending_conn_callbacks();
+        assert_eq!(conn.len(), 1);
+        assert!(conn[0].on_opened);
+        assert!(!conn[0].on_closed);
+        assert_eq!(conn[0].callback_handle, 22);
+
+        let crs = state.take_pending_coordinate_systems();
+        assert_eq!(crs.len(), 1);
+        assert_eq!(crs[0].auth_name, "EPSG");
+        assert_eq!(crs[0].code, 4326);
+
+        let arrow = state.take_pending_arrow_tables();
+        assert_eq!(arrow.len(), 1);
+        assert_eq!(arrow[0].name, "feed");
+        assert_eq!(arrow[0].columns.len(), 1);
+        assert_eq!(arrow[0].callback_handle, 23);
+
+        let encodings = state.take_pending_encodings();
+        assert_eq!(encodings.len(), 1);
+        assert_eq!(encodings[0].name, "latin-1");
+        assert_eq!(encodings[0].aliases, vec!["iso-8859-1".to_string()]);
+
+        let compressions = state.take_pending_compressions();
+        assert_eq!(compressions.len(), 1);
+        assert_eq!(compressions[0].name, "zstd");
+        assert_eq!(compressions[0].file_extension, "zst");
+        assert_eq!(compressions[0].callback_handle, 25);
+    }
+
+    #[test]
+    fn nested_value_rides_complex_arm_without_new_type_arm() {
+        // Nested LIST/STRUCT values ride the EXISTING `complex(type-expr, json)`
+        // escape hatch on `duckvalue` -- no new `duckvalue`/`logicaltype` arm, so
+        // the bump stays additive (2.1.0). This asserts a flat-encoded LIST value
+        // is carried through the base types verbatim (the CORE reconstructs the
+        // real LIST vector from the type-expr + JSON via the duckdb C vector API).
+        let v = extension_types::Duckvalue::Complex(extension_types::Complexvalue {
+            type_expr: "INTEGER[]".to_string(),
+            json: "[10,20,30]".to_string(),
+        });
+        match v {
+            extension_types::Duckvalue::Complex(c) => {
+                assert_eq!(c.type_expr, "INTEGER[]");
+                assert_eq!(c.json, "[10,20,30]");
+            }
+            _ => panic!("expected complex arm"),
+        }
     }
 
     #[test]
@@ -2492,6 +4287,26 @@ pub fn add_extension_interfaces_to_linker(
     extension_collation::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
     extension_files_reg::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
     extension_query::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    // 2.1.0 additive registration imports.
+    extension_secret::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_settings::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_macro_ext::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_types_ext::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    // 2.2.0 additive registration imports (Items 6-7).
+    extension_runtime_ext::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_lifecycle::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_coordinate_system::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(
+        linker,
+        |s| s,
+    )?;
+    extension_arrow_ext::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_encoding::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_compression::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    // 2.3.0 / v3 additive registration imports.
+    extension_parser::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    extension_optimizer::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    // 3.1.0 additive registration import: filterable streaming table-fn marker.
+    extension_table_stream::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
     Ok(())
 }
 
@@ -2558,7 +4373,7 @@ pub fn load_component_with_dynlink(
             );
             crate::compose_dynlink::add_to_linker::<ExtensionStoreState>(&mut linker)
                 .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-            Some(crate::compose_dynlink::DynLinkBridge::new(registry))
+            Some(crate::compose_dynlink::new_resident(registry))
         }
         _ => None,
     };

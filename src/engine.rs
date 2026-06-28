@@ -243,7 +243,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
@@ -282,7 +282,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
@@ -309,7 +309,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
@@ -339,7 +339,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
             .into_iter()
