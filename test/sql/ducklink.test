@@ -11,4 +11,4 @@ require ducklink
 query I
 SELECT ducklink_version();
 ----
-ducklink 0.2.0
+ducklink 0.2.1
