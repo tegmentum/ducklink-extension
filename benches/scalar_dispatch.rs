@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 use ducklink::engine::Engine2;
-use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Duckvalue as WitVal;
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
+    Complexvalue as WitComplex, Decimalvalue as WitDecimal, Duckvalue as WitVal,
+    Intervalvalue as WitInterval, Uuidvalue as WitUuid,
+};
 use ducklink_runtime::reg::DuckValue;
 
 const ROWS: usize = 2048; // one DuckDB STANDARD_VECTOR_SIZE chunk
@@ -26,6 +29,9 @@ const ROWS: usize = 2048; // one DuckDB STANDARD_VECTOR_SIZE chunk
 // Replica of the engine's private neutral->WIT codec, to measure the conversion
 // cost in isolation (attribution: is the per-chunk Vec<Vec<>> rebuild a real cost,
 // or does Vec's in-place collect specialization make it ~free for same-size enums?).
+// Only the numeric `Int64` arm is exercised by this bench; the remaining arms keep
+// the match exhaustive against the full `reg::DuckValue` (which carries every rich
+// logical type), so the codec stays a faithful replica of the engine's.
 #[inline]
 fn n2w(v: DuckValue) -> WitVal {
     match v {
@@ -36,13 +42,55 @@ fn n2w(v: DuckValue) -> WitVal {
         DuckValue::Float64(f) => WitVal::Float64(f),
         DuckValue::Text(s) => WitVal::Text(s),
         DuckValue::Blob(b) => WitVal::Blob(b),
+        DuckValue::Int8(i) => WitVal::Int8(i),
+        DuckValue::Int16(i) => WitVal::Int16(i),
+        DuckValue::Int32(i) => WitVal::Int32(i),
+        DuckValue::Uint8(u) => WitVal::Uint8(u),
+        DuckValue::Uint16(u) => WitVal::Uint16(u),
+        DuckValue::Uint32(u) => WitVal::Uint32(u),
+        DuckValue::Float32(f) => WitVal::Float32(f),
+        DuckValue::Timestamp(t) => WitVal::Timestamp(t),
+        DuckValue::Date(d) => WitVal::Date(d),
+        DuckValue::Time(t) => WitVal::Time(t),
+        DuckValue::Timestamptz(t) => WitVal::Timestamptz(t),
+        DuckValue::Decimal {
+            lower,
+            upper,
+            width,
+            scale,
+        } => WitVal::Decimal(WitDecimal {
+            lower,
+            upper,
+            width,
+            scale,
+        }),
+        DuckValue::Interval {
+            months,
+            days,
+            micros,
+        } => WitVal::Interval(WitInterval {
+            months,
+            days,
+            micros,
+        }),
+        DuckValue::Uuid { hi, lo } => WitVal::Uuid(WitUuid { hi, lo }),
+        DuckValue::Complex { type_expr, json } => {
+            WitVal::Complex(WitComplex { type_expr, json })
+        }
+    }
+}
+
+/// Directory holding the prebuilt corpus `*.wasm` artifacts (see
+/// `tests/bridge_coverage.rs`). Overridable with `DUCKLINK_CORPUS_DIR`.
+fn corpus_dir() -> PathBuf {
+    match std::env::var_os("DUCKLINK_CORPUS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/extensions"),
     }
 }
 
 fn artifact(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../artifacts/extensions")
-        .join(format!("{name}.wasm"))
+    corpus_dir().join(format!("{name}.wasm"))
 }
 
 fn bench_scalar_dispatch(c: &mut Criterion) {

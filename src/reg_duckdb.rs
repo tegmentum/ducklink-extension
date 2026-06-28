@@ -476,6 +476,90 @@ fn write_ret(
     Ok(())
 }
 
+/// Write a whole column of component-returned WIT values into the flat output
+/// vector. Symmetric to [`read_col_into`]: for the fixed-width result types the
+/// output's typed slice and the return-type match are derived ONCE per chunk,
+/// leaving only an index + value store per row — rather than re-deriving the
+/// slice and re-matching `(code, value)` on every row, as a per-row [`write_ret`]
+/// does. This is the write-side counterpart to the column-major read hoist.
+///
+/// `null_mask[i] == true` (an input NULL the bridge propagates) and a
+/// component-returned `Null` both mark row `i` invalid. The output's typed slice
+/// and `set_null` both need `&mut` access to the same vector, so the null rows are
+/// recorded while the slice is held and invalidated only after it is dropped.
+/// The `nulls` scratch never allocates unless a NULL actually occurs, so the
+/// all-valid common case stays allocation-free. Variable-width and rarer fixed
+/// types (TEXT/BLOB/COMPLEX/DECIMAL/INTERVAL/UUID) fall back to the per-row
+/// [`write_ret`], preserving its exact behaviour.
+fn write_col_from(
+    code: u8,
+    out: &mut FlatVector,
+    results: Vec<WitVal>,
+    null_mask: Option<&[bool]>,
+    len: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let is_null = |i: usize| null_mask.is_some_and(|nm| nm[i]);
+    // Hoist the typed output slice + the variant match out of the per-row loop.
+    macro_rules! hoist {
+        ($ty:ty, $variant:ident) => {{
+            let s = unsafe { out.as_mut_slice_with_len::<$ty>(len) };
+            let mut nulls: Vec<usize> = Vec::new();
+            for (i, r) in results.iter().enumerate() {
+                if is_null(i) {
+                    nulls.push(i);
+                    continue;
+                }
+                match r {
+                    WitVal::$variant(x) => s[i] = *x,
+                    // A component may return SQL NULL for any declared type.
+                    WitVal::Null => nulls.push(i),
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared return type"
+                        )
+                        .into())
+                    }
+                }
+            }
+            // The slice borrow has ended; now invalidate the recorded NULL rows.
+            for i in nulls {
+                out.set_null(i);
+            }
+            Ok(())
+        }};
+    }
+    match code {
+        T_I64 => hoist!(i64, Int64),
+        T_U64 => hoist!(u64, Uint64),
+        T_F64 => hoist!(f64, Float64),
+        T_BOOL => hoist!(bool, Boolean),
+        T_I8 => hoist!(i8, Int8),
+        T_I16 => hoist!(i16, Int16),
+        T_I32 => hoist!(i32, Int32),
+        T_U8 => hoist!(u8, Uint8),
+        T_U16 => hoist!(u16, Uint16),
+        T_U32 => hoist!(u32, Uint32),
+        T_F32 => hoist!(f32, Float32),
+        // Temporal types share their underlying integer storage.
+        T_TIMESTAMP => hoist!(i64, Timestamp),
+        T_DATE => hoist!(i32, Date),
+        T_TIME => hoist!(i64, Time),
+        T_TIMESTAMPTZ => hoist!(i64, Timestamptz),
+        // Variable-width (TEXT/BLOB/COMPLEX) and the rarer HUGEINT-backed fixed
+        // types (DECIMAL/INTERVAL/UUID) keep the per-row writer.
+        _ => {
+            for (i, r) in results.into_iter().enumerate() {
+                if is_null(i) {
+                    out.set_null(i);
+                } else {
+                    write_ret(code, out, i, len, r)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 // The signature for the next `register_scalar_function_with_state` call.
 // `VScalar::signatures()` is a static method with no access to the function's
 // state, so the per-function signature is handed to it through this thread-local,
@@ -581,13 +665,10 @@ impl VScalar for WasmScalar {
                 )
                 .into());
             }
-            for (i, result) in results.into_iter().enumerate() {
-                if null_mask.as_ref().is_some_and(|nm| nm[i]) {
-                    out.set_null(i);
-                } else {
-                    write_ret(state.ret_code, &mut out, i, len, result)?;
-                }
-            }
+            // Write the whole result column at once: the fixed-width hot types
+            // derive the typed output slice and match the return type a single
+            // time per chunk (column-major), mirroring the read side.
+            write_col_from(state.ret_code, &mut out, results, null_mask.as_deref(), len)?;
             Ok(())
         })
     }
@@ -1224,8 +1305,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn sample_component() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../artifacts/extensions/sample_extension.wasm")
+        // Defaults to the monorepo layout; overridable with `DUCKLINK_CORPUS_DIR`
+        // so the bundled tests run from the standalone repo checkout too.
+        let dir = match std::env::var_os("DUCKLINK_CORPUS_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/extensions"),
+        };
+        dir.join("sample_extension.wasm")
     }
 
     /// End-to-end: load the sample wasm component, register its
@@ -1306,12 +1392,17 @@ mod tests {
                 r.get(0)
             })
             .expect("sum query");
-        assert_eq!(sum, 0 + 1 + 2 + 3 + 4, "sum of values 0..5");
+        assert_eq!(sum, 1 + 2 + 3 + 4, "sum of values 0..5");
     }
+
+    // `DUCKLINK_COMPONENTS` is a process-global; the tests that mutate it must not
+    // run concurrently (cargo runs unit tests multi-threaded). Serialize them on a
+    // shared lock so each sets/reads/clears the var in isolation.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn env_specs_parse_name_and_bare_path() {
-        // Safety: single-threaded within this test; no other test reads the var.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("DUCKLINK_COMPONENTS", "sample=/a/b.wasm:/c/isin.wasm");
         }
@@ -1380,5 +1471,88 @@ mod tests {
             "missing context, got: {msg}"
         );
         assert!(msg.contains("kaboom 42"), "missing payload, got: {msg}");
+    }
+
+    // --- Pure mapping / codec helpers (no wasm) ----------------------------
+
+    #[test]
+    fn uuid_storage_logical_is_self_inverse() {
+        for &stored in &[0i128, 1, -1, i128::MAX, i128::MIN, 0x0123_4567_89ab_cdef] {
+            let logical = uuid_storage_to_logical(stored);
+            // Applying the (self-inverse) transform again returns the storage bits.
+            assert_eq!(
+                uuid_storage_to_logical(logical as i128),
+                stored as u128,
+                "uuid transform not self-inverse for {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_codes_are_distinct_per_logical_type() {
+        use ducklink_runtime::reg::LogicalType::*;
+        let types = [
+            Int64,
+            Uint64,
+            Float64,
+            Boolean,
+            Text,
+            Blob,
+            Int8,
+            Int16,
+            Int32,
+            Uint8,
+            Uint16,
+            Uint32,
+            Float32,
+            Timestamp,
+            Date,
+            Time,
+            Timestamptz,
+            Decimal,
+            Interval,
+            Uuid,
+            Complex(String::new()),
+        ];
+        let codes: Vec<u8> = types.iter().map(type_code).collect();
+        let mut uniq = codes.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            codes.len(),
+            "every logical type maps to a distinct bridge code"
+        );
+    }
+
+    #[test]
+    fn logical_type_and_duckdb_type_cover_every_code() {
+        // Every defined code (0..=T_COMPLEX) must build a column logical type and a
+        // raw duckdb_type without hitting the `unreachable!` arm.
+        for code in 0u8..=T_COMPLEX {
+            let _ = logical_type(code); // must not panic
+            let _ = duckdb_type_of(code); // must not panic
+        }
+    }
+
+    // --- DUCKLINK_COMPONENTS parsing edge cases ----------------------------
+
+    #[test]
+    fn env_specs_skip_empty_entries_and_keep_order() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("DUCKLINK_COMPONENTS", ":a=/x.wasm::/y/z.wasm:");
+        }
+        let specs = component_specs_from_env();
+        unsafe {
+            std::env::remove_var("DUCKLINK_COMPONENTS");
+        }
+        // Leading / trailing / doubled colons produce empty entries that are dropped.
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "a");
+        assert_eq!(specs[0].path, PathBuf::from("/x.wasm"));
+        // Bare path -> file stem as the name.
+        assert_eq!(specs[1].name, "z");
+        assert_eq!(specs[1].path, PathBuf::from("/y/z.wasm"));
     }
 }

@@ -27,11 +27,21 @@ use ducklink::reg_duckdb::{register_components, register_scalars, register_table
 // Shared setup
 // ---------------------------------------------------------------------------
 
+/// Directory holding the prebuilt corpus `*.wasm` artifacts. Defaults to the
+/// monorepo layout (`../../artifacts/extensions` relative to this crate, which is
+/// where it sits as the `native-extension/ducklink` submodule); overridable with
+/// `DUCKLINK_CORPUS_DIR` so the bundled suite is runnable from the standalone
+/// repo checkout too.
+fn corpus_dir() -> PathBuf {
+    match std::env::var_os("DUCKLINK_CORPUS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/extensions"),
+    }
+}
+
 /// Path to a prebuilt corpus artifact by extension name.
 fn artifact(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../artifacts/extensions")
-        .join(format!("{name}.wasm"))
+    corpus_dir().join(format!("{name}.wasm"))
 }
 
 /// A live in-process DuckDB plus the raw sibling connection aggregate
@@ -921,4 +931,91 @@ fn scalar_text_lengths_and_unicode_roundtrip() {
             .expect("query");
         assert_eq!(&got, s, "round-trip failed for input of len {}", s.len());
     }
+}
+
+// ---------------------------------------------------------------------------
+// 12. Write-path column-major hoist — a BOOL-returning scalar over a real,
+//     multi-chunk input column with scattered NULLs. Exercises `write_col_from`'s
+//     hoisted bool slice + the deferred-`set_null` path across chunk boundaries
+//     (the input NULLs and the component results both have to land correctly).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scalar_bool_multichunk_with_scattered_nulls() {
+    let (db, _) = setup("isin");
+    // Over range(5000) (three STANDARD_VECTOR_SIZE chunks): i % 100 == 0 -> NULL
+    // input, else even i -> a valid ISIN (true), odd i -> junk (false).
+    //   nulls   = multiples of 100 in [0,5000)            = 50
+    //   trues   = even i, not a multiple of 100           = 2500 - 50 = 2450
+    //   falses  = odd i (never a multiple of 100)         = 2500
+    let (trues, nulls, falses): (i64, i64, i64) = db
+        .con
+        .query_row(
+            "SELECT \
+               count(*) FILTER (WHERE v),         \
+               count(*) FILTER (WHERE v IS NULL), \
+               count(*) FILTER (WHERE NOT v)      \
+             FROM (SELECT isin_validate(s) AS v FROM ( \
+               SELECT CASE WHEN i % 100 = 0 THEN NULL \
+                           WHEN i % 2 = 0 THEN 'US0378331005' \
+                           ELSE 'bad' END AS s \
+               FROM range(5000) t(i)))",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("query");
+    assert_eq!(
+        (trues, nulls, falses),
+        (2450, 50, 2500),
+        "bool write hoist + deferred set_null across chunks"
+    );
+}
+
+#[test]
+fn scalar_float_multichunk_exact() {
+    let (db, _) = setup("haversine");
+    // A DOUBLE-returning scalar over >2048 rows: every row is identical points,
+    // so each result is exactly 0.0 and the whole (3-chunk) column must sum to 0.
+    let total: f64 = db
+        .con
+        .query_row(
+            "SELECT sum(haversine_km(0.0, 0.0, 0.0, 0.0)) FROM range(5000)",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    assert_eq!(total, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Load-time trust boundary — a bad artifact must surface as an `Err` through
+//     `register_components`, never a panic or a process abort.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn register_components_rejects_non_component_artifact() {
+    let db = Db::new();
+    let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+    let mut path = std::env::temp_dir();
+    path.push(format!("ducklink_bad_artifact_{}.wasm", std::process::id()));
+    std::fs::write(&path, b"definitely not a wasm component").expect("write");
+    let specs = vec![ComponentSpec {
+        name: "bad".to_string(),
+        path: path.clone(),
+    }];
+    let r = register_components(&db.con, Some(db.raw_con), engine, &specs);
+    let _ = std::fs::remove_file(&path);
+    assert!(r.is_err(), "garbage artifact must Err, not panic");
+}
+
+#[test]
+fn register_components_missing_artifact_errs() {
+    let db = Db::new();
+    let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+    let specs = vec![ComponentSpec {
+        name: "ghost".to_string(),
+        path: PathBuf::from("/no/such/ducklink/component.wasm"),
+    }];
+    let r = register_components(&db.con, Some(db.raw_con), engine, &specs);
+    assert!(r.is_err(), "missing artifact must Err");
 }

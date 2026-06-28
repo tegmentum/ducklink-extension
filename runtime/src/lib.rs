@@ -22,21 +22,21 @@ use std::collections::HashMap;
 use wasmtime::component::Component;
 use wasmtime::Engine;
 
-/// The AUTHORITATIVE, content-addressed `duckdb:extension` contract identity: a
-/// **witcanon digest** — `sha256("witcanon:1" || canonical-WIT-bytes)` (hex),
-/// the scheme from `compose-core::blobs::compute_wit_digest` in the
-/// webassembly-component-orchestration framework (SPEC §4.1) — computed at build
-/// time over the canonical `wit/duckdb-extension/*.wit` bytes (see `build.rs`).
-///
-/// This is the SOURCE OF TRUTH for the contract: a contract is identified by a
-/// hash of its actual shape, not a hand-maintained version string. It changes iff
-/// the WIT changes, interoperates with the framework's blob identity, and is what
-/// `tooling/{gen,verify}-catalog.py` record + enforce per registry entry.
-///
-/// The runtime cannot recompute a *loaded* component's WIT digest (it can only
-/// introspect the imported package @MAJOR — see [`component_contract_major`]), so
-/// the runtime guard ([`check_component_contract`]) is the runtime-observable
-/// PROXY for this identity; the digest is enforced at catalog-verify time.
+// The AUTHORITATIVE, content-addressed `duckdb:extension` contract identity: a
+// witcanon digest — `sha256("witcanon:1" || canonical-WIT-bytes)` (hex), the
+// scheme from `compose-core::blobs::compute_wit_digest` in the
+// webassembly-component-orchestration framework (SPEC §4.1) — computed at build
+// time over the canonical `wit/duckdb-extension/*.wit` bytes (see `build.rs`).
+//
+// This is the SOURCE OF TRUTH for the contract: a contract is identified by a
+// hash of its actual shape, not a hand-maintained version string. It changes iff
+// the WIT changes, interoperates with the framework's blob identity, and is what
+// `tooling/{gen,verify}-catalog.py` record + enforce per registry entry.
+//
+// The runtime cannot recompute a *loaded* component's WIT digest (it can only
+// introspect the imported package @MAJOR — see [`component_contract_major`]), so
+// the runtime guard ([`check_component_contract`]) is the runtime-observable
+// PROXY for this identity; the digest is enforced at catalog-verify time.
 include!(concat!(env!("OUT_DIR"), "/contract_digest.rs"));
 
 /// The witcanon digest (hex) of the current canonical `duckdb:extension` WIT —

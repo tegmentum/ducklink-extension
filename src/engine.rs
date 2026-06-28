@@ -439,3 +439,121 @@ fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `reg::DuckValue` variant, with distinctive payloads, so a mis-wired
+    /// `neutral_to_wit` / `wit_to_neutral` arm (a swapped or dropped field) shows
+    /// up as a round-trip mismatch rather than silently corrupting a value.
+    fn all_variants() -> Vec<reg::DuckValue> {
+        vec![
+            reg::DuckValue::Null,
+            reg::DuckValue::Boolean(true),
+            reg::DuckValue::Int64(-9_000_000_000),
+            reg::DuckValue::Uint64(18_000_000_000),
+            reg::DuckValue::Float64(1234.5),
+            reg::DuckValue::Text("héllo ☃".to_string()),
+            reg::DuckValue::Blob(vec![0, 1, 2, 255, 128]),
+            reg::DuckValue::Int8(-12),
+            reg::DuckValue::Int16(-3000),
+            reg::DuckValue::Int32(-2_000_000),
+            reg::DuckValue::Uint8(200),
+            reg::DuckValue::Uint16(60000),
+            reg::DuckValue::Uint32(4_000_000_000),
+            reg::DuckValue::Float32(1.5),
+            reg::DuckValue::Timestamp(1_700_000_000_000_000),
+            reg::DuckValue::Date(19_000),
+            reg::DuckValue::Time(86_399_000_000),
+            reg::DuckValue::Timestamptz(1_700_000_000_000_001),
+            reg::DuckValue::Decimal {
+                lower: 0xDEAD_BEEF,
+                upper: 0x1234,
+                width: 18,
+                scale: 3,
+            },
+            reg::DuckValue::Interval {
+                months: 13,
+                days: -5,
+                micros: 999,
+            },
+            reg::DuckValue::Uuid {
+                hi: 0xABCD_0000_1111_2222,
+                lo: 0x3333_4444_5555_6666,
+            },
+            reg::DuckValue::Complex {
+                type_expr: "STRUCT(a INT)".to_string(),
+                json: "{\"a\":1}".to_string(),
+            },
+        ]
+    }
+
+    /// neutral -> WIT -> neutral is the identity for every variant. Guards the
+    /// two big hand-written match tables against drift (e.g. the rich-type
+    /// expansion) — the dispatch correctness the whole bridge rests on.
+    #[test]
+    fn neutral_wit_roundtrip_is_identity_for_all_variants() {
+        for v in all_variants() {
+            let before = format!("{v:?}");
+            let after = format!("{:?}", wit_to_neutral(neutral_to_wit(v)));
+            assert_eq!(before, after, "round-trip changed value");
+        }
+    }
+
+    /// The 22 variants must all be distinct after a round-trip (no two collapse
+    /// onto the same WIT arm), so the count of unique debug renderings is stable.
+    #[test]
+    fn roundtrip_preserves_distinctness() {
+        let mut seen = std::collections::HashSet::new();
+        for v in all_variants() {
+            let s = format!("{:?}", wit_to_neutral(neutral_to_wit(v)));
+            assert!(seen.insert(s.clone()), "two variants collapsed to {s}");
+        }
+        assert_eq!(seen.len(), 22, "expected 22 distinct DuckValue variants");
+    }
+
+    /// Dispatching against a callback handle that was never registered must be a
+    /// clean `Err` (not a panic / not an index out of bounds) — the registry-miss
+    /// arm on every dispatch entry point. No component is loaded, so this also
+    /// confirms the lookup fails before any instance is touched.
+    #[test]
+    fn dispatch_unknown_handle_errors_cleanly() {
+        let mut engine = Engine2::new().expect("engine");
+        let bad = 999_999u32;
+
+        let s = engine.dispatch_scalar(bad, 0, vec![reg::DuckValue::Int64(1)]);
+        assert!(s.is_err(), "scalar dispatch on unknown handle should Err");
+
+        let b = engine.dispatch_scalar_batch(bad, 0, &vec![vec![]]);
+        assert!(b.is_err(), "batch dispatch on unknown handle should Err");
+
+        let t = engine.dispatch_table(bad, vec![]);
+        assert!(t.is_err(), "table dispatch on unknown handle should Err");
+
+        let a = engine.dispatch_aggregate(bad, vec![vec![reg::DuckValue::Int64(1)]]);
+        assert!(a.is_err(), "aggregate dispatch on unknown handle should Err");
+    }
+
+    /// Loading a path that is not a valid wasm component must surface an `Err`
+    /// rather than panicking — the load-time trust boundary for an attacker- or
+    /// operator-supplied artifact.
+    #[test]
+    fn load_rejects_non_component_bytes() {
+        let mut engine = Engine2::new().expect("engine");
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("ducklink_bogus_{}.wasm", std::process::id()));
+        std::fs::write(&tmp, b"not a wasm component at all").expect("write tmp");
+        let r = engine.load("bogus", &tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_err(), "loading garbage bytes should Err, not panic");
+    }
+
+    /// A missing artifact path is a clean `Err` too (no panic on the io error).
+    #[test]
+    fn load_missing_file_errors() {
+        let mut engine = Engine2::new().expect("engine");
+        let r = engine.load("ghost", std::path::Path::new("/no/such/ducklink/file.wasm"));
+        assert!(r.is_err(), "missing file should Err");
+    }
+}

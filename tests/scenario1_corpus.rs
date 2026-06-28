@@ -37,8 +37,18 @@ struct Case {
 /// Find every `extensions/<name>-component/smoke.sql` that has a matching built
 /// `artifacts/extensions/<name>.wasm`.
 fn discover() -> Vec<Case> {
-    let ext_dir = manifest().join("../../extensions");
-    let artifact_dir = manifest().join("../../artifacts/extensions");
+    // Default to the monorepo layout (this crate sits at `native-extension/ducklink`);
+    // both dirs are overridable so the corpus diff is runnable from the standalone
+    // repo checkout too (`DUCKLINK_EXT_DIR` = the `*-component` source dirs holding
+    // `smoke.sql`, `DUCKLINK_CORPUS_DIR` = the built `*.wasm`).
+    let ext_dir = match std::env::var_os("DUCKLINK_EXT_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => manifest().join("../../extensions"),
+    };
+    let artifact_dir = match std::env::var_os("DUCKLINK_CORPUS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => manifest().join("../../artifacts/extensions"),
+    };
     let mut cases = Vec::new();
     let Ok(entries) = fs::read_dir(&ext_dir) else {
         return cases;
@@ -182,8 +192,8 @@ fn run_stmt(con: &Connection, sql: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Normalize CLI-shaped output the way smoke.py does (its `splitlines()` + rstrip
-/// + drop-blank-lines): rstrip each line (also strips the trailing `\r` from
+/// Normalize CLI-shaped output the way smoke.py does (`splitlines()`, then rstrip
+/// and drop blank lines): rstrip each line (also strips the trailing `\r` from
 /// CRLF, which HTML/markdown extensions emit) and drop blank lines. DuckDB's CLI
 /// emits blank lines for empty-string values and inside multi-line values; the
 /// corpus drops them (NULL renders as the literal "NULL", not blank).

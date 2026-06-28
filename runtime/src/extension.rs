@@ -24,7 +24,7 @@ use crate::duckdb_extension_bindings::duckdb::extension::{
     logging as extension_logging, query as extension_query, runtime as extension_runtime,
     storage as extension_storage, types as extension_types,
 };
-use crate::duckdb_extension_bindings::{DuckdbExtension, DuckdbExtensionPre};
+use crate::duckdb_extension_bindings::DuckdbExtension;
 use crate::reg;
 use crate::{CallbackKind, CallbackRegistry};
 
