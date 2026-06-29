@@ -244,50 +244,44 @@ impl Engine2 {
     }
 
     /// Advanced tier — PARSER. Offer the rejected statement `sql` to the parser
-    /// extension behind `callback_handle`. Returns `Some(rewrite_sql)` if the
-    /// component claims it, `None` if it declines. Resolves the handle through the
-    /// shared callback registry to the owning component (as the scalar path does).
+    /// extension `handle` of component `extension` (the component's own guest
+    /// dispatcher handle, captured in its `ParserReg`). Returns `Some(rewrite_sql)`
+    /// if the component claims it, `None` if it declines. Unlike the scalar path,
+    /// parser/optimizer handles are NOT in the shared callback registry; the
+    /// owning component is known directly from the registration, as in the wasm
+    /// core's `parser_host` routing.
     pub fn dispatch_parse(
         &mut self,
-        callback_handle: u32,
+        extension: &str,
+        handle: u32,
         sql: &str,
     ) -> Result<Option<String>> {
-        let entry = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
-            registry
-                .get(callback_handle)
-                .ok_or_else(|| anyhow!("unknown parser callback handle {callback_handle}"))?
-        };
         let instance = self
             .instances
-            .get_mut(&*entry.extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+            .get_mut(extension)
+            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
         instance
-            .call_parse(entry.dispatcher_handle, sql)
+            .call_parse(handle, sql)
             .map_err(|e| anyhow!("parser dispatch failed: {e:?}"))
     }
 
     /// Advanced tier — OPTIMIZER. Offer the flattened `nodes` (id, op-type,
-    /// parent, params-json) + source `query` to the rule behind `callback_handle`.
-    /// Returns `Some(rewrite_sql)` for a `rewrite-query` directive, else `None`.
+    /// parent, params-json) + source `query` to the rule `handle` of component
+    /// `extension`. Returns `Some(rewrite_sql)` for a `rewrite-query` directive,
+    /// else `None`.
     pub fn dispatch_optimize(
         &mut self,
-        callback_handle: u32,
+        extension: &str,
+        handle: u32,
         nodes: Vec<(u32, String, Option<u32>, String)>,
         query: &str,
     ) -> Result<Option<String>> {
-        let entry = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
-            registry
-                .get(callback_handle)
-                .ok_or_else(|| anyhow!("unknown optimizer callback handle {callback_handle}"))?
-        };
         let instance = self
             .instances
-            .get_mut(&*entry.extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+            .get_mut(extension)
+            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
         instance
-            .call_optimize(entry.dispatcher_handle, nodes, query)
+            .call_optimize(handle, nodes, query)
             .map_err(|e| anyhow!("optimizer dispatch failed: {e:?}"))
     }
 

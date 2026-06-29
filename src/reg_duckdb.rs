@@ -1270,6 +1270,7 @@ pub fn component_specs_from_env() -> Vec<ComponentSpec> {
 pub fn register_components(
     con: &Connection,
     raw_con: Option<ffi::duckdb_connection>,
+    db: Option<ffi::duckdb_database>,
     engine: Arc<Mutex<Engine2>>,
     specs: &[ComponentSpec],
 ) -> anyhow::Result<usize> {
@@ -1281,6 +1282,12 @@ pub fn register_components(
         };
         total += register_scalars(con, engine.clone(), &loaded.scalars)?;
         total += register_tables(con, engine.clone(), &loaded.tables)?;
+        // Advanced tier: wire any PARSER / OPTIMIZER / filterable-table markers
+        // through the internal-ABI C++ shim. Needs the raw `db` handle; the
+        // bundled tests (which use a duckdb-rs Connection) pass `None`.
+        if let Some(db) = db {
+            crate::advanced::register(db, &engine, &loaded);
+        }
         match raw_con {
             Some(rc) => {
                 total += unsafe { register_aggregates(rc, engine.clone(), &loaded.aggregates)? };
@@ -1358,7 +1365,8 @@ mod tests {
             path: sample_component(),
         }];
         let con = Connection::open_in_memory().expect("open duckdb");
-        let n = register_components(&con, None, engine, &specs).expect("register components");
+        let n =
+            register_components(&con, None, None, engine, &specs).expect("register components");
         assert!(n >= 1, "expected >=1 scalar registered, got {n}");
 
         let v: i64 = con
@@ -1378,7 +1386,7 @@ mod tests {
             path: sample_component(),
         }];
         let con = Connection::open_in_memory().expect("open duckdb");
-        register_components(&con, None, engine, &specs).expect("register components");
+        register_components(&con, None, None, engine, &specs).expect("register components");
 
         let count: i64 = con
             .query_row("SELECT count(*) FROM sample_emit_sequence(5)", [], |r| {

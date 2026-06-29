@@ -22,6 +22,12 @@ pub mod engine;
 #[cfg(feature = "duckdb-api")]
 pub mod reg_duckdb;
 
+/// The advanced dispatch tier (PARSER / OPTIMIZER / table FILTER pushdown): the
+/// Rust side of the C++ shim that binds DuckDB's internal C++ ABI. Present
+/// whenever the duckdb crate is available.
+#[cfg(feature = "duckdb-api")]
+pub mod advanced;
+
 #[cfg(feature = "loadable")]
 mod loadable {
     use std::error::Error;
@@ -162,8 +168,9 @@ mod loadable {
             .map_err(stringify)?;
         let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
         let specs = component_specs_from_env();
-        let registered = register_components(&con, have_raw.then_some(raw_con), engine, &specs)
-            .map_err(stringify)?;
+        let registered =
+            register_components(&con, have_raw.then_some(raw_con), Some(db), engine, &specs)
+                .map_err(stringify)?;
 
         // The aggregate functions are now in the database catalog; the sibling
         // connection has served its purpose.
