@@ -77,8 +77,9 @@ fn main() {
 const CPP_FILES: &[&str] = &[
     "ducklink_advanced.cpp",
     "ducklink_parser.cpp",
-    // Added as each remaining tier lands:
-    //   "ducklink_optimizer.cpp", "ducklink_table_stream.cpp"
+    "ducklink_optimizer.cpp",
+    // Added as the remaining tier lands:
+    //   "ducklink_table_stream.cpp"
 ];
 
 /// Resolve the DuckDB v1.5.4 source tree (header root) we compile the shim

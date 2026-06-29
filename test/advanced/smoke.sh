@@ -84,6 +84,16 @@ else
 	skip "ggsql.wasm not in corpus"
 fi
 
+# --- OPTIMIZER: plan rewrite via qopt ----------------------------------------
+if [ -f "$corpus/qopt.wasm" ]; then
+	run "optimizer/rewrite (qopt)" \
+		"qopt=$corpus/qopt.wasm" \
+		"CREATE TABLE optme(x INTEGER); INSERT INTO optme VALUES (1); SELECT x FROM optme;" \
+		"99"
+else
+	skip "qopt.wasm not in corpus"
+fi
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails advanced-tier smoke check(s) failed" >&2
 	exit 1

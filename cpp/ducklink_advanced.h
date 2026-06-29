@@ -60,11 +60,12 @@ int32_t ducklink_register_filterable_table_function(void *db, const char *name, 
 // claims it, or NULL if none do.
 char *ducklink_parser_try_rewrite(const char *sql);
 
-// OPTIMIZER: offer the flattened plan to every declared component rule. `nodes`
-// is a '\n'-joined list of `id\top-type\tparent\tparams-json` lines (parent -1
-// for the root); `query` is the source SQL (may be empty). Returns a malloc'd
+// OPTIMIZER: offer the flattened plan to every declared component rule.
+// `plan_json` is the neutral plan-shape array
+// (`[{"id":N,"op":"X","parent":P,"table":"T"?}, ...]`, same shape the wasm core
+// ships); `query` is the source SQL (may be empty). Returns a malloc'd
 // rewrite-SQL C string, or NULL if no rule rewrote it.
-char *ducklink_optimizer_try_rewrite(const char *nodes, const char *query);
+char *ducklink_optimizer_try_rewrite(const char *plan_json, const char *query);
 
 // Free a C string returned by the `_try_rewrite` bridges / ducklink_ts_*.
 void ducklink_adv_free(char *ptr);

@@ -1052,6 +1052,7 @@ dependencies = [
  "duckdb",
  "ducklink-runtime",
  "libduckdb-sys",
+ "serde_json",
  "wasmtime",
  "wasmtime-wasi",
 ]
