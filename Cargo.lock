@@ -929,6 +929,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "datalink-contract"
+version = "0.1.0"
+source = "git+https://github.com/tegmentum/datalink.git?rev=88782655415e22bb67c4cb3575a10fc1938b14e0#88782655415e22bb67c4cb3575a10fc1938b14e0"
+dependencies = [
+ "anyhow",
+ "wasmtime",
+]
+
+[[package]]
+name = "datalink-dynlink"
+version = "0.1.0"
+source = "git+https://github.com/tegmentum/datalink.git?rev=88782655415e22bb67c4cb3575a10fc1938b14e0#88782655415e22bb67c4cb3575a10fc1938b14e0"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "wasmtime",
+ "wasmtime-wasi",
+]
+
+[[package]]
 name = "debugid"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1024,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "ducklink-extension"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1039,6 +1059,8 @@ dependencies = [
 name = "ducklink-runtime"
 version = "0.1.0"
 dependencies = [
+ "datalink-contract",
+ "datalink-dynlink",
  "hex",
  "sha2",
  "wasmtime",
