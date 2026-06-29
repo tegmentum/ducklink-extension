@@ -37,6 +37,13 @@ mod loadable {
     use crate::engine::Engine2;
     use crate::reg_duckdb::{component_specs_from_env, register_components};
 
+    // The advanced-tier C++ shim, compiled against DuckDB's internal headers and
+    // linked into this extension (see build.rs). Internal C++ symbols it
+    // references are resolved at LOAD time against the host DuckDB.
+    extern "C" {
+        fn ducklink_advanced_probe(db: *mut std::ffi::c_void) -> i32;
+    }
+
     /// `ducklink_version()` -> the extension's version string. Registered
     /// unconditionally (needs no WebAssembly component), so
     /// `LOAD ducklink; SELECT ducklink_version();` is a self-contained smoke
@@ -132,6 +139,13 @@ mod loadable {
             return Ok(false);
         }
         let db: ffi::duckdb_database = *db_ptr;
+
+        // Build-model proof: reach the advanced-tier C++ shim and have it
+        // dereference the database to its internal DBConfig (an internal C++ ABI
+        // call resolved at load). A negative result means the cast failed; we log
+        // and continue (the common tier does not depend on it).
+        let probe = ducklink_advanced_probe(db.cast());
+        eprintln!("[ducklink] advanced C++ shim probe: maximum_threads={probe}");
 
         // duckdb-rs Connection for the safe scalar / table registration paths.
         let con = Connection::open_from_raw(db.cast())?;

@@ -1047,6 +1047,7 @@ name = "ducklink-extension"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "cc",
  "criterion",
  "duckdb",
  "ducklink-runtime",

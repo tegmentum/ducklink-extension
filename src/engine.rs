@@ -141,6 +141,12 @@ pub struct LoadedComponent {
     pub scalars: Vec<ScalarFunc>,
     pub tables: Vec<TableFunc>,
     pub aggregates: Vec<AggregateFunc>,
+    /// Advanced tier (INTERNAL C++ ABI): PARSER extensions the component declared.
+    pub parsers: Vec<reg::ParserReg>,
+    /// Advanced tier: general OPTIMIZER rules the component declared.
+    pub optimizers: Vec<reg::OptimizerReg>,
+    /// Advanced tier: streaming + FILTER-PUSHDOWN table functions.
+    pub filterable_tables: Vec<reg::FilterableTableReg>,
 }
 
 /// Process-wide Direction-2 engine: loads components and dispatches DuckDB
@@ -218,12 +224,71 @@ impl Engine2 {
                 callback_handle: a.callback_handle,
             })
             .collect();
+        // Advanced tier: the parser / optimizer / filterable-table markers a
+        // component declared. These do not flow through `drain_pending` (which
+        // covers the common tier); the runtime exposes them as separate pending
+        // queues. The native sink wires each to a C++ shim against DuckDB's
+        // internal ABI (see src/advanced.rs).
+        let parsers = instance.take_pending_parsers();
+        let optimizers = instance.take_pending_optimizers();
+        let filterable_tables = instance.take_pending_filterable_tables();
         self.instances.insert(extension.to_string(), instance);
         Ok(LoadedComponent {
             scalars,
             tables,
             aggregates,
+            parsers,
+            optimizers,
+            filterable_tables,
         })
+    }
+
+    /// Advanced tier — PARSER. Offer the rejected statement `sql` to the parser
+    /// extension behind `callback_handle`. Returns `Some(rewrite_sql)` if the
+    /// component claims it, `None` if it declines. Resolves the handle through the
+    /// shared callback registry to the owning component (as the scalar path does).
+    pub fn dispatch_parse(
+        &mut self,
+        callback_handle: u32,
+        sql: &str,
+    ) -> Result<Option<String>> {
+        let entry = {
+            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            registry
+                .get(callback_handle)
+                .ok_or_else(|| anyhow!("unknown parser callback handle {callback_handle}"))?
+        };
+        let instance = self
+            .instances
+            .get_mut(&*entry.extension)
+            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+        instance
+            .call_parse(entry.dispatcher_handle, sql)
+            .map_err(|e| anyhow!("parser dispatch failed: {e:?}"))
+    }
+
+    /// Advanced tier — OPTIMIZER. Offer the flattened `nodes` (id, op-type,
+    /// parent, params-json) + source `query` to the rule behind `callback_handle`.
+    /// Returns `Some(rewrite_sql)` for a `rewrite-query` directive, else `None`.
+    pub fn dispatch_optimize(
+        &mut self,
+        callback_handle: u32,
+        nodes: Vec<(u32, String, Option<u32>, String)>,
+        query: &str,
+    ) -> Result<Option<String>> {
+        let entry = {
+            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            registry
+                .get(callback_handle)
+                .ok_or_else(|| anyhow!("unknown optimizer callback handle {callback_handle}"))?
+        };
+        let instance = self
+            .instances
+            .get_mut(&*entry.extension)
+            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+        instance
+            .call_optimize(entry.dispatcher_handle, nodes, query)
+            .map_err(|e| anyhow!("optimizer dispatch failed: {e:?}"))
     }
 
     /// Invoke a component scalar for one row. `callback_handle` is the value
