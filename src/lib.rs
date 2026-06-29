@@ -31,7 +31,7 @@ pub mod advanced;
 #[cfg(feature = "loadable")]
 mod loadable {
     use std::error::Error;
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use std::sync::{Arc, Mutex};
 
     use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeId};
@@ -48,6 +48,28 @@ mod loadable {
     // references are resolved at LOAD time against the host DuckDB.
     extern "C" {
         fn ducklink_advanced_probe(db: *mut std::ffi::c_void) -> i32;
+    }
+
+    /// The EXACT DuckDB version this extension's advanced-tier C++ shim was
+    /// compiled against, locked to the `libduckdb-sys` pin in `Cargo.toml`
+    /// (`1.10504.0` = DuckDB v1.5.4). The advanced tier (parser / optimizer /
+    /// filter pushdown) binds DuckDB's INTERNAL C++ ABI, which is NOT stable
+    /// across DuckDB versions, so it is enabled ONLY when the host DuckDB reports
+    /// this exact version. Keep in lock-step with the `duckdb` / `libduckdb-sys`
+    /// pin (a DuckDB bump re-anchors this one string + the C++ shim headers).
+    const DUCKDB_ABI_VERSION: &str = "v1.5.4";
+
+    /// The host DuckDB's reported library version, read through the STABLE C API
+    /// (`duckdb_library_version`, populated in the loadable function-pointer
+    /// table by the API init above). `None` if the pointer is null or not UTF-8.
+    /// This is the gate that keeps a version mismatch from ever calling an
+    /// internal-ABI symbol.
+    unsafe fn host_library_version() -> Option<String> {
+        let ptr = ffi::duckdb_library_version();
+        if ptr.is_null() {
+            return None;
+        }
+        CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string())
     }
 
     /// `ducklink_version()` -> the extension's version string. Registered
@@ -134,7 +156,7 @@ mod loadable {
     ) -> Result<bool, Box<dyn Error>> {
         // Populate the loadable C-API function-pointer table. Returns false on an
         // API-version mismatch, in which case loading aborts cleanly.
-        if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.4").map_err(stringify)? {
+        if !ffi::duckdb_rs_extension_api_init(info, access, DUCKDB_ABI_VERSION).map_err(stringify)? {
             return Ok(false);
         }
         let get_database = (*access)
@@ -146,12 +168,48 @@ mod loadable {
         }
         let db: ffi::duckdb_database = *db_ptr;
 
-        // Build-model proof: reach the advanced-tier C++ shim and have it
-        // dereference the database to its internal DBConfig (an internal C++ ABI
-        // call resolved at load). A negative result means the cast failed; we log
-        // and continue (the common tier does not depend on it).
-        let probe = ducklink_advanced_probe(db.cast());
-        eprintln!("[ducklink] advanced C++ shim probe: maximum_threads={probe}");
+        // VERSION GUARD for the advanced tier. The advanced tier (parser /
+        // optimizer / filter pushdown) binds DuckDB's INTERNAL C++ ABI through
+        // the linked C++ shim, with the internal symbols resolved at LOAD against
+        // the host process. That ABI is NOT stable across DuckDB versions, so
+        // calling into it on a host that differs from the version the shim was
+        // compiled against could crash or corrupt state. We therefore enable the
+        // advanced tier ONLY when the host reports the EXACT built-against version
+        // and otherwise DEGRADE GRACEFULLY to the common tier (scalar / table /
+        // aggregate, all on the stable C API) — never touching an internal-ABI
+        // symbol (not even the probe). `DUCKLINK_DISABLE_ADVANCED` forces the
+        // degraded path regardless (testing / belt-and-suspenders).
+        //
+        // Note the stable C-API init above is a *minimum*-version check (forward
+        // compatible), so a NEWER host loads the common tier fine; this exact
+        // gate is what disables the unstable tier on that newer host.
+        let host_version = host_library_version();
+        let forced_off = std::env::var_os("DUCKLINK_DISABLE_ADVANCED").is_some();
+        let advanced_enabled =
+            !forced_off && host_version.as_deref() == Some(DUCKDB_ABI_VERSION);
+
+        if advanced_enabled {
+            // Internal C++ ABI call, resolved at load against the matching host:
+            // dereference the database to its internal DBConfig as a load-time
+            // proof the shim is reachable and the ABI resolved.
+            let probe = ducklink_advanced_probe(db.cast());
+            eprintln!(
+                "[ducklink] advanced tier ENABLED (host DuckDB {DUCKDB_ABI_VERSION}); \
+                 C++ shim probe maximum_threads={probe}"
+            );
+        } else {
+            let host = host_version.as_deref().unwrap_or("unknown");
+            let reason = if forced_off {
+                "forced off via DUCKLINK_DISABLE_ADVANCED".to_string()
+            } else {
+                format!("host DuckDB {host} does not match the built-against {DUCKDB_ABI_VERSION}")
+            };
+            eprintln!(
+                "[ducklink] advanced tier DISABLED ({reason}); parser / optimizer / \
+                 filter-pushdown are unavailable on this host. Common tier \
+                 (scalar/table/aggregate) is active."
+            );
+        }
 
         // duckdb-rs Connection for the safe scalar / table registration paths.
         let con = Connection::open_from_raw(db.cast())?;
@@ -168,8 +226,13 @@ mod loadable {
             .map_err(stringify)?;
         let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
         let specs = component_specs_from_env();
+        // Only hand the raw `db` to the registrar when the advanced tier is
+        // enabled; with `None`, `register_components` skips ALL internal-ABI C++
+        // shim registration (parser / optimizer / filterable tables) and wires
+        // only the stable-C-API common tier.
+        let advanced_db = advanced_enabled.then_some(db);
         let registered =
-            register_components(&con, have_raw.then_some(raw_con), Some(db), engine, &specs)
+            register_components(&con, have_raw.then_some(raw_con), advanced_db, engine, &specs)
                 .map_err(stringify)?;
 
         // The aggregate functions are now in the database catalog; the sibling

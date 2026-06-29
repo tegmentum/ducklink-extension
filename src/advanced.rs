@@ -72,6 +72,36 @@ fn advanced_or_init(engine: &Arc<Mutex<Engine2>>) -> &'static Advanced {
     })
 }
 
+/// Run an advanced-tier FFI bridge body, converting any panic into the
+/// function's error sentinel so a Rust panic can NEVER unwind across the
+/// C++/Rust boundary (which is undefined behavior). These functions are CALLED
+/// FROM the C++ shim (inside DuckDB's parser / optimizer / scan), so an
+/// unguarded panic — e.g. a poisoned engine/state mutex after an earlier
+/// failure — would unwind into C++. A panic here is an internal bug; we log it
+/// and degrade the single call to its error value rather than abort the process.
+fn guard<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("[ducklink] advanced-tier bridge call panicked; recovered at the FFI boundary");
+            on_panic
+        }
+    }
+}
+
+/// Like [`guard`], but also records the panic in the table-stream last-error
+/// slot so the C++ TableFunction raises a clean SQL error instead of silently
+/// treating the panic as end-of-stream.
+fn guard_ts<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(v) => v,
+        Err(_) => {
+            ts_set_last_error("ducklink advanced-tier table-stream bridge panicked".to_string());
+            on_panic
+        }
+    }
+}
+
 extern "C" {
     /// Install the component-driven ParserExtension on `db` (idempotent).
     fn ducklink_register_parser(db: *mut c_void) -> i32;
@@ -231,6 +261,20 @@ pub unsafe extern "C" fn ducklink_ts_open(
     filters: *const DucklinkTsFilter,
     nfilt: u32,
 ) -> u32 {
+    guard_ts(0, || unsafe {
+        ducklink_ts_open_impl(handle, args, nargs, projection, nproj, filters, nfilt)
+    })
+}
+
+unsafe fn ducklink_ts_open_impl(
+    handle: u32,
+    args: *const DucklinkTsValue,
+    nargs: u32,
+    projection: *const u32,
+    nproj: u32,
+    filters: *const DucklinkTsFilter,
+    nfilt: u32,
+) -> u32 {
     let adv = match ADVANCED.get() {
         Some(a) => a,
         None => return 0,
@@ -326,7 +370,11 @@ pub unsafe extern "C" fn ducklink_ts_open(
 /// # Safety
 /// `chunk` must be a valid `duckdb_data_chunk` with the emitted column schema.
 #[no_mangle]
-pub unsafe extern "C" fn ducklink_ts_fill(_handle: u32, cursor: u32, chunk: *mut c_void) -> bool {
+pub unsafe extern "C" fn ducklink_ts_fill(handle: u32, cursor: u32, chunk: *mut c_void) -> bool {
+    guard_ts(false, || unsafe { ducklink_ts_fill_impl(handle, cursor, chunk) })
+}
+
+unsafe fn ducklink_ts_fill_impl(_handle: u32, cursor: u32, chunk: *mut c_void) -> bool {
     let adv = match ADVANCED.get() {
         Some(a) => a,
         None => return false,
@@ -369,6 +417,19 @@ pub unsafe extern "C" fn ducklink_ts_fill(_handle: u32, cursor: u32, chunk: *mut
         return false;
     }
 
+    // Defensive bound at the component trust boundary: we ask for at most a
+    // vector's worth of rows, but a misbehaving component could return more.
+    // Writing past the chunk's vector capacity would be out-of-bounds, so reject
+    // an over-long batch cleanly instead of corrupting memory.
+    let capacity = ffi::duckdb_vector_size() as usize;
+    if rows.len() > capacity {
+        ts_set_last_error(format!(
+            "ducklink_ts_fill: component returned {} rows, exceeding the chunk capacity {capacity}",
+            rows.len()
+        ));
+        return false;
+    }
+
     let ncols = col_codes.len();
     ffi::duckdb_data_chunk_set_size(output, rows.len() as ffi::idx_t);
     for (col_idx, &code) in col_codes.iter().enumerate() {
@@ -392,7 +453,11 @@ pub unsafe extern "C" fn ducklink_ts_fill(_handle: u32, cursor: u32, chunk: *mut
 
 /// Close + free a streaming cursor.
 #[no_mangle]
-pub extern "C" fn ducklink_ts_close(_handle: u32, cursor: u32) {
+pub extern "C" fn ducklink_ts_close(handle: u32, cursor: u32) {
+    guard((), || ducklink_ts_close_impl(handle, cursor))
+}
+
+fn ducklink_ts_close_impl(_handle: u32, cursor: u32) {
     let adv = match ADVANCED.get() {
         Some(a) => a,
         None => return,
@@ -412,6 +477,11 @@ pub extern "C" fn ducklink_ts_close(_handle: u32, cursor: u32) {
 /// bridge call). Empty C string when none.
 #[no_mangle]
 pub extern "C" fn ducklink_ts_last_error() -> *const c_char {
+    const EMPTY: &[u8] = b"\0";
+    guard(EMPTY.as_ptr() as *const c_char, ducklink_ts_last_error_impl)
+}
+
+fn ducklink_ts_last_error_impl() -> *const c_char {
     static EMPTY: &[u8] = b"\0";
     let adv = match ADVANCED.get() {
         Some(a) => a,
@@ -477,6 +547,15 @@ pub unsafe extern "C" fn ducklink_optimizer_try_rewrite(
     plan_json: *const c_char,
     query: *const c_char,
 ) -> *mut c_char {
+    guard(std::ptr::null_mut(), || unsafe {
+        ducklink_optimizer_try_rewrite_impl(plan_json, query)
+    })
+}
+
+unsafe fn ducklink_optimizer_try_rewrite_impl(
+    plan_json: *const c_char,
+    query: *const c_char,
+) -> *mut c_char {
     let adv = match ADVANCED.get() {
         Some(a) => a,
         None => return std::ptr::null_mut(),
@@ -531,6 +610,12 @@ pub unsafe extern "C" fn ducklink_optimizer_try_rewrite(
 /// `sql` must be a valid NUL-terminated C string for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn ducklink_parser_try_rewrite(sql: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || unsafe {
+        ducklink_parser_try_rewrite_impl(sql)
+    })
+}
+
+unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
     let adv = match ADVANCED.get() {
         Some(a) => a,
         None => return std::ptr::null_mut(),
@@ -573,7 +658,9 @@ pub unsafe extern "C" fn ducklink_parser_try_rewrite(sql: *const c_char) -> *mut
 /// `ptr` must be NULL or a pointer previously returned by a `ducklink_*` bridge.
 #[no_mangle]
 pub unsafe extern "C" fn ducklink_adv_free(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        drop(CString::from_raw(ptr));
-    }
+    guard((), || unsafe {
+        if !ptr.is_null() {
+            drop(CString::from_raw(ptr));
+        }
+    })
 }
