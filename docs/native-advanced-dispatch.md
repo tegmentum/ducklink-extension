@@ -1,7 +1,9 @@
 # Native advanced-tier dispatch (follow-on)
 
-Status as of v0.4.0 (`duckdb:extension@4.0.0`, contract digest
-`a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40`).
+Status as of v0.5.0 (`duckdb:extension@4.0.0`, contract digest
+`a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40`). v0.5.0
+ships the advanced tier, version-guarded; the WIT contract is unchanged from
+v0.4.0 (additive native capability — see "Hardening & graceful degradation").
 
 v0.4.0 retargets the embedded runtime to the major-4 COLUMNAR contract: the hot
 dispatch path (scalar / aggregate / cast over a whole DataChunk) now crosses the
@@ -46,14 +48,18 @@ load un-rebuilt).
 
 ## What now ships natively too (the advanced tier — on the INTERNAL C++ ABI)
 
-STATUS UPDATE (task #200): the advanced tier — PARSER, OPTIMIZER, and
-table-function FILTER pushdown — is now IMPLEMENTED in the native loadable
+STATUS UPDATE: SHIPPED in v0.5.0, version-guarded (task #200 implemented it;
+task #203 hardened it for release). The advanced tier — PARSER, OPTIMIZER, and
+table-function FILTER pushdown — is IMPLEMENTED in the native loadable
 extension, exactly as the follow-on plan below prescribed. A small C++ shim TU
 set (`cpp/ducklink_*.cpp`) compiled against DuckDB's INTERNAL headers is linked
 into the loadable `.duckdb_extension`; it registers the real extension points and
 calls back into the embedded wasmtime engine through `extern "C"` bridge
 functions (`src/advanced.rs`). All three tiers are proven end-to-end against a
 real DuckDB v1.5.4 CLI (see "Build-model verdict" and "Proof" below).
+
+It is additive native capability on top of the unchanged `duckdb:extension`
+@4.0.0 WIT contract — no contract bump, no component rebuild.
 
 These tiers cannot be driven through the stable C API. The stable C surface
 exposes NONE of:
@@ -169,6 +175,71 @@ instead). Proven outputs:
 The corpus `qopt.wasm` / `numstream.wasm` were rebuilt against the frozen
 `@4.0.0` WIT (the shipped artifacts were stale at `@3.0.0`); `ggsql.wasm` was
 already `@4.0.0`.
+
+## Hardening & graceful degradation (shipped v0.5.0)
+
+The advanced tier binds DuckDB's INTERNAL C++ ABI, which is NOT stable across
+DuckDB versions. If the host DuckDB differs from the version-locked headers the
+shim was built against, the deferred internal symbols could be ABI-incompatible
+and crash/corrupt at first use. v0.5.0 makes that impossible:
+
+1. VERSION GUARD (the key safety mechanism). At LOAD, after the stable-C-API
+   init, the extension reads the host's reported version through the STABLE C API
+   (`duckdb_library_version`, routed via the loadable function-pointer table) and
+   enables the advanced tier ONLY when it EXACTLY matches `DUCKDB_ABI_VERSION`
+   (`v1.5.4`, locked to the `libduckdb-sys` pin). On ANY mismatch it DEGRADES
+   GRACEFULLY to the common tier (scalar/table/aggregate, on the stable C API)
+   and never touches a single internal-ABI symbol — not even the probe — so a
+   mismatch cannot segfault. A clear warning is emitted naming the host vs.
+   built-against version. `src/lib.rs` gates this by passing the raw `db` handle
+   to `register_components` only when enabled (`None` otherwise skips ALL C++
+   shim registration). Exact match is deliberate: the internal ABI can change on
+   any version (including patch/dev builds), so anything but `v1.5.4` is unsafe.
+   - The stable C-API init is a MINIMUM-version check (forward compatible): a
+     NEWER host loads the common tier fine; this exact gate is what disables the
+     unstable tier on that newer host. An OLDER host is rejected even earlier by
+     the extension's metadata `duckdb_version` footer (also a clean, no-crash
+     failure).
+   - `DUCKLINK_DISABLE_ADVANCED=1` forces the degraded branch on any host (the
+     same code path a real mismatch takes), which is how the smoke suite proves
+     graceful degradation deterministically on a matching host.
+
+2. FFI PANIC GUARD. Every advanced-tier Rust bridge function called from the C++
+   shim (parser / optimizer / table-stream open/fill/close/last-error/free) wraps
+   its body in `catch_unwind`, so a Rust panic — e.g. a poisoned engine/state
+   mutex after an earlier failure — can NEVER unwind across the C++/Rust boundary
+   (which is UB). Panics convert to the function's error sentinel; the
+   table-stream path also records a last-error so the C++ TableFunction raises a
+   clean SQL error rather than silently treating the panic as end-of-stream. The
+   C++ side already wraps each registration entrypoint and the optimizer re-plan
+   in `try/catch`, so no C++ exception escapes either.
+
+3. BOUNDS GUARD. `ducklink_ts_fill` rejects a component batch larger than the
+   chunk's vector capacity (`duckdb_vector_size`) instead of writing out of
+   bounds — defensive at the component trust boundary.
+
+Memory-safety audit (manual; ASAN is not feasible here because the loaded
+extension resolves its internal symbols against a non-instrumented host DuckDB,
+so an ASAN-built shim would mismatch the host runtime): the FFI boundary is the
+whole surface. Rewrite strings are Rust-allocated (`CString::into_raw`) and
+Rust-freed (`ducklink_adv_free`) — matched, single free. Filter/arg text crossing
+the boundary is kept alive C++-side for the duration of the `open` call and copied
+to owned values in Rust before return. Cursors are tracked in a bridge-local map
+and closed from the C++ global-state destructor (covering the mid-scan-error
+path). Null/empty pointers and zero counts are checked on every entry; NULL filter
+constants are dropped (un-pushable); malformed optimizer plan JSON degrades to an
+empty node list (bounded at 2^16 nodes). Table scans are single-threaded
+(`MaxThreads()==1`) and all engine/state access is mutex-serialized.
+
+### Expanded smoke suite
+
+`test/advanced/smoke.sh` now covers, beyond the three happy paths: parser
+pass-through + malformed SQL (no crash); optimizer no-op; filter pushdown with
+zero / all rows and IS NULL / IS NOT NULL; all three advanced extensions loaded
+together; idempotent double-LOAD; a common-tier scalar alongside the active shim
+(no-regression); the version-guard degraded path; and loading into a non-matching
+host (clean rejection, no crash). Every check also fails on any crash marker.
+`STRICT=1` is green on a real v1.5.4 CLI with the `@4.0.0` corpus.
 
 ### Implementation map
 
