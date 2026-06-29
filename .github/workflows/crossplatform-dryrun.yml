@@ -1,0 +1,81 @@
+# TEMPORARY cross-platform build dry-run for the v0.5.1 Windows fix.
+#
+# Reproduces the build the duckdb/community-extensions CI runs for a Rust
+# extension (`cargo build --release --features loadable`, the default feature
+# set) on the three host families, to prove windows_amd64 builds the common
+# tier and linux/macOS still build the advanced tier (the tar-extract +
+# C++-against-internal-headers shim) in a clean sandbox.
+#
+# This file lives ONLY on the `ci/crossplatform-dryrun` branch; it is not on the
+# default branch, so it never runs on normal pushes.
+name: crossplatform-dryrun
+
+on:
+  push:
+    branches: [ci/crossplatform-dryrun]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # The HARD GATE. This is the exact build that regressed on windows_amd64
+      # in v0.5.0. On linux/macOS it also runs build.rs (tar-extracts the pinned
+      # DuckDB source and compiles the C++ shim against its internal headers),
+      # so a clean-sandbox build here validates the advanced tier too.
+      - name: Build loadable extension (community-CI build)
+        run: cargo build --release --features loadable
+
+      - name: Show built artifact
+        shell: bash
+        run: |
+          echo "Built artifacts in target/release:"
+          ls -la target/release || true
+          echo "---"
+          find target/release -maxdepth 1 \
+            \( -name 'libducklink.*' -o -name 'ducklink.dll' \) -print || true
+
+      # Best-effort runtime smoke on the platforms where a DuckDB CLI is easy to
+      # get. Informational only (continue-on-error) — the build above is the
+      # authoritative gate; a version-mismatched CLI just loads the common tier.
+      - name: Load + ducklink_version() smoke (linux/macOS, best-effort)
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Wrap the cdylib with extension metadata so a CLI will LOAD it.
+          make release || { echo "make release failed (informational)"; exit 0; }
+          EXT="build/release/ducklink.duckdb_extension"
+          [ -f "$EXT" ] || { echo "no wrapped extension produced (informational)"; exit 0; }
+          # Try to fetch a matching DuckDB v1.5.4 CLI; skip cleanly if absent.
+          case "${{ runner.os }}" in
+            Linux)  ASSET="duckdb_cli-linux-amd64.zip" ;;
+            macOS)  ASSET="duckdb_cli-osx-universal.zip" ;;
+          esac
+          URL="https://github.com/duckdb/duckdb/releases/download/v1.5.4/${ASSET}"
+          if curl -fsSL "$URL" -o duckdb_cli.zip; then
+            unzip -o duckdb_cli.zip -d duckdb_cli >/dev/null
+            CLI="$(find duckdb_cli -name duckdb -type f | head -n1)"
+            chmod +x "$CLI" || true
+            "$CLI" --version || true
+            "$CLI" -unsigned -c "LOAD '$PWD/$EXT'; SELECT ducklink_version();" || \
+              echo "load/version check returned non-zero (informational)"
+          else
+            echo "no public v1.5.4 CLI to download; skipping load check (informational)"
+          fi
