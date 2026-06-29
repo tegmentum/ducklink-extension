@@ -1,12 +1,21 @@
 # Native advanced-tier dispatch (follow-on)
 
-Status as of v0.3.0 (`duckdb:extension@3.1.0`, contract digest
-`1b94f15d2c41f9a81de50c6d4d8cf508bf76333c4b901c00f511b811b8eb4983`).
+Status as of v0.4.0 (`duckdb:extension@4.0.0`, contract digest
+`a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40`).
+
+v0.4.0 retargets the embedded runtime to the major-4 COLUMNAR contract: the hot
+dispatch path (scalar / aggregate / cast over a whole DataChunk) now crosses the
+canonical ABI as typed `colvec`s — one bulk transfer per fixed-width column —
+instead of the major-3 row-major `list<list<duckvalue>>` tagged-variant batch.
+The native bridge marshals each DuckDB chunk once and the shared runtime pivots
+it to columns at the boundary, so the per-cell variant marshalling is gone. The
+common tier (scalar / table / aggregate / window-over-aggregate) is otherwise
+unchanged and still on the stable C API.
 
 ## The stability model
 
 We guard exactly ONE external surface: the `duckdb:extension` WIT contract. It is
-frozen (major 3, additive minors only; the contract is identified by the witcanon
+frozen (major 4, additive minors only; the contract is identified by the witcanon
 digest of the canonical WIT, not a hand-maintained string). Components target the
 WIT world and are version-independent.
 
@@ -15,12 +24,12 @@ binding layer (the native extension's DuckDB-facing code). "We have to keep up, 
 it is only one thing that needs to keep up." A DuckDB version bump re-anchors that
 one layer; it never bumps the WIT contract.
 
-## What v0.3.0 ships natively (the common tier — on the STABLE C API)
+## What v0.4.0 ships natively (the common tier — on the STABLE C API)
 
 The native extension is a Rust loadable `.duckdb_extension` built against DuckDB's
 STABLE C Extension API (`duckdb_ext_api_v1`, frozen since DuckDB 1.2.0) via
 `duckdb-rs` + `libduckdb-sys` (loadable-extension). On that stable C ground it
-loads `@3.1.0` components and drives the bulk of the catalog:
+loads `@4.0.0` columnar components and drives the bulk of the catalog:
 
 - scalar functions  — `register_scalar_function_with_state`
 - table functions   — `register_table_function_with_extra_info` (whole-batch
@@ -82,8 +91,9 @@ Add a C++ shim TU to the extension build that registers, against the loaded
    `column_ids` + `filters`, flattens to the neutral filter descriptor, opens the
    cursor via `table-stream-dispatch.call-table-open-filtered` (the host driver
    `ExtensionInstance::table_open_filtered` already exists in `ducklink-runtime`).
-   The `@3.1.0` additive `register-filterable-table` marker exists; the boundary
-   test already proves a pushed filter prunes rows at the component source.
+   The additive `register-filterable-table` marker exists in the contract; the
+   boundary test already proves a pushed filter prunes rows at the component
+   source.
 
 Per-release cost: when DuckDB bumps, re-anchor this one C++ shim TU against the new
 internal headers. That is the single layer that "keeps up"; the WIT contract and
