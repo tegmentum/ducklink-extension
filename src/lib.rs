@@ -23,13 +23,16 @@ pub mod engine;
 pub mod reg_duckdb;
 
 /// The advanced dispatch tier (PARSER / OPTIMIZER / table FILTER pushdown): the
-/// Rust side of the C++ shim that binds DuckDB's internal C++ ABI. Present
-/// whenever the duckdb crate is available, EXCEPT on Windows: the shim's
-/// deferred-undefined-symbol linking model has no portable PE/COFF equivalent,
-/// so the C++ shim is not built there (see build.rs) and the advanced module —
-/// along with every reference to its FFI — is compiled out, leaving Windows
-/// with the common tier only (scalar/table/aggregate on the stable C API).
-#[cfg(all(feature = "duckdb-api", not(target_os = "windows")))]
+/// Rust side of the C++ shim that binds DuckDB's internal C++ ABI. Compiled in
+/// only when the `advanced` feature is built AND the C++ shim was compiled —
+/// build.rs sets the `advanced_tier` cfg for non-Windows `--features advanced`
+/// builds. The DEFAULT community build does NOT enable `advanced` (it is off by
+/// default), and the shim's deferred-undefined-symbol linking model has no
+/// portable Windows PE/COFF equivalent, so on the default build and on Windows
+/// this module — along with every reference to its FFI — is compiled out,
+/// leaving the common tier only (scalar/table/aggregate on the stable C API)
+/// with a trivial build script and no undefined internal symbols.
+#[cfg(advanced_tier)]
 pub mod advanced;
 
 #[cfg(feature = "loadable")]
@@ -49,11 +52,12 @@ mod loadable {
 
     // The advanced-tier C++ shim, compiled against DuckDB's internal headers and
     // linked into this extension (see build.rs). Internal C++ symbols it
-    // references are resolved at LOAD time against the host DuckDB. Not built on
-    // Windows (the shim is compiled out there), so this declaration — and every
-    // call into it — is gated off, leaving no undefined internal symbol in the
-    // Windows cdylib.
-    #[cfg(not(target_os = "windows"))]
+    // references are resolved at LOAD time against the host DuckDB. Only present
+    // in `advanced_tier` builds (non-Windows `--features advanced`); on the
+    // default community build and on Windows the shim is not compiled, so this
+    // declaration — and every call into it — is gated off, leaving no undefined
+    // internal symbol in the cdylib.
+    #[cfg(advanced_tier)]
     extern "C" {
         fn ducklink_advanced_probe(db: *mut std::ffi::c_void) -> i32;
     }
@@ -194,20 +198,20 @@ mod loadable {
         let host_version = host_library_version();
         let forced_off = std::env::var_os("DUCKLINK_DISABLE_ADVANCED").is_some();
 
-        // On Windows the advanced tier is compiled out entirely (no C++ shim is
-        // built — see build.rs / the gated `advanced` module), so it is always
-        // disabled at compile time and no internal-ABI symbol is ever referenced.
-        // Everywhere else, the version guard enables it ONLY when the host reports
-        // the EXACT built-against DuckDB version, degrading gracefully to the
-        // common tier otherwise. Both paths select the same common-tier-only
-        // behavior; on Windows it is just selected at compile time.
-        #[cfg(target_os = "windows")]
+        // When the advanced tier is not compiled into this artifact (the default
+        // community build, or Windows — no C++ shim is built, see build.rs / the
+        // gated `advanced` module), it is always disabled at compile time and no
+        // internal-ABI symbol is ever referenced. When it IS compiled in
+        // (`advanced_tier`), the version guard enables it ONLY when the host
+        // reports the EXACT built-against DuckDB version, degrading gracefully to
+        // the common tier otherwise.
+        #[cfg(not(advanced_tier))]
         let advanced_enabled = false;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(advanced_tier)]
         let advanced_enabled =
             !forced_off && host_version.as_deref() == Some(DUCKDB_ABI_VERSION);
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(advanced_tier)]
         if advanced_enabled {
             // Internal C++ ABI call, resolved at load against the matching host:
             // dereference the database to its internal DBConfig as a load-time
@@ -230,13 +234,18 @@ mod loadable {
                  (scalar/table/aggregate) is active."
             );
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(not(advanced_tier))]
         {
             // Reference the otherwise-unused inputs so the common-tier-only build
             // stays warning-clean.
             let _ = (&host_version, forced_off);
+            let why = if cfg!(target_os = "windows") {
+                "not built on Windows (no portable PE/COFF equivalent)"
+            } else {
+                "not built in this artifact (build with --features advanced to enable)"
+            };
             eprintln!(
-                "[ducklink] advanced tier NOT BUILT on Windows; parser / optimizer / \
+                "[ducklink] advanced tier {why}; parser / optimizer / \
                  filter-pushdown are unavailable here. Common tier \
                  (scalar/table/aggregate) is active."
             );

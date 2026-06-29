@@ -1274,9 +1274,10 @@ pub fn register_components(
     engine: Arc<Mutex<Engine2>>,
     specs: &[ComponentSpec],
 ) -> anyhow::Result<usize> {
-    // The advanced-tier `db` handle is unused on Windows (the advanced module is
-    // compiled out there); reference it so the common-tier-only build is clean.
-    #[cfg(target_os = "windows")]
+    // The advanced-tier `db` handle is unused when the advanced module is not
+    // compiled in (the default community build, or Windows); reference it so the
+    // common-tier-only build is clean.
+    #[cfg(not(advanced_tier))]
     let _ = &db;
     let mut total = 0usize;
     for spec in specs {
@@ -1289,9 +1290,10 @@ pub fn register_components(
         // Advanced tier: wire any PARSER / OPTIMIZER / filterable-table markers
         // through the internal-ABI C++ shim. Needs the raw `db` handle; the
         // bundled tests (which use a duckdb-rs Connection) pass `None`. Compiled
-        // out on Windows, where the C++ shim and the `advanced` module do not
-        // exist (callers there always pass `None` anyway).
-        #[cfg(not(target_os = "windows"))]
+        // in only for `advanced_tier` builds; on the default community build and
+        // on Windows the C++ shim and the `advanced` module do not exist (callers
+        // there always pass `None` anyway).
+        #[cfg(advanced_tier)]
         if let Some(db) = db {
             crate::advanced::register(db, &engine, &loaded);
         }

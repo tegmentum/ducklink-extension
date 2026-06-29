@@ -7,8 +7,10 @@
 # functions; this asserts the entrypoint runs cleanly and the engine boots.
 require ducklink
 
-# The always-available built-in returns the extension version string.
+# The always-available built-in returns the extension version string. Assert the
+# SHAPE (the `ducklink ` prefix) rather than an exact version, so this test never
+# breaks on a version bump.
 query I
-SELECT ducklink_version();
+SELECT ducklink_version() LIKE 'ducklink %';
 ----
-ducklink 0.3.0
+true

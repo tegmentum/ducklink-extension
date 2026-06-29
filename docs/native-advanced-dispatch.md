@@ -5,6 +5,32 @@ Status as of v0.5.0 (`duckdb:extension@4.0.0`, contract digest
 ships the advanced tier, version-guarded; the WIT contract is unchanged from
 v0.4.0 (additive native capability — see "Hardening & graceful degradation").
 
+## v0.5.2: the advanced tier is an OPT-IN cargo feature (off by default)
+
+The advanced tier (parser / optimizer / table FILTER pushdown) is gated behind a
+cargo feature, `advanced`, that is **OFF by default**:
+
+- **Default build** (`cargo build --release`, what the community-extensions CI
+  runs) → the COMMON tier only. The build script is a trivial no-op: it pulls no
+  `cc` build-dependency, compiles no C++ shim, and emits no link args — exactly
+  like the green v0.4.0, which had no build.rs at all. This is portable across
+  every platform (Linux / macOS / Windows). The `advanced_tier` cfg is unset, so
+  the `advanced` module and every internal-ABI reference are compiled out.
+- **Native distribution** (`cargo build --release --features advanced`) → the
+  FULL tier. build.rs compiles `cpp/ducklink_*.cpp` and sets the `advanced_tier`
+  cfg, enabling the parser / optimizer / filter-pushdown dispatch. Still
+  compiled out on Windows (no portable PE/COFF deferred-undefined-symbol model).
+
+Why: the community macOS CI (macOS 26 / arm64, vcpkg toolchain, ccache on PATH)
+failed to *execute* the cc-linked host `build-script-build` binary
+(`cannot execute binary file`, exit 126) — a regression introduced purely by the
+presence of the cc-using build.rs (the runtime crate's trivial build script built
+fine in the same env). Making the advanced tier opt-in restores the
+guaranteed-green common-tier community artifact while preserving the full tier for
+our own native builds. The community-shipped artifact is therefore COMMON-tier;
+ship `--features advanced` builds through our own native distribution channel for
+parser / optimizer / filter-pushdown support.
+
 v0.4.0 retargets the embedded runtime to the major-4 COLUMNAR contract: the hot
 dispatch path (scalar / aggregate / cast over a whole DataChunk) now crosses the
 canonical ABI as typed `colvec`s — one bulk transfer per fixed-width column —

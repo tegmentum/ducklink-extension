@@ -5,7 +5,7 @@
 # git dependency so this repo builds on its own under the community-extensions CI.
 [package]
 name = "ducklink-extension"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 description = "Run WebAssembly component extensions inside DuckDB"
@@ -32,6 +32,17 @@ loadable = [
 ]
 # Compile an in-process DuckDB from source, for the end-to-end Rust tests.
 bundled = ["duckdb-api", "duckdb/bundled"]
+# The ADVANCED native dispatch tier (parser / optimizer / table FILTER
+# pushdown). It binds DuckDB's INTERNAL C++ ABI through a C++ shim compiled by
+# build.rs (pulls the `cc` build-dependency) and is therefore OPT-IN and OFF by
+# default: the community-extensions CI runs a plain `cargo build --release`
+# (default features only), so it gets the COMMON tier with a trivial no-op build
+# script — guaranteed-portable across every platform (this is why v0.4.0, which
+# had no build.rs, built green everywhere). Our own native distribution builds
+# `--features loadable,advanced` to ship the full tier. The shim has no portable
+# Windows PE/COFF equivalent, so it is compiled out on Windows regardless (see
+# build.rs).
+advanced = ["dep:cc", "duckdb-api"]
 
 [dependencies]
 # The shared engine: the duckdb:extension bindgen, the neutral reg::* capture
@@ -57,7 +68,11 @@ libduckdb-sys = { version = "1.10504.0", features = ["loadable-extension"], opti
 # Compiles the advanced-tier C++ shim (cpp/ducklink_*.cpp) against DuckDB's
 # INTERNAL headers and links it into the loadable extension. Headers are taken
 # from the version-locked libduckdb-sys bundled source (v1.5.4). See build.rs.
-cc = "1"
+# OPTIONAL and gated behind the `advanced` feature so the DEFAULT (community)
+# build does not pull `cc` into the build script at all — the build-script-build
+# binary then links exactly like the trivial runtime one (which builds green in
+# the community macOS CI), instead of the cc-linked one that fails to exec there.
+cc = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

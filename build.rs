@@ -20,80 +20,107 @@
 //! which exports them (verified: the v1.5.4 CLI exports all of them). On macOS
 //! that needs `-undefined dynamic_lookup` on the cdylib link, added below.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 fn main() {
-    // The advanced C++ shim is only needed when building against a real DuckDB
-    // (the `duckdb-api` feature, enabled by both `loadable` and `bundled`). The
-    // engine-only builds (e.g. `--no-default-features` benches) skip it entirely
-    // and never need the DuckDB toolchain or headers.
-    if std::env::var("CARGO_FEATURE_DUCKDB_API").is_err() {
-        return;
-    }
-    // Never compiled for a wasm target (that is the OTHER direction — the wasm
-    // core, which compiles its own equivalent shims in-tree).
-    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if target_arch == "wasm32" {
-        return;
-    }
-    // Never compiled on Windows. The advanced tier links against DuckDB's
-    // internal C++ ABI with internal symbols left UNDEFINED in the shim object,
-    // resolved at LOAD time against the host process. That deferred-undefined
-    // model has no portable equivalent on Windows PE/COFF (the MSVC linker
-    // requires every symbol resolved at link time and rejects the GNU-ld
-    // `--allow-shlib-undefined` flag below). So Windows builds the COMMON tier
-    // only — a pure Rust + stable-C-API cdylib with no undefined internal
-    // symbols — and the advanced module is compiled out on the Rust side too
-    // (`#[cfg(not(target_os = "windows"))]`). Skip the C++ shim and emit no
-    // cdylib link-arg here.
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "windows" {
-        return;
-    }
+    // The source uses `#[cfg(advanced_tier)]` / `#[cfg(not(advanced_tier))]` to
+    // gate the advanced module and every internal-ABI reference. Declare the
+    // custom cfg unconditionally so it is known to the compiler in EVERY build
+    // (advanced on or off, bench, test), keeping check-cfg clean.
+    println!("cargo:rustc-check-cfg=cfg(advanced_tier)");
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let ddb_root = resolve_duckdb_source(&out_dir);
-    let include_dirs = read_include_dirs(&ddb_root);
-
-    let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .std("c++17")
-        // DuckDB's internal headers gate symbol-visibility macros on this; the
-        // bundled DuckDB build sets it, so match it for ABI-identical inlines.
-        .define("DUCKDB_BUILD_LIBRARY", None)
-        .warnings(false)
-        .flag_if_supported("-Wno-unused-parameter");
-    for dir in &include_dirs {
-        build.include(ddb_root.join(dir));
-    }
-    for tu in CPP_FILES {
-        println!("cargo:rerun-if-changed=cpp/{tu}");
-        build.file(format!("cpp/{tu}"));
-    }
-    build.compile("ducklink_advanced");
-
-    // Loadable build: the shim references internal DuckDB C++ symbols that live
-    // in the loading process, not in this cdylib. Defer them to load time.
-    // `rustc-cdylib-link-arg` applies ONLY to the cdylib (the .duckdb_extension),
-    // never to the bundled test executable, where the symbols are linked in.
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-cdylib-link-arg=-undefined");
-        println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
-    } else {
-        // ELF: allow undefined symbols in the shared object (resolved at load).
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--allow-shlib-undefined");
-    }
+    // The advanced tier (and its `cc` build-dependency + C++ shim) is OPT-IN and
+    // OFF BY DEFAULT. The community-extensions CI runs a plain
+    // `cargo build --release` with default features only, so the `advanced`
+    // feature is absent: this build script does nothing, links no `cc`, compiles
+    // no C++, and emits no link args — a trivial no-op build script, exactly like
+    // the green v0.4.0. Only `--features advanced` (our native distribution) runs
+    // the shim build below.
+    #[cfg(feature = "advanced")]
+    advanced_build::run();
 }
 
-/// The C++ shim translation units, compiled together into `libducklink_advanced`.
-const CPP_FILES: &[&str] = &[
-    "ducklink_advanced.cpp",
-    "ducklink_parser.cpp",
-    "ducklink_optimizer.cpp",
-    "ducklink_table_stream.cpp",
-];
+/// Build the advanced-tier C++ shim and link it into the loadable extension.
+/// Compiled ONLY under `--features advanced` (so `cc` is an optional build-dep
+/// that is absent from the default community build).
+#[cfg(feature = "advanced")]
+mod advanced_build {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    pub fn run() {
+        // The advanced C++ shim is only meaningful when building against a real
+        // DuckDB (the `duckdb-api` feature, which `advanced` pulls in). Guard
+        // anyway so an odd feature combo never tries to compile it.
+        if std::env::var("CARGO_FEATURE_DUCKDB_API").is_err() {
+            return;
+        }
+        // Never compiled for a wasm target (that is the OTHER direction — the
+        // wasm core, which compiles its own equivalent shims in-tree).
+        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        if target_arch == "wasm32" {
+            return;
+        }
+        // Never compiled on Windows. The advanced tier links against DuckDB's
+        // internal C++ ABI with internal symbols left UNDEFINED in the shim
+        // object, resolved at LOAD time against the host process. That
+        // deferred-undefined model has no portable equivalent on Windows
+        // PE/COFF (the MSVC linker requires every symbol resolved at link time
+        // and rejects the GNU-ld `--allow-shlib-undefined` flag below). So
+        // Windows builds the COMMON tier only and the advanced module is
+        // compiled out on the Rust side too (`#[cfg(advanced_tier)]`, which we
+        // never set here). Skip the C++ shim and emit no cdylib link-arg.
+        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_os == "windows" {
+            return;
+        }
+
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+        let ddb_root = resolve_duckdb_source(&out_dir);
+        let include_dirs = read_include_dirs(&ddb_root);
+
+        let mut build = cc::Build::new();
+        build
+            .cpp(true)
+            .std("c++17")
+            // DuckDB's internal headers gate symbol-visibility macros on this;
+            // the bundled DuckDB build sets it, so match it for ABI-identical
+            // inlines.
+            .define("DUCKDB_BUILD_LIBRARY", None)
+            .warnings(false)
+            .flag_if_supported("-Wno-unused-parameter");
+        for dir in &include_dirs {
+            build.include(ddb_root.join(dir));
+        }
+        for tu in CPP_FILES {
+            println!("cargo:rerun-if-changed=cpp/{tu}");
+            build.file(format!("cpp/{tu}"));
+        }
+        build.compile("ducklink_advanced");
+
+        // The advanced tier is compiled into this build: turn on the source-side
+        // gate so the `advanced` module and its internal-ABI references compile.
+        println!("cargo:rustc-cfg=advanced_tier");
+
+        // Loadable build: the shim references internal DuckDB C++ symbols that
+        // live in the loading process, not in this cdylib. Defer them to load
+        // time. `rustc-cdylib-link-arg` applies ONLY to the cdylib (the
+        // .duckdb_extension), never to the bundled test executable, where the
+        // symbols are linked in.
+        if cfg!(target_os = "macos") {
+            println!("cargo:rustc-cdylib-link-arg=-undefined");
+            println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
+        } else {
+            // ELF: allow undefined symbols in the shared object (resolved at load).
+            println!("cargo:rustc-cdylib-link-arg=-Wl,--allow-shlib-undefined");
+        }
+    }
+
+    /// The C++ shim translation units, compiled together into `libducklink_advanced`.
+    const CPP_FILES: &[&str] = &[
+        "ducklink_advanced.cpp",
+        "ducklink_parser.cpp",
+        "ducklink_optimizer.cpp",
+        "ducklink_table_stream.cpp",
+    ];
 
 /// Resolve the DuckDB v1.5.4 source tree (header root) we compile the shim
 /// against, version-locked to the `libduckdb-sys` crate this build depends on.
@@ -202,3 +229,4 @@ fn read_include_dirs(root: &Path) -> Vec<String> {
     assert!(!dirs.is_empty(), "no include_dirs parsed from manifest.json");
     dirs
 }
+} // mod advanced_build
