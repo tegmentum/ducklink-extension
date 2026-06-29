@@ -5,7 +5,7 @@
 # git dependency so this repo builds on its own under the community-extensions CI.
 [package]
 name = "ducklink-extension"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 description = "Run WebAssembly component extensions inside DuckDB"

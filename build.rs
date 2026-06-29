@@ -37,6 +37,20 @@ fn main() {
     if target_arch == "wasm32" {
         return;
     }
+    // Never compiled on Windows. The advanced tier links against DuckDB's
+    // internal C++ ABI with internal symbols left UNDEFINED in the shim object,
+    // resolved at LOAD time against the host process. That deferred-undefined
+    // model has no portable equivalent on Windows PE/COFF (the MSVC linker
+    // requires every symbol resolved at link time and rejects the GNU-ld
+    // `--allow-shlib-undefined` flag below). So Windows builds the COMMON tier
+    // only — a pure Rust + stable-C-API cdylib with no undefined internal
+    // symbols — and the advanced module is compiled out on the Rust side too
+    // (`#[cfg(not(target_os = "windows"))]`). Skip the C++ shim and emit no
+    // cdylib link-arg here.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        return;
+    }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let ddb_root = resolve_duckdb_source(&out_dir);
