@@ -285,6 +285,82 @@ impl Engine2 {
             .map_err(|e| anyhow!("optimizer dispatch failed: {e:?}"))
     }
 
+    /// Advanced tier — TABLE FILTER PUSHDOWN. Open a streaming cursor on the
+    /// filterable table function `handle` of component `extension`, with bound
+    /// `args`, a column `projection` (empty = all), and the conjunctive `filters`
+    /// (column index, op code 0..8 mirroring `filter-op`, operand values). Returns
+    /// the component cursor handle. Drives `call-table-open-filtered`.
+    pub fn dispatch_table_open_filtered(
+        &mut self,
+        extension: &str,
+        handle: u32,
+        args: Vec<reg::DuckValue>,
+        projection: Vec<u32>,
+        filters: Vec<(u32, u8, Vec<reg::DuckValue>)>,
+    ) -> Result<u32> {
+        use ducklink_runtime::extension::{FilterOp, TableFilter};
+        let instance = self
+            .instances
+            .get_mut(extension)
+            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        let wit_args: Vec<extension_types::Duckvalue> =
+            args.into_iter().map(neutral_to_wit).collect();
+        let wit_filters: Vec<TableFilter> = filters
+            .into_iter()
+            .filter_map(|(column, op, values)| {
+                ts_filter_op(op).map(|op| TableFilter {
+                    column,
+                    op,
+                    values: values.into_iter().map(neutral_to_wit).collect(),
+                })
+            })
+            .collect();
+        let _ = FilterOp::Eq; // anchor the import even if no filters are present
+        let result = instance
+            .table_open_filtered(handle, &wit_args, &projection, &wit_filters)
+            .map_err(|e| anyhow!("table-stream open failed: {e:?}"))?;
+        Ok(result.cursor)
+    }
+
+    /// Advanced tier — pull up to `max_rows` from a streaming cursor as neutral
+    /// rows. An empty result signals EOF. Drives `call-table-next`.
+    pub fn dispatch_table_next(
+        &mut self,
+        extension: &str,
+        handle: u32,
+        cursor: u32,
+        max_rows: u32,
+    ) -> Result<Vec<Vec<reg::DuckValue>>> {
+        let instance = self
+            .instances
+            .get_mut(extension)
+            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        let rows = instance
+            .table_next(handle, cursor, max_rows)
+            .map_err(|e| anyhow!("table-stream next failed: {e:?}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.into_iter().map(wit_to_neutral).collect())
+            .collect())
+    }
+
+    /// Advanced tier — close a streaming cursor. Drives `call-table-close`.
+    pub fn dispatch_table_close(
+        &mut self,
+        extension: &str,
+        handle: u32,
+        cursor: u32,
+    ) -> Result<()> {
+        let instance = self
+            .instances
+            .get_mut(extension)
+            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        instance
+            .table_close(handle, cursor)
+            .map_err(|e| anyhow!("table-stream close failed: {e:?}"))?;
+        Ok(())
+    }
+
     /// Invoke a component scalar for one row. `callback_handle` is the value
     /// handed to DuckDB at registration; it resolves through the shared callback
     /// registry to the owning component instance and its guest dispatcher.
@@ -409,6 +485,25 @@ impl Engine2 {
             .map_err(|e| anyhow!("aggregate dispatch failed: {e:?}"))?;
         Ok(wit_to_neutral(result))
     }
+}
+
+/// Map a C-ABI ts-op code (DUCKLINK_TS_OP_*, mirroring `filter-op`) to the WIT
+/// `FilterOp`. Unknown codes are dropped (the engine re-checks the real filter
+/// above the scan, so dropping a clause forgoes pruning, never correctness).
+fn ts_filter_op(op: u8) -> Option<ducklink_runtime::extension::FilterOp> {
+    use ducklink_runtime::extension::FilterOp as Op;
+    Some(match op {
+        0 => Op::Eq,
+        1 => Op::Ne,
+        2 => Op::Lt,
+        3 => Op::Le,
+        4 => Op::Gt,
+        5 => Op::Ge,
+        6 => Op::IsIn,
+        7 => Op::IsNull,
+        8 => Op::IsNotNull,
+        _ => return None,
+    })
 }
 
 fn neutral_to_wit(v: reg::DuckValue) -> extension_types::Duckvalue {

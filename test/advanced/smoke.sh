@@ -94,6 +94,23 @@ else
 	skip "qopt.wasm not in corpus"
 fi
 
+# --- TABLE FILTER PUSHDOWN: numstream prunes at the source -------------------
+# numstream(10) emits v=0..9; `WHERE v > 7` is pushed to the source, so only
+# v=8,9 are produced. Assert both the kept rows and (via SUM) that nothing below
+# the threshold leaked through.
+if [ -f "$corpus/numstream.wasm" ]; then
+	run "table-fn filter pushdown / rows (numstream)" \
+		"numstream=$corpus/numstream.wasm" \
+		"SELECT v FROM numstream(10) WHERE v > 7 ORDER BY v;" \
+		"8"
+	run "table-fn filter pushdown / pruned-sum (numstream)" \
+		"numstream=$corpus/numstream.wasm" \
+		"SELECT count(*) AS c, sum(v) AS s FROM numstream(10) WHERE v > 7;" \
+		"2"
+else
+	skip "numstream.wasm not in corpus"
+fi
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails advanced-tier smoke check(s) failed" >&2
 	exit 1

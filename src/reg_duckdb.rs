@@ -111,7 +111,7 @@ const T_COMPLEX: u8 = 20;
 /// Map a neutral logical type to a bridge type code. All current `reg`
 /// logical types are supported. Borrows `lt` because the `Complex` arm carries
 /// an owned `String`, so `reg::LogicalType` is no longer `Copy`.
-fn type_code(lt: &reg::LogicalType) -> u8 {
+pub(crate) fn type_code(lt: &reg::LogicalType) -> u8 {
     match lt {
         reg::LogicalType::Int64 => T_I64,
         reg::LogicalType::Uint64 => T_U64,
@@ -989,7 +989,7 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
 }
 
 /// Write a neutral value into row `i` of a raw result vector (type `code`).
-unsafe fn write_ret_raw(
+pub(crate) unsafe fn write_ret_raw(
     code: u8,
     vector: ffi::duckdb_vector,
     i: usize,
