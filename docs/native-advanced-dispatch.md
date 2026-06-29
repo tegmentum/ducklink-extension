@@ -44,10 +44,19 @@ This covers the common tier — the bulk of the ~190-component catalog
 (stable C API), and a WIT additive minor does not perturb it (older components
 load un-rebuilt).
 
-## What is deferred (the advanced tier — needs the INTERNAL C++ ABI)
+## What now ships natively too (the advanced tier — on the INTERNAL C++ ABI)
 
-parser / optimizer / table-function FILTER pushdown cannot be driven through the
-stable C API. The stable C surface exposes NONE of:
+STATUS UPDATE (task #200): the advanced tier — PARSER, OPTIMIZER, and
+table-function FILTER pushdown — is now IMPLEMENTED in the native loadable
+extension, exactly as the follow-on plan below prescribed. A small C++ shim TU
+set (`cpp/ducklink_*.cpp`) compiled against DuckDB's INTERNAL headers is linked
+into the loadable `.duckdb_extension`; it registers the real extension points and
+calls back into the embedded wasmtime engine through `extern "C"` bridge
+functions (`src/advanced.rs`). All three tiers are proven end-to-end against a
+real DuckDB v1.5.4 CLI (see "Build-model verdict" and "Proof" below).
+
+These tiers cannot be driven through the stable C API. The stable C surface
+exposes NONE of:
 
 - `ParserExtension` registration (`DBConfig::parser_extensions`)
 - `OptimizerExtension::Register` (`DBConfig::optimizer_extension*`)
@@ -101,3 +110,73 @@ the ~190 components do not move.
 
 OPERATOR extensions remain out of scope (infeasible by-value over WIT — steer to
 table functions), as in the v3 stabilization audit.
+
+## The build-model change (how the C++ shim links into a Rust loadable)
+
+The loadable `.duckdb_extension` is a Rust `cdylib` built via `duckdb-rs` +
+`libduckdb-sys` against the STABLE C API only — the stable C loadable mechanism
+routes every `duckdb_*` call through a function-pointer table, so the cdylib
+normally has NO undefined DuckDB symbols. The advanced tier adds a C++ TU set
+that references DuckDB INTERNAL C++ symbols (`DBConfig`, `ParserExtension`,
+`OptimizerExtension`, `Parser`, `Planner`, `TableFunction`, ...). Those are left
+UNDEFINED in the shim and resolved at LOAD time against the host DuckDB process,
+which exports them (a standard DuckDB C++ extension links the same way).
+
+Concretely (`build.rs`, gated on `CARGO_FEATURE_DUCKDB_API`, never for wasm):
+
+- HEADERS, version-locked. The internal headers come from the EXACT
+  `libduckdb-sys` crate this build already depends on (pinned `1.10504.0` =
+  DuckDB v1.5.4). In the `bundled` build `libduckdb-sys` publishes its extracted
+  source via `DEP_DUCKDB_INCLUDE`; in the loadable (wrapper-only) build it does
+  not, so `build.rs` extracts the crate's bundled `duckdb.tar.gz` into `OUT_DIR`.
+  The header version therefore moves in lock-step with the `duckdb` /
+  `libduckdb-sys` crate version — there is no separate string to maintain.
+- INCLUDE DIRS. `build.rs` reads the source's `manifest.json` `base.include_dirs`
+  (the exact set DuckDB compiles itself with: `src/include` + the `third_party/*`
+  dirs) and feeds them to the `cc` build, with `-DDUCKDB_BUILD_LIBRARY`, C++17.
+- LINK. The shim object is linked into the crate as a static archive. For the
+  cdylib only (`cargo:rustc-cdylib-link-arg`), `build.rs` adds
+  `-undefined dynamic_lookup` (macOS) / `--allow-shlib-undefined` (ELF) so the
+  internal C++ symbols defer to load time. The bundled test executable is
+  unaffected (its symbols are linked in).
+- New deps: `[build-dependencies] cc`, and `serde_json` (parse the optimizer
+  plan JSON into node tuples).
+
+## Build-model verdict: FEASIBLE (proven)
+
+The model was validated mechanically and end-to-end:
+- A C++ TU including `duckdb.hpp` + internal headers and referencing
+  `DBConfig::GetConfig` COMPILES against the v1.5.4 headers, exports its own
+  symbol, and leaves `duckdb::DBConfig::GetConfig(DatabaseInstance&)` undefined.
+- It LINKS into the cdylib with `-undefined dynamic_lookup`.
+- The packaged `.duckdb_extension` LOADS into a real DuckDB v1.5.4 CLI (which
+  exports the ~23k internal symbols) and the probe resolves `DBConfig::GetConfig`
+  at load (`ducklink_advanced_probe` returns `maximum_threads`).
+
+## Proof (real DuckDB v1.5.4 CLI, `LOAD` + SQL)
+
+All three tiers are exercised by `test/advanced/smoke.sh` (skips cleanly when a
+v1.5.4 CLI / the artifact / the component corpus are absent; `STRICT=1` to fail
+instead). Proven outputs:
+
+1. PARSER — `LOAD ggsql; VISUALIZE SELECT 'apple' AS label, 3 AS n UNION ALL
+   SELECT 'pear', 1` -> `(apple,3,###) (pear,1,#)`.
+2. OPTIMIZER — `LOAD qopt; SELECT x FROM optme` -> `99`.
+3. TABLE-FN FILTER PUSHDOWN — `LOAD numstream; SELECT v FROM numstream(10)
+   WHERE v > 5` -> `6,7,8,9` (the pushed filter is delivered to
+   `call-table-open-filtered` and the component prunes at the source).
+
+The corpus `qopt.wasm` / `numstream.wasm` were rebuilt against the frozen
+`@4.0.0` WIT (the shipped artifacts were stale at `@3.0.0`); `ggsql.wasm` was
+already `@4.0.0`.
+
+### Implementation map
+
+| tier | C++ shim | Rust bridge / engine |
+| --- | --- | --- |
+| build-model probe | `cpp/ducklink_advanced.cpp` | `ducklink_advanced_probe` call in `src/lib.rs` |
+| parser | `cpp/ducklink_parser.cpp` | `advanced::ducklink_parser_try_rewrite` -> `Engine2::dispatch_parse` |
+| optimizer | `cpp/ducklink_optimizer.cpp` | `advanced::ducklink_optimizer_try_rewrite` -> `Engine2::dispatch_optimize` |
+| table filter pushdown | `cpp/ducklink_table_stream.cpp` | `advanced::ducklink_ts_{open,fill,close}` -> `Engine2::dispatch_table_*` |
+
+C ABI between the two sides: `cpp/ducklink_advanced.h`.

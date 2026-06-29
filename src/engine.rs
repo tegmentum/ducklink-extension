@@ -298,7 +298,7 @@ impl Engine2 {
         projection: Vec<u32>,
         filters: Vec<(u32, u8, Vec<reg::DuckValue>)>,
     ) -> Result<u32> {
-        use ducklink_runtime::extension::{FilterOp, TableFilter};
+        use ducklink_runtime::extension::TableFilter;
         let instance = self
             .instances
             .get_mut(extension)
@@ -315,7 +315,6 @@ impl Engine2 {
                 })
             })
             .collect();
-        let _ = FilterOp::Eq; // anchor the import even if no filters are present
         let result = instance
             .table_open_filtered(handle, &wit_args, &projection, &wit_filters)
             .map_err(|e| anyhow!("table-stream open failed: {e:?}"))?;
