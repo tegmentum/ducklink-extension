@@ -18,7 +18,10 @@ name = "ducklink"
 [features]
 # The community-extensions CI runs a plain `cargo build --release` (no
 # --features), so the loadable .duckdb_extension build must be the default.
-default = ["loadable"]
+# `advanced` ships the internal-C++-ABI tier (the `LOAD WASM` statement);
+# it auto-compiles out on Windows (build.rs) and community-extensions
+# rebuilds per DuckDB version, so the exact-version gate self-aligns.
+default = ["loadable", "advanced"]
 # Code that talks to the duckdb crate: the Direction-2 registration + dispatch
 # bridge (reg_duckdb.rs).
 duckdb-api = ["dep:duckdb", "duckdb/vscalar"]
