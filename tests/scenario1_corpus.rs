@@ -279,7 +279,7 @@ fn run_inner(case: &Case) -> Result<Option<String>, String> {
     }];
 
     let outcome = (|| -> Result<Option<String>, String> {
-        register_components(&con, Some(raw_con), engine, &specs)
+        register_components(&con, Some(raw_con), None, engine, &specs)
             .map_err(|e| format!("register: {e}"))?;
 
         let sql = fs::read_to_string(&case.smoke_sql).map_err(|e| e.to_string())?;

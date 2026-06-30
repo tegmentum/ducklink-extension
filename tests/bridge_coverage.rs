@@ -100,7 +100,7 @@ fn setup_with(names: &[&str]) -> (Db, usize) {
             path: artifact(n),
         })
         .collect();
-    let n = register_components(&db.con, Some(db.raw_con), engine, &specs)
+    let n = register_components(&db.con, Some(db.raw_con), None, engine, &specs)
         .expect("register components");
     (db, n)
 }
@@ -537,7 +537,7 @@ fn no_raw_connection_skips_aggregates_registers_rest() {
         name: "aggstat".to_string(),
         path: artifact("aggstat"),
     }];
-    let n_agg = register_components(&db.con, None, engine, &agg_only).expect("register aggstat");
+    let n_agg = register_components(&db.con, None, None, engine, &agg_only).expect("register aggstat");
     assert_eq!(
         n_agg, 0,
         "aggregate-only component registers nothing without a raw connection"
@@ -557,7 +557,7 @@ fn no_raw_connection_skips_aggregates_registers_rest() {
         name: "sample_extension".to_string(),
         path: artifact("sample_extension"),
     }];
-    let n_mixed = register_components(&db2.con, None, engine2, &mixed).expect("register sample");
+    let n_mixed = register_components(&db2.con, None, None, engine2, &mixed).expect("register sample");
     assert!(
         n_mixed >= 2,
         "scalar + table registered without raw_con, got {n_mixed}"
@@ -1003,7 +1003,7 @@ fn register_components_rejects_non_component_artifact() {
         name: "bad".to_string(),
         path: path.clone(),
     }];
-    let r = register_components(&db.con, Some(db.raw_con), engine, &specs);
+    let r = register_components(&db.con, Some(db.raw_con), None, engine, &specs);
     let _ = std::fs::remove_file(&path);
     assert!(r.is_err(), "garbage artifact must Err, not panic");
 }
@@ -1016,6 +1016,6 @@ fn register_components_missing_artifact_errs() {
         name: "ghost".to_string(),
         path: PathBuf::from("/no/such/ducklink/component.wasm"),
     }];
-    let r = register_components(&db.con, Some(db.raw_con), engine, &specs);
+    let r = register_components(&db.con, Some(db.raw_con), None, engine, &specs);
     assert!(r.is_err(), "missing artifact must Err");
 }
