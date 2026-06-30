@@ -57,6 +57,12 @@ struct CursorState {
     col_codes: Vec<u8>,
 }
 
+/// Sentinel prefix the parser bridge returns for a `LOAD WASM '<arg>'` statement.
+/// The C++ plan path strips this and calls `ducklink_load_wasm` with the live
+/// `context.db`. Kept in lock-step with `DUCKLINK_LOAD_WASM_SENTINEL` in
+/// cpp/ducklink_advanced.h.
+const LOAD_WASM_SENTINEL: &str = "\u{1}ducklink:load-wasm\u{1}";
+
 static ADVANCED: OnceLock<Advanced> = OnceLock::new();
 /// Bridge-local cursor id generator (0 is reserved for "open failed").
 static CURSOR_SEQ: AtomicU32 = AtomicU32::new(1);
@@ -616,16 +622,32 @@ pub unsafe extern "C" fn ducklink_parser_try_rewrite(sql: *const c_char) -> *mut
 }
 
 unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
-    let adv = match ADVANCED.get() {
-        Some(a) => a,
-        None => return std::ptr::null_mut(),
-    };
     if sql.is_null() {
         return std::ptr::null_mut();
     }
     let query = match CStr::from_ptr(sql).to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return std::ptr::null_mut(),
+    };
+
+    // `LOAD WASM '<name-or-path>'` — the advanced-tier statement that loads a
+    // component AT RUNTIME from SQL, the native analogue of the host's
+    // execute-level `LOAD WASM`. DuckDB's built-in parser rejects it (the `WASM`
+    // keyword is ours), so it reaches this ParserExtension. We return a SENTINEL
+    // rewrite (`LOAD_WASM_SENTINEL` + the argument); the C++ plan path recognizes
+    // it and calls `ducklink_load_wasm` with the parser's LIVE `context.db`,
+    // which loads the component and registers its functions on the connection the
+    // statement is actually running on (so they resolve in the NEXT statement).
+    if let Some(arg) = parse_load_wasm(&query) {
+        let sentinel = format!("{LOAD_WASM_SENTINEL}{arg}");
+        return CString::new(sentinel)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+
+    let adv = match ADVANCED.get() {
+        Some(a) => a,
+        None => return std::ptr::null_mut(),
     };
     let handles = {
         let guard = adv.parsers.lock().expect("advanced parsers mutex poisoned");
@@ -650,6 +672,101 @@ unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
         }
     }
     std::ptr::null_mut()
+}
+
+/// `LOAD WASM` bridge — load a component into the LIVE database the parser is
+/// executing against and register its functions. Called from the C++ parser
+/// shim's plan path with the `duckdb_database` it wraps around the parser's
+/// `ClientContext` (`context.db`). `path` is the quoted argument (a filesystem
+/// path or a catalog name). On success writes a human-readable summary into
+/// `*out_summary` (malloc'd, free via [`ducklink_adv_free`]) and returns 0; on
+/// error writes the message into `*out_summary` and returns non-zero.
+///
+/// # Safety
+/// `db` must be the valid live `duckdb_database`; `path` a valid C string;
+/// `out_summary` a valid pointer to write one `*mut c_char` into.
+#[no_mangle]
+pub unsafe extern "C" fn ducklink_load_wasm(
+    db: *mut c_void,
+    path: *const c_char,
+    out_summary: *mut *mut c_char,
+) -> i32 {
+    guard(2, || unsafe { ducklink_load_wasm_impl(db, path, out_summary) })
+}
+
+unsafe fn ducklink_load_wasm_impl(
+    db: *mut c_void,
+    path: *const c_char,
+    out_summary: *mut *mut c_char,
+) -> i32 {
+    if path.is_null() || out_summary.is_null() {
+        return 2;
+    }
+    let arg = match CStr::from_ptr(path).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            *out_summary = CString::new("LOAD WASM: argument is not valid UTF-8")
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+    };
+    match crate::reg_duckdb::load_wasm_into_db(db.cast(), arg) {
+        Ok((name, scalars, tables, aggregates)) => {
+            let msg = format!(
+                "loaded '{name}': {scalars} scalar(s), {tables} table(s), {aggregates} aggregate(s)"
+            );
+            *out_summary = CString::new(msg)
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            0
+        }
+        Err(err) => {
+            *out_summary = CString::new(format!("LOAD WASM failed: {err}"))
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            1
+        }
+    }
+}
+
+/// Recognize `LOAD WASM '<name-or-path>'` (case-insensitive on the keywords,
+/// optional trailing `;`/whitespace) and return the quoted argument. Total and
+/// allocation-light: any statement that is not exactly this shape returns
+/// `None`, so a normal `LOAD <ext>` or any other rejected statement falls
+/// through to the component parser path unchanged.
+fn parse_load_wasm(sql: &str) -> Option<String> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    // Split off the leading `LOAD` keyword (case-insensitive).
+    let rest = s.strip_prefix("LOAD").or_else(|| s.strip_prefix("load")).or_else(|| {
+        // Mixed case: compare the first 4 chars case-insensitively.
+        if s.len() >= 4 && s[..4].eq_ignore_ascii_case("LOAD") {
+            Some(&s[4..])
+        } else {
+            None
+        }
+    })?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    // Next token must be the `WASM` keyword (case-insensitive), then whitespace.
+    if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case("WASM") {
+        return None;
+    }
+    let after = &rest[4..];
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let arg = after.trim();
+    // The argument must be a single-quoted string literal.
+    let inner = arg.strip_prefix('\'')?.strip_suffix('\'')?;
+    // Reject an embedded unescaped quote (would not be a single literal); the
+    // loader argument is a path or catalog name, neither of which needs quotes.
+    if inner.contains('\'') {
+        return None;
+    }
+    Some(inner.to_string())
 }
 
 /// Free a C string returned by the advanced-tier bridge functions.

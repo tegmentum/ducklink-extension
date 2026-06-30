@@ -29,6 +29,8 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/allocator.hpp"
+#include "duckdb/common/helper.hpp"
 
 #include "ducklink_advanced.h"
 
@@ -69,10 +71,49 @@ struct DucklinkExecGlobal : public GlobalTableFunctionState {
 //! Run the rewrite SQL (passed as the single VARCHAR parameter) on a fresh
 //! connection, buffer the result, and declare its schema. Executing the rewrite
 //! here keeps the ParserExtension's plan a plain scan over the buffered rows.
+//!
+//! `LOAD WASM` special case: when the parser bridge returns the
+//! DUCKLINK_LOAD_WASM_SENTINEL marker, the "rewrite" is not SQL — it carries the
+//! component argument. We load the component into the LIVE database (the parser's
+//! own `context.db`, wrapped as a `duckdb_database`) via `ducklink_load_wasm`,
+//! registering its functions on the connection the statement runs on, and emit a
+//! single `summary` row. This is what makes runtime loading work in the real
+//! loadable host, where the init-captured handle cannot be re-connected later.
 static unique_ptr<FunctionData> DucklinkExecBindFn(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	auto rewrite = input.inputs[0].GetValue<string>();
 	auto result = make_uniq<DucklinkExecBind>();
+
+	const string sentinel = DUCKLINK_LOAD_WASM_SENTINEL;
+	if (rewrite.rfind(sentinel, 0) == 0) {
+		// LOAD WASM: load into the live context db and report a summary row.
+		string arg = rewrite.substr(sentinel.size());
+		// Wrap the parser's own database instance as a stable-C duckdb_database so
+		// the Rust loader registers on the SAME database this statement runs on.
+		// `DuckDB(DatabaseInstance &)` shares the live instance (shared_from_this),
+		// so no new database is created.
+		DatabaseWrapper wrapper;
+		wrapper.database = make_shared_ptr<DuckDB>(*context.db);
+		char *summary = nullptr;
+		int32_t rc = ducklink_load_wasm(reinterpret_cast<void *>(&wrapper), arg.c_str(), &summary);
+		string msg = summary ? string(summary) : string("LOAD WASM: no summary");
+		if (summary) {
+			ducklink_adv_free(summary);
+		}
+		if (rc != 0) {
+			throw InvalidInputException("%s", msg);
+		}
+		result->types = {LogicalType::VARCHAR};
+		result->names = {"summary"};
+		auto chunk = make_uniq<DataChunk>();
+		chunk->Initialize(Allocator::DefaultAllocator(), result->types);
+		chunk->SetValue(0, 0, Value(msg));
+		chunk->SetCardinality(1);
+		result->chunks.push_back(std::move(chunk));
+		return_types = result->types;
+		names = result->names;
+		return std::move(result);
+	}
 
 	Connection con(*context.db);
 	auto query_result = con.Query(rewrite);

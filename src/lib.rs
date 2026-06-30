@@ -16,6 +16,13 @@
 
 pub mod engine;
 
+/// Catalog resolution + name->blob fetch/cache/verify for `ducklink_load(<name>)`
+/// by catalog NAME. Live HTTPS fetch with a bundled-snapshot fallback; downloaded
+/// blobs are sha256-verified against the catalog `content_digest` before caching.
+/// Independent of the DuckDB toolchain (reqwest + serde only).
+#[cfg(feature = "duckdb-api")]
+pub mod catalog;
+
 /// The Direction-2 DuckDB sink (registration + dispatch). Present whenever the
 /// duckdb crate is available (the `loadable` and `bundled` features both enable
 /// it); the `bundled` end-to-end test lives in this module.
@@ -48,7 +55,7 @@ mod loadable {
     use duckdb::Connection;
 
     use crate::engine::Engine2;
-    use crate::reg_duckdb::{component_specs_from_env, register_components};
+    use crate::reg_duckdb::{component_specs_from_env, register_components, register_load_function};
 
     // The advanced-tier C++ shim, compiled against DuckDB's internal headers and
     // linked into this extension (see build.rs). Internal C++ symbols it
@@ -60,6 +67,11 @@ mod loadable {
     #[cfg(advanced_tier)]
     extern "C" {
         fn ducklink_advanced_probe(db: *mut std::ffi::c_void) -> i32;
+        /// Install the component-driven ParserExtension on `db` (idempotent).
+        /// Registered unconditionally when the advanced tier is active so the
+        /// `LOAD WASM '<name>'` statement is recognized even before any
+        /// component declares a parser of its own.
+        fn ducklink_register_parser(db: *mut std::ffi::c_void) -> i32;
     }
 
     /// The EXACT DuckDB version this extension's advanced-tier C++ shim was
@@ -221,6 +233,14 @@ mod loadable {
                 "[ducklink] advanced tier ENABLED (host DuckDB {DUCKDB_ABI_VERSION}); \
                  C++ shim probe maximum_threads={probe}"
             );
+            // Install the component-driven ParserExtension now (idempotent), so
+            // `LOAD WASM '<name>'` is recognized from the first statement — it
+            // routes through the parser bridge to the `ducklink_load` loader,
+            // independent of whether any component has declared a parser yet.
+            let prc = ducklink_register_parser(db.cast());
+            if prc != 0 {
+                eprintln!("[ducklink] failed to install LOAD WASM parser extension (rc={prc})");
+            }
         } else {
             let host = host_version.as_deref().unwrap_or("unknown");
             let reason = if forced_off {
@@ -264,7 +284,38 @@ mod loadable {
         // even before any component is configured.
         con.register_scalar_function::<DucklinkVersion>("ducklink_version")
             .map_err(stringify)?;
+        // Populate `duckdb_functions().comment` so introspection (and the
+        // community-extensions site's "Added Functions" table) shows a real
+        // description instead of NULL. ducklink is a transparent host:
+        // `ducklink_version` is the only statically-registered function; every
+        // other capability is provided by WebAssembly component extensions
+        // loaded at runtime. The `description` column is C++-only and not
+        // reachable through the stable C API, so `comment` carries this text.
+        // Non-fatal: a failed COMMENT must never break `LOAD ducklink`.
+        if let Err(e) = con.execute(
+            "COMMENT ON FUNCTION ducklink_version IS \
+             'Returns the ducklink extension version. ducklink is a transparent \
+              host for WebAssembly component extensions: this is the only \
+              built-in function — all other functionality is provided by \
+              WebAssembly modules loaded at runtime (via the DUCKLINK_COMPONENTS \
+              environment variable or LOAD).'",
+            [],
+        ) {
+            eprintln!("[ducklink] could not set ducklink_version comment: {e}");
+        }
         let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
+
+        // Register `ducklink_load(path)`: the in-SQL analogue of DuckDB's `LOAD`,
+        // which loads a component at RUNTIME (from a SQL statement) and registers
+        // its functions on the live database for use in later statements. It
+        // captures the process-wide `db` handle + shared `engine` so its static
+        // table-function bind can re-open a sibling connection to register. Shares
+        // the SAME `engine` as the env-driven components below. Non-fatal: a
+        // failure here must not break `LOAD ducklink`.
+        if let Err(e) = register_load_function(&con, db, engine.clone()) {
+            eprintln!("[ducklink] could not register ducklink_load: {e}");
+        }
+
         let specs = component_specs_from_env();
         // Only hand the raw `db` to the registrar when the advanced tier is
         // enabled; with `None`, `register_components` skips ALL internal-ABI C++

@@ -70,6 +70,19 @@ char *ducklink_optimizer_try_rewrite(const char *plan_json, const char *query);
 // Free a C string returned by the `_try_rewrite` bridges / ducklink_ts_*.
 void ducklink_adv_free(char *ptr);
 
+// Sentinel prefix `ducklink_parser_try_rewrite` returns for a `LOAD WASM '<arg>'`
+// statement (the rest of the string is the argument). The parser plan path
+// recognizes it and calls `ducklink_load_wasm` with the live context db, rather
+// than executing the returned string as SQL. Lock-step with LOAD_WASM_SENTINEL
+// in src/advanced.rs.
+#define DUCKLINK_LOAD_WASM_SENTINEL "\001ducklink:load-wasm\001"
+
+// LOAD WASM: load the component named/at `path` into the live database `db`
+// (a duckdb_database wrapping the parser's ClientContext) and register its
+// functions. On success writes a malloc'd summary into *out_summary (free via
+// ducklink_adv_free) and returns 0; on error writes the message and returns != 0.
+int32_t ducklink_load_wasm(void *db, const char *path, char **out_summary);
+
 //===----------------------------------------------------------------------===//
 // table-stream bridge (filter pushdown) — mirrors wasm_table_stream_bridge.h
 //===----------------------------------------------------------------------===//

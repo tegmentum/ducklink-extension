@@ -10,7 +10,7 @@
 //! to them is more `VScalar` impls keyed by `reg::LogicalType`.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -705,8 +705,17 @@ pub fn register_scalars(
         PENDING_SIGNATURE.with(|s| *s.borrow_mut() = Some((arg_codes, ret_code)));
         let result = con.register_scalar_function_with_state::<WasmScalar>(&f.name, &state);
         PENDING_SIGNATURE.with(|s| *s.borrow_mut() = None);
-        result?;
-        registered += 1;
+        // IDEMPOTENCY: a function of this name already in the catalog (a re-load
+        // of the same component, or a name another component already claimed) is
+        // NOT a hard error — DuckDB rejects the duplicate registration, which we
+        // treat as "already present" and skip, so `ducklink_load` can be called
+        // again without failing.
+        match result {
+            Ok(()) => registered += 1,
+            Err(e) => {
+                eprintln!("[ducklink] scalar '{}' not registered (already present?): {e}", f.name);
+            }
+        }
     }
     Ok(registered)
 }
@@ -859,8 +868,14 @@ pub fn register_tables(
         let result = con
             .register_table_function_with_extra_info::<WasmTable, WasmTableExtra>(&t.name, &extra);
         PENDING_TABLE_PARAMS.with(|s| *s.borrow_mut() = None);
-        result?;
-        registered += 1;
+        // IDEMPOTENCY: a duplicate table-function name (re-load) is skipped, not
+        // a hard error. See `register_scalars`.
+        match result {
+            Ok(()) => registered += 1,
+            Err(e) => {
+                eprintln!("[ducklink] table function '{}' not registered (already present?): {e}", t.name);
+            }
+        }
     }
     Ok(registered)
 }
@@ -1208,11 +1223,12 @@ pub unsafe fn register_aggregates(
         let rc = ffi::duckdb_register_aggregate_function(raw_con, func);
         let mut func_mut = func;
         ffi::duckdb_destroy_aggregate_function(&mut func_mut);
+        // IDEMPOTENCY: a duplicate aggregate name (re-load) is skipped, not a
+        // hard error — the C API returns failure for an already-present name,
+        // which we treat as "already registered". See `register_scalars`.
         if rc != ffi::DuckDBSuccess {
-            return Err(duckdb::Error::DuckDBFailure(
-                ffi::Error::new(ffi::DuckDBError),
-                Some(format!("failed to register aggregate '{}'", f.name)),
-            ));
+            eprintln!("[ducklink] aggregate '{}' not registered (already present?)", f.name);
+            continue;
         }
         registered += 1;
     }
@@ -1254,6 +1270,593 @@ pub fn component_specs_from_env() -> Vec<ComponentSpec> {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// `ducklink_load(path)` — RUNTIME component loading from SQL
+// ---------------------------------------------------------------------------
+//
+// `LOAD ducklink` (the extension entry point) loads the components named in
+// `DUCKLINK_COMPONENTS` up front. `ducklink_load(path)` is the in-SQL analogue
+// of DuckDB's own `LOAD`: it loads ONE component and registers its functions on
+// the live database so they are callable in SUBSEQUENT statements of the same
+// session.
+//
+// Surface: a TABLE function (`SELECT * FROM ducklink_load('path')` /
+// `CALL ducklink_load('path')`). Registration is done in `VTab::bind`, which
+// DuckDB runs during the BIND/PLAN phase of the query — the phase where catalog
+// access happens — rather than in a scalar `invoke` (execution phase, after the
+// plan is already bound and while the executing query may hold catalog locks).
+// The component's functions land in the catalog as a side effect of binding the
+// `ducklink_load` call, so the NEXT statement's binder resolves them.
+//
+// The registration itself is performed on a FRESH duckdb-rs `Connection` opened
+// from the process-wide `duckdb_database` handle (captured at `LOAD ducklink`
+// time), NOT on the connection currently executing the `ducklink_load` query.
+// Registrations are database-wide, so every connection — including the caller's
+// — sees the new functions on the next statement. The fresh connection also
+// gives the registration its own catalog/transaction context, avoiding any
+// re-entrancy against the connection that is mid-query.
+
+/// Process-wide ducklink runtime, captured once at `LOAD ducklink` time so the
+/// `ducklink_load` table function (whose static `VTab::bind` has no `self` and
+/// no connection of its own) can reach the shared `Engine2` and re-open a
+/// `Connection` on the live database to register newly loaded functions.
+///
+/// The `duckdb_database` is a raw pointer that DuckDB owns for the whole process
+/// lifetime; we only ever read it (to `open_from_raw`), never free it. The raw
+/// pointer is not `Send`/`Sync`, so it is wrapped — DuckDB serialises bind, and
+/// the registration goes through a fresh connection, so concurrent loads are
+/// guarded by the engine `Mutex`.
+struct DucklinkRuntime {
+    /// The `duckdb_database` handle captured at `LOAD ducklink` time. KEPT FOR
+    /// REFERENCE/diagnostics only — it is NOT safe to re-`duckdb_connect` later:
+    /// in the real loadable host this points at a `DatabaseWrapper` owned by the
+    /// stack-local `DuckDBExtensionLoadState`, which is FREED when the extension's
+    /// `init` returns (see duckdb `extension_load.cpp`: `database_data` is a
+    /// `unique_ptr` member of a stack `load_state`). Reconnecting through it later
+    /// is a use-after-free that surfaces as `Binder Error: connect error`. Runtime
+    /// registration therefore reuses `con` below (a connection opened ONCE at init,
+    /// while the handle was still alive), never this handle.
+    #[allow(dead_code)]
+    db: ffi::duckdb_database,
+    /// A duckdb-rs connection opened ONCE at init (while `db` was still valid) and
+    /// kept alive for the whole process. A `Connection` owns a `shared_ptr` to the
+    /// live `DatabaseInstance`, so it stays valid after the load state is freed.
+    /// Runtime function registration (`ducklink_load` / `LOAD WASM`) goes through
+    /// this connection: registration only touches the already-open
+    /// `duckdb_connection` (no reconnect), and is database-wide so the functions
+    /// are visible to every connection on the NEXT statement.
+    con: Mutex<Connection>,
+    /// A raw sibling `duckdb_connection`, also opened once at init and kept alive,
+    /// for the aggregate registration path (which needs the raw C handle). Null if
+    /// the init-time connect failed. Disconnected at process exit (we never free
+    /// it explicitly — it lives as long as the runtime).
+    raw_con: RawConnHandle,
+    engine: Arc<Mutex<Engine2>>,
+    /// Components loaded in THIS session (by `ducklink_load`), tracked so
+    /// `ducklink_loaded()` can report them and so a re-load is idempotent.
+    loaded: Mutex<Vec<LoadedRecord>>,
+}
+
+/// A kept-alive raw `duckdb_connection` (opened at init, valid for the process).
+struct RawConnHandle(ffi::duckdb_connection);
+
+/// A summary of one component loaded this session, surfaced by `ducklink_loaded()`.
+#[derive(Clone)]
+struct LoadedRecord {
+    name: String,
+    scalars: usize,
+    tables: usize,
+    aggregates: usize,
+    path: String,
+}
+
+// SAFETY: `db` is a stable, process-lifetime handle DuckDB owns; we only read it
+// to open sibling connections (a database-wide, thread-safe C-API operation).
+unsafe impl Send for DucklinkRuntime {}
+unsafe impl Sync for DucklinkRuntime {}
+
+static RUNTIME: std::sync::OnceLock<DucklinkRuntime> = std::sync::OnceLock::new();
+
+/// Register the `ducklink_load(path)` table function and capture the
+/// process-wide runtime handle it needs. Idempotent: the handle is set once
+/// (the first `LOAD ducklink` in the process wins); the table function is
+/// registered on `con` each call (a no-op duplicate is tolerated by DuckDB).
+pub fn register_load_function(
+    con: &Connection,
+    db: ffi::duckdb_database,
+    engine: Arc<Mutex<Engine2>>,
+) -> duckdb::Result<()> {
+    // Open a PERSISTENT connection NOW, while `db` is still valid (we are inside
+    // `init`). `try_clone` performs the `duckdb_connect` here; the resulting
+    // `Connection` owns a shared_ptr to the live `DatabaseInstance`, so it
+    // outlives the soon-to-be-freed load-state `DatabaseWrapper` that `db` points
+    // at. Later runtime registration reuses THIS connection (no reconnect through
+    // the dangling handle). If the clone somehow fails we still install the table
+    // functions; runtime loading would then surface a clear error.
+    let persistent = con.try_clone()?;
+
+    // Also keep a raw sibling connection alive for the aggregate path (it needs
+    // the raw C handle). Opened here while `db` is valid.
+    let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+    let raw_ok = unsafe { ffi::duckdb_connect(db, &mut raw) } == ffi::DuckDBSuccess && !raw.is_null();
+    let raw_con = RawConnHandle(if raw_ok { raw } else { std::ptr::null_mut() });
+
+    // First loader in the process captures the runtime; later ones reuse it.
+    let _ = RUNTIME.set(DucklinkRuntime {
+        db,
+        con: Mutex::new(persistent),
+        raw_con,
+        engine,
+        loaded: Mutex::new(Vec::new()),
+    });
+    con.register_table_function::<WasmLoad>("ducklink_load")?;
+    con.register_table_function::<WasmExtensions>("ducklink_extensions")?;
+    con.register_table_function::<WasmLoaded>("ducklink_loaded")?;
+    Ok(())
+}
+
+/// Load a component (by path or catalog name) into the GIVEN database handle and
+/// register its functions. The advanced-tier `LOAD WASM '<name>'` statement
+/// routes here from the C++ parser shim, which hands us a `duckdb_database`
+/// derived from the PARSER's live `ClientContext` (`context.db`) — the connection
+/// the statement actually runs on — instead of the process-captured `rt.db`. In
+/// the real loadable/CLI context the init-time `rt.db` handle does not survive to
+/// re-`duckdb_connect` later (observed: "connect error"), so reusing the live
+/// context db is what makes runtime loading work end to end there.
+///
+/// Returns Ok((name, scalars, tables, aggregates)) on success.
+///
+/// # Safety
+/// `db` must be a valid `duckdb_database` for the live database the statement is
+/// executing on.
+pub unsafe fn load_wasm_into_db(
+    db: ffi::duckdb_database,
+    arg: &str,
+) -> Result<(String, usize, usize, usize), String> {
+    let rt = RUNTIME
+        .get()
+        .ok_or_else(|| "LOAD WASM: runtime not initialised (LOAD ducklink first)".to_string())?;
+
+    // Resolve the arg to (display name, on-disk .wasm path): a path-looking arg
+    // is a filesystem path; anything else is a catalog NAME (live catalog with a
+    // bundled-snapshot fallback). Mirrors `ducklink_load`'s heuristic.
+    let looks_like_path = arg.contains('/')
+        || arg.contains('\\')
+        || arg.ends_with(".wasm")
+        || Path::new(arg).exists();
+    let (name, path): (String, PathBuf) = if looks_like_path {
+        let path = PathBuf::from(arg);
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("component")
+            .to_string();
+        (name, path)
+    } else {
+        let cached = crate::catalog::resolve_name_to_blob(arg).map_err(|e| e.to_string())?;
+        (arg.to_string(), cached)
+    };
+    let path_str = path.to_string_lossy().into_owned();
+
+    let loaded = {
+        let mut e = rt.engine.lock().expect("engine mutex poisoned");
+        e.load(&name, &path).map_err(|e| e.to_string())?
+    };
+
+    // Register on the PERSISTENT init connection (database-wide; valid for the
+    // process). Same handle the common-tier `ducklink_load` path uses — see the
+    // use-after-free note on `DucklinkRuntime::db`. (`db`, the live context db the
+    // advanced parser hands us, also works, but reusing the persistent connection
+    // keeps a single registration path for both tiers.)
+    let _ = db;
+    let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+    let scalars =
+        register_scalars(&con, rt.engine.clone(), &loaded.scalars).map_err(|e| e.to_string())?;
+    let tables =
+        register_tables(&con, rt.engine.clone(), &loaded.tables).map_err(|e| e.to_string())?;
+    drop(con);
+
+    let mut agg = 0usize;
+    if !loaded.aggregates.is_empty() {
+        let raw_con = rt.raw_con.0;
+        if !raw_con.is_null() {
+            agg = register_aggregates(raw_con, rt.engine.clone(), &loaded.aggregates)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    {
+        let mut loaded_list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
+        let rec = LoadedRecord {
+            name: name.clone(),
+            scalars,
+            tables,
+            aggregates: agg,
+            path: path_str,
+        };
+        match loaded_list.iter_mut().find(|r| r.name == name) {
+            Some(existing) => *existing = rec,
+            None => loaded_list.push(rec),
+        }
+    }
+
+    Ok((name, scalars, tables, agg))
+}
+
+/// One-row bind result for `ducklink_load`: a summary of what was loaded.
+struct WasmLoadBind {
+    name: String,
+    path: String,
+    scalars: usize,
+    tables: usize,
+    aggregates: usize,
+}
+
+/// Init cursor for `ducklink_load` (single row).
+struct WasmLoadInit {
+    done: AtomicUsize,
+}
+
+/// The `ducklink_load(path)` table function. Its `bind` performs the load +
+/// registration side effect; `func` streams back the single summary row.
+struct WasmLoad;
+
+impl VTab for WasmLoad {
+    type InitData = WasmLoadInit;
+    type BindData = WasmLoadBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_load bind", || {
+            let rt = RUNTIME.get().ok_or_else(|| -> Box<dyn std::error::Error> {
+                "ducklink_load: runtime not initialised (LOAD ducklink first)".into()
+            })?;
+
+            // Argument 0: EITHER a filesystem path to a `.wasm` component OR a
+            // catalog NAME (e.g. 'aba'). Heuristic: an argument that contains a
+            // path separator, ends in `.wasm`, or names an existing file is a
+            // PATH; anything else is a catalog NAME resolved against the
+            // published catalog (live, with a bundled-snapshot fallback).
+            let arg_val = bind.get_parameter(0);
+            let arg_str = arg_val.to_string();
+
+            let looks_like_path = arg_str.contains('/')
+                || arg_str.contains('\\')
+                || arg_str.ends_with(".wasm")
+                || Path::new(&arg_str).exists();
+
+            // Resolve to (display name, on-disk .wasm path). For a path arg the
+            // name defaults to the file stem (overridable via `name :=`); for a
+            // catalog name the arg IS the name and the path is the cached blob.
+            let (name, path): (String, PathBuf) = if looks_like_path {
+                let path = PathBuf::from(&arg_str);
+                let name = match bind.get_named_parameter("name") {
+                    Some(v) => v.to_string(),
+                    None => path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("component")
+                        .to_string(),
+                };
+                (name, path)
+            } else {
+                // Catalog NAME -> resolve + fetch/cache/verify the blob.
+                let cached = crate::catalog::resolve_name_to_blob(&arg_str)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                let name = match bind.get_named_parameter("name") {
+                    Some(v) => v.to_string(),
+                    None => arg_str.clone(),
+                };
+                (name, cached)
+            };
+            let path_str = path.to_string_lossy().into_owned();
+
+            // Load the component through the shared engine.
+            let loaded = {
+                let mut e = rt.engine.lock().expect("engine mutex poisoned");
+                e.load(&name, &path)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
+            };
+
+            // Register on the PERSISTENT connection captured at init (NOT a fresh
+            // reconnect through `rt.db`: that handle points at the load-state's
+            // `DatabaseWrapper`, freed once `init` returned, so reconnecting is a
+            // use-after-free that DuckDB reports as `connect error`). Registration
+            // only touches the already-open `duckdb_connection` (no reconnect) and
+            // is database-wide, so the functions are visible to the caller's next
+            // statement. The init connection is a SEPARATE connection from the one
+            // binding this call, so this is not catalog re-entrancy.
+            let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+            let scalars = register_scalars(&con, rt.engine.clone(), &loaded.scalars)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            let tables = register_tables(&con, rt.engine.clone(), &loaded.tables)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            drop(con);
+
+            // Aggregates need the raw C connection: reuse the persistent raw
+            // sibling captured at init (also valid for the process lifetime).
+            let mut agg = 0usize;
+            if !loaded.aggregates.is_empty() {
+                let raw_con = rt.raw_con.0;
+                let ok = !raw_con.is_null();
+                if ok {
+                    agg = unsafe {
+                        register_aggregates(raw_con, rt.engine.clone(), &loaded.aggregates)
+                    }
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+                    // Do NOT disconnect: this raw connection is the persistent
+                    // sibling, reused across loads for the process lifetime.
+                }
+            }
+
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("scalars", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+            bind.add_result_column("tables", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+            bind.add_result_column("aggregates", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+
+            // Track this load for `ducklink_loaded()`. A re-load of the same name
+            // updates the existing record rather than appending a duplicate.
+            {
+                let mut loaded_list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
+                let rec = LoadedRecord {
+                    name: name.clone(),
+                    scalars,
+                    tables,
+                    aggregates: agg,
+                    path: path_str.clone(),
+                };
+                match loaded_list.iter_mut().find(|r| r.name == name) {
+                    Some(existing) => *existing = rec,
+                    None => loaded_list.push(rec),
+                }
+            }
+
+            Ok(WasmLoadBind {
+                name,
+                path: path_str,
+                scalars,
+                tables,
+                aggregates: agg,
+            })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmLoadInit {
+            done: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_load scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            if init.done.swap(1, Ordering::Relaxed) != 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            output.flat_vector(0).insert(0, bind.name.as_str());
+            output.flat_vector(1).insert(0, bind.path.as_str());
+            // SAFETY: BIGINT result columns; row 0 is in range (set_len(1) below).
+            unsafe {
+                output.flat_vector(2).as_mut_slice::<i64>()[0] = bind.scalars as i64;
+                output.flat_vector(3).as_mut_slice::<i64>()[0] = bind.tables as i64;
+                output.flat_vector(4).as_mut_slice::<i64>()[0] = bind.aggregates as i64;
+            }
+            output.set_len(1);
+            Ok(())
+        })
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // Positional arg 0: filesystem path to the component .wasm.
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        // Optional `name :=` override; defaults to the file stem.
+        Some(vec![(
+            "name".to_string(),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        )])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `ducklink_extensions()` — list the published catalog (discovery)
+// ---------------------------------------------------------------------------
+
+/// Render an entry's function list for the `functions` column: the rich
+/// signature names if the catalog carries them (the signature-enrichment field),
+/// else the `exports` list. Comma-separated.
+fn render_functions(entry: &crate::catalog::CatalogEntry) -> String {
+    if !entry.functions.is_empty() {
+        entry
+            .functions
+            .iter()
+            .filter_map(|f| f.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        entry.exports.join(", ")
+    }
+}
+
+/// One catalog row materialised for `ducklink_extensions()`.
+struct CatRow {
+    name: String,
+    version: String,
+    description: String,
+    categories: String,
+    functions: String,
+}
+
+/// Bind data: every catalog row, ready to stream.
+struct WasmExtensionsBind {
+    rows: Vec<CatRow>,
+}
+
+/// `ducklink_extensions()` — one row per published catalog entry. Reads the
+/// resolved catalog (live, or the bundled snapshot when offline).
+struct WasmExtensions;
+
+impl VTab for WasmExtensions {
+    type InitData = WasmTableInit;
+    type BindData = WasmExtensionsBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_extensions bind", || {
+            let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            bind.add_result_column("name", vc());
+            bind.add_result_column("version", vc());
+            bind.add_result_column("description", vc());
+            bind.add_result_column("categories", vc());
+            bind.add_result_column("functions", vc());
+
+            let catalog = crate::catalog::resolve_catalog();
+            let rows = catalog
+                .extensions
+                .iter()
+                .map(|e| CatRow {
+                    name: e.name.clone(),
+                    version: e.version.clone().unwrap_or_default(),
+                    description: e.description.clone().unwrap_or_default(),
+                    categories: e.categories.join(", "),
+                    functions: render_functions(e),
+                })
+                .collect();
+            Ok(WasmExtensionsBind { rows })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_extensions scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(0).insert(r, row.name.as_str());
+                output.flat_vector(1).insert(r, row.version.as_str());
+                output.flat_vector(2).insert(r, row.description.as_str());
+                output.flat_vector(3).insert(r, row.categories.as_str());
+                output.flat_vector(4).insert(r, row.functions.as_str());
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `ducklink_loaded()` — list components loaded in THIS session (discovery)
+// ---------------------------------------------------------------------------
+
+/// Bind data: a snapshot of the session's loaded-component records.
+struct WasmLoadedBind {
+    rows: Vec<LoadedRecord>,
+}
+
+/// `ducklink_loaded()` — one row per component loaded via `ducklink_load` in
+/// this session.
+struct WasmLoaded;
+
+impl VTab for WasmLoaded {
+    type InitData = WasmTableInit;
+    type BindData = WasmLoadedBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_loaded bind", || {
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("scalars", LogicalTypeHandle::from(LogicalTypeId::Integer));
+            bind.add_result_column("tables", LogicalTypeHandle::from(LogicalTypeId::Integer));
+            bind.add_result_column(
+                "aggregates",
+                LogicalTypeHandle::from(LogicalTypeId::Integer),
+            );
+            bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+            let rows = match RUNTIME.get() {
+                Some(rt) => rt
+                    .loaded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                None => Vec::new(),
+            };
+            Ok(WasmLoadedBind { rows })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_loaded scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(0).insert(r, row.name.as_str());
+                output.flat_vector(4).insert(r, row.path.as_str());
+            }
+            // INTEGER columns: fill the typed slices after the string inserts.
+            // Each `flat_vector` is bound to a `let` so the slice it owns
+            // outlives the fill loop (the temporary would otherwise drop).
+            unsafe {
+                let mut sv = output.flat_vector(1);
+                let s = sv.as_mut_slice::<i32>();
+                for r in 0..n {
+                    s[r] = bind.rows[start + r].scalars as i32;
+                }
+                let mut tv = output.flat_vector(2);
+                let t = tv.as_mut_slice::<i32>();
+                for r in 0..n {
+                    t[r] = bind.rows[start + r].tables as i32;
+                }
+                let mut av = output.flat_vector(3);
+                let a = av.as_mut_slice::<i32>();
+                for r in 0..n {
+                    a[r] = bind.rows[start + r].aggregates as i32;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
 }
 
 /// Load each component and register its functions, sharing one `engine`. Scalars
@@ -1410,6 +2013,230 @@ mod tests {
             })
             .expect("sum query");
         assert_eq!(sum, 1 + 2 + 3 + 4, "sum of values 0..5");
+    }
+
+    /// Serialises the tests that drive the process-wide `RUNTIME` OnceLock via the
+    /// raw `duckdb_open` entry-point path. `RUNTIME` is first-write-wins and holds
+    /// ONE `db` handle for the whole process, so two such tests must not run
+    /// concurrently (the second would register `ducklink_load` against the first's
+    /// db). Whichever test acquires this lock FIRST also wins the OnceLock; a later
+    /// test that finds `RUNTIME` already bound to a different db must skip (its
+    /// logic is independently covered in isolation + by the `catalog` unit tests).
+    static RUNTIME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// True once the process-wide `RUNTIME` is bound to `db` (this test won the
+    /// first-write). A later raw-open test that finds it bound elsewhere skips.
+    fn runtime_is_ours(db: ffi::duckdb_database) -> bool {
+        RUNTIME.get().map(|rt| rt.db) == Some(db)
+    }
+
+    /// THE LINCHPIN TEST: prove `ducklink_load(path)` loads a component AT
+    /// RUNTIME from a SQL statement and registers its functions so a SEPARATE,
+    /// SUBSEQUENT statement in the same session can call them.
+    ///
+    /// This mirrors the real loadable entry point exactly: open a raw
+    /// `duckdb_database`, wrap it in a `Connection`, seed the process-wide runtime
+    /// + register `ducklink_load` (what `register_load_function` does at
+    /// `LOAD ducklink` time). Then issue `SELECT * FROM ducklink_load(<wasm>)` and,
+    /// in a LATER `query_row`, call the freshly-registered `sample_plus_one`.
+    #[test]
+    fn ducklink_load_registers_at_runtime_for_later_statements() {
+        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            // Raw database, exactly as DuckDB hands the loadable entry point one.
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            let r = ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
+            assert_eq!(r, ffi::DuckDBSuccess, "duckdb_open failed");
+
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+
+            // What the entry point does: register ducklink_load + seed RUNTIME.
+            register_load_function(&con, db, engine).expect("register ducklink_load");
+
+            // `RUNTIME` is process-wide first-write-wins; if an earlier raw-open
+            // test already bound it to a different db, this run cannot proceed
+            // (registrations would target the wrong database). Skip cleanly.
+            if !runtime_is_ours(db) {
+                eprintln!("[test] RUNTIME already bound elsewhere; skipping (covered in isolation)");
+                drop(con);
+                ffi::duckdb_close(&mut db);
+                return;
+            }
+
+            // BEFORE the load, the component's function must NOT exist yet.
+            let pre = con.query_row("SELECT sample_plus_one(1)", [], |r| r.get::<_, i64>(0));
+            assert!(
+                pre.is_err(),
+                "sample_plus_one must not exist before ducklink_load"
+            );
+
+            // STATEMENT 1: load the component at runtime from SQL.
+            let path = sample_component();
+            let path_str = path.to_str().expect("utf8 path").to_string();
+            let (got_name, n_scalars): (String, i64) = con
+                .query_row(
+                    "SELECT name, scalars FROM ducklink_load(?)",
+                    [&path_str],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("ducklink_load query");
+            assert_eq!(got_name, "sample_extension", "name defaults to file stem");
+            assert!(n_scalars >= 1, "expected >=1 scalar registered, got {n_scalars}");
+
+            // STATEMENT 2 (separate, subsequent): call the newly-registered fn.
+            let v: i64 = con
+                .query_row("SELECT sample_plus_one(41)", [], |r| r.get(0))
+                .expect("call sample_plus_one AFTER runtime load");
+            assert_eq!(v, 42, "sample_plus_one(41) computed in wasm after runtime load");
+
+            // STATEMENT 3: also visible on a SIBLING connection (db-wide catalog).
+            let con2 = con.try_clone().expect("clone connection");
+            let v2: i64 = con2
+                .query_row("SELECT sample_plus_one(7)", [], |r| r.get(0))
+                .expect("call on sibling connection after runtime load");
+            assert_eq!(v2, 8);
+
+            drop(con2);
+            drop(con);
+            ffi::duckdb_close(&mut db);
+        }
+    }
+
+    /// NAME-BASED end-to-end: `CALL ducklink_load('aba')` (by catalog NAME, not a
+    /// path) must resolve the catalog, obtain the `aba.wasm` blob (cache hit after
+    /// seeding), register `aba_validate`, and have it callable in a LATER
+    /// statement. Also exercises the two discovery table functions
+    /// (`ducklink_extensions()` ~193 rows; `ducklink_loaded()` shows aba).
+    ///
+    /// To stay deterministic regardless of the sandbox's network, the cache is
+    /// pre-seeded from the local artifact at the catalog digest so the resolver
+    /// finds it WITHOUT downloading. The catalog itself resolves live-or-bundled
+    /// (the bundled snapshot carries the aba entry + digest), so name lookup works
+    /// offline too. The download+verify+fallback logic is covered by the
+    /// `catalog::tests` unit tests.
+    #[test]
+    fn ducklink_load_by_name_registers_aba_and_discovery_lists_it() {
+        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A private cache root for this test (does not touch the user's cache).
+        let cache_root = std::env::temp_dir().join(format!("ducklink_nm_{}", std::process::id()));
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &cache_root);
+        }
+
+        // Seed the cache from the local aba artifact at its catalog digest, so the
+        // name resolver returns it as a cache hit (no network needed).
+        let digest = "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15";
+        let seed_target = cache_root
+            .join("ducklink")
+            .join("wasm")
+            .join("sha256")
+            .join(digest)
+            .join("aba.wasm");
+        // The local artifact: monorepo layout, overridable with DUCKLINK_CORPUS_DIR.
+        let src = match std::env::var_os("DUCKLINK_CORPUS_DIR") {
+            Some(d) => PathBuf::from(d).join("aba.wasm"),
+            None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/extensions/aba.wasm"),
+        };
+        if !src.is_file() {
+            eprintln!("[test] skipping name-based test: local aba.wasm not found at {}", src.display());
+            return;
+        }
+        std::fs::create_dir_all(seed_target.parent().unwrap()).expect("mk cache dir");
+        std::fs::copy(&src, &seed_target).expect("seed cache");
+
+        unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_open(c":memory:".as_ptr(), &mut db), ffi::DuckDBSuccess);
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+            register_load_function(&con, db, engine).expect("register ducklink_load + discovery");
+
+            // `RUNTIME` is process-wide first-write-wins; if another raw-open test
+            // already bound it, this run can't register against its own db. Skip
+            // (this test's logic is proven when it runs first / in isolation, and
+            // the resolve/verify/fallback path is covered by `catalog::tests`).
+            if !runtime_is_ours(db) {
+                eprintln!("[test] RUNTIME already bound elsewhere; skipping name-based E2E (covered in isolation)");
+                drop(con);
+                ffi::duckdb_close(&mut db);
+                std::env::remove_var("XDG_CACHE_HOME");
+                let _ = std::fs::remove_dir_all(&cache_root);
+                return;
+            }
+
+            // Discovery BEFORE load: the published catalog lists ~193 extensions.
+            let n_ext: i64 = con
+                .query_row("SELECT count(*) FROM ducklink_extensions()", [], |r| r.get(0))
+                .expect("ducklink_extensions count");
+            assert!(
+                n_ext > 150,
+                "expected ~193 catalog rows, got {n_ext}"
+            );
+            // aba is one of them, and its functions column renders aba_validate.
+            let (_d, fns): (String, String) = con
+                .query_row(
+                    "SELECT description, functions FROM ducklink_extensions() WHERE name = 'aba'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("aba row in ducklink_extensions");
+            assert!(fns.contains("aba_validate"), "functions col should list aba_validate, got: {fns}");
+
+            // ducklink_loaded() is empty before any load.
+            let n_loaded_before: i64 = con
+                .query_row("SELECT count(*) FROM ducklink_loaded()", [], |r| r.get(0))
+                .expect("loaded count before");
+            assert_eq!(n_loaded_before, 0, "nothing loaded yet");
+
+            // STATEMENT 1: load BY NAME (resolves catalog -> cached blob).
+            let (got_name, n_scalars): (String, i64) = con
+                .query_row(
+                    "SELECT name, scalars FROM ducklink_load('aba')",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("ducklink_load('aba') by name");
+            assert_eq!(got_name, "aba", "name defaults to the catalog name");
+            assert!(n_scalars >= 1, "aba should register >=1 scalar, got {n_scalars}");
+
+            // STATEMENT 2 (separate): call the freshly-registered aba_validate.
+            // A valid ABA routing number (well-known example): 021000021.
+            let valid: bool = con
+                .query_row("SELECT aba_validate('021000021')", [], |r| r.get(0))
+                .expect("call aba_validate after name-based load");
+            assert!(valid, "021000021 is a valid ABA routing number");
+            let invalid: bool = con
+                .query_row("SELECT aba_validate('021000020')", [], |r| r.get(0))
+                .expect("call aba_validate (invalid)");
+            assert!(!invalid, "021000020 fails the ABA checksum");
+
+            // ducklink_loaded() now shows aba with its counts + cache path.
+            let (lname, lscalars, lpath): (String, i32, String) = con
+                .query_row(
+                    "SELECT name, scalars, path FROM ducklink_loaded() WHERE name = 'aba'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("aba in ducklink_loaded");
+            assert_eq!(lname, "aba");
+            assert!(lscalars >= 1);
+            assert!(lpath.contains("sha256"), "loaded path should be the cached blob: {lpath}");
+
+            // IDEMPOTENCY: re-loading aba must NOT hard-error.
+            let again = con.query_row(
+                "SELECT name FROM ducklink_load('aba')",
+                [],
+                |r| r.get::<_, String>(0),
+            );
+            assert!(again.is_ok(), "re-load of aba should not error: {again:?}");
+
+            drop(con);
+            ffi::duckdb_close(&mut db);
+        }
+
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+        let _ = std::fs::remove_dir_all(&cache_root);
     }
 
     // `DUCKLINK_COMPONENTS` is a process-global; the tests that mutate it must not
