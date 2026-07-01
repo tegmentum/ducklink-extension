@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "ducklink-extension"
-version = "0.5.2"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "cc",
