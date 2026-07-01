@@ -16450,7 +16450,35 @@
       "expansion": "com.tegmentum.ducklink.minijinja",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "448074036bb9f027559b2b7f88fe6118846ec22d53ee6f058cb0b502c3103633"
+      "content_digest": "448074036bb9f027559b2b7f88fe6118846ec22d53ee6f058cb0b502c3103633",
+      "functions": [
+        {
+          "name": "jinja_render",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            },
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            }
+          ],
+          "returns": "VARCHAR"
+        },
+        {
+          "name": "jinja_valid",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            }
+          ],
+          "returns": "BOOLEAN"
+        }
+      ]
     },
     {
       "name": "tera",
@@ -16489,7 +16517,35 @@
       "expansion": "com.tegmentum.ducklink.tera",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ea523f36951cd45ba6a2d87948c9a8786486778ad2ad284fa9da764667c5f955"
+      "content_digest": "ea523f36951cd45ba6a2d87948c9a8786486778ad2ad284fa9da764667c5f955",
+      "functions": [
+        {
+          "name": "tera_render",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            },
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            }
+          ],
+          "returns": "VARCHAR"
+        },
+        {
+          "name": "tera_valid",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            }
+          ],
+          "returns": "BOOLEAN"
+        }
+      ]
     },
     {
       "name": "pcap",
@@ -16527,7 +16583,45 @@
       "expansion": "com.tegmentum.ducklink.pcap",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "886223a88934ec0daabfd631d77982ea73d5e6df6650323acc5b9514f66bafff"
+      "content_digest": "886223a88934ec0daabfd631d77982ea73d5e6df6650323acc5b9514f66bafff",
+      "functions": [
+        {
+          "name": "read_pcap",
+          "kind": "table",
+          "arguments": [
+            {
+              "name": "data",
+              "type": "BLOB"
+            }
+          ],
+          "columns": [
+            {
+              "name": "idx",
+              "type": "BIGINT"
+            },
+            {
+              "name": "ts_sec",
+              "type": "BIGINT"
+            },
+            {
+              "name": "ts_usec",
+              "type": "BIGINT"
+            },
+            {
+              "name": "caplen",
+              "type": "BIGINT"
+            },
+            {
+              "name": "origlen",
+              "type": "BIGINT"
+            },
+            {
+              "name": "data",
+              "type": "BLOB"
+            }
+          ]
+        }
+      ]
     },
     {
       "name": "a5",
@@ -16572,7 +16666,109 @@
       "expansion": "com.tegmentum.ducklink.a5",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ef73ae33dde5c1f26de60ac926b3ea1c82ed448ac87e8c6edbbf79dcb5cb9535"
+      "content_digest": "ef73ae33dde5c1f26de60ac926b3ea1c82ed448ac87e8c6edbbf79dcb5cb9535",
+      "functions": [
+        {
+          "name": "a5_lonlat_to_cell",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "DOUBLE"
+            },
+            {
+              "name": "value",
+              "type": "DOUBLE"
+            },
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "BIGINT"
+        },
+        {
+          "name": "a5_cell_to_lat",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "DOUBLE"
+        },
+        {
+          "name": "a5_cell_to_lon",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "DOUBLE"
+        },
+        {
+          "name": "a5_cell_to_resolution",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "BIGINT"
+        },
+        {
+          "name": "a5_cell_to_parent",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            },
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "BIGINT"
+        },
+        {
+          "name": "a5_is_valid_cell",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "BOOLEAN"
+        },
+        {
+          "name": "a5_cell_to_hex",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "VARCHAR"
+        },
+        {
+          "name": "a5_hex_to_cell",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            }
+          ],
+          "returns": "BIGINT"
+        }
+      ]
     },
     {
       "name": "jsonata",
@@ -16610,7 +16806,24 @@
       "expansion": "com.tegmentum.ducklink.jsonata",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "40ce03b4336415820440e8d097ed79e86e34aff03aab9b94739528cc73457ffd"
+      "content_digest": "40ce03b4336415820440e8d097ed79e86e34aff03aab9b94739528cc73457ffd",
+      "functions": [
+        {
+          "name": "jsonata",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            },
+            {
+              "name": "value",
+              "type": "VARCHAR"
+            }
+          ],
+          "returns": "VARCHAR"
+        }
+      ]
     },
     {
       "name": "sqlitecompat",
@@ -16659,6 +16872,67 @@
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/sqlitecompat.wasm",
           "content_digest": "db3d3e63918ae782de46fb0074e50689d2ca7e6dfa00939d7c9e9443bd758b8b"
+        }
+      ],
+      "functions": [
+        {
+          "name": "zeroblob",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "BLOB"
+        },
+        {
+          "name": "randomblob",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BIGINT"
+            }
+          ],
+          "returns": "BLOB"
+        },
+        {
+          "name": "likely",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BOOLEAN"
+            }
+          ],
+          "returns": "BOOLEAN"
+        },
+        {
+          "name": "unlikely",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BOOLEAN"
+            }
+          ],
+          "returns": "BOOLEAN"
+        },
+        {
+          "name": "likelihood",
+          "kind": "scalar",
+          "arguments": [
+            {
+              "name": "value",
+              "type": "BOOLEAN"
+            },
+            {
+              "name": "value",
+              "type": "DOUBLE"
+            }
+          ],
+          "returns": "BOOLEAN"
         }
       ]
     }
