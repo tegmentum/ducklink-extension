@@ -43,6 +43,19 @@ pub mod reg_duckdb;
 #[cfg(feature = "duckdb-api")]
 pub mod pytier;
 
+/// PEP 723 inline-dependency resolution + pure-Python wheel staging for the
+/// `ducklink_run` Python source tier (Part 1): parse a script's `# /// script`
+/// dependencies, resolve each to a pure-Python wheel on PyPI, and stage it into a
+/// `site-packages` dir the resident interpreter imports from. Native/C-extension
+/// deps are refused (the Phase-5 boundary).
+#[cfg(feature = "duckdb-api")]
+pub mod pydeps;
+
+/// Arbitrary-`http(s)`-URL resolution for `ducklink_load` / `ducklink_run` (Part
+/// 2): download + cache + (optionally) verify a `.wasm`/`.py` from a caller URL —
+/// the load-your-own / unsigned path, opt-in via `DUCKLINK_ALLOW_URL`.
+pub mod url_fetch;
+
 /// The advanced dispatch tier (PARSER / OPTIMIZER / table FILTER pushdown): the
 /// Rust side of the C++ shim that binds DuckDB's internal C++ ABI. Compiled in
 /// only when the `advanced` feature is built AND the C++ shim was compiled —

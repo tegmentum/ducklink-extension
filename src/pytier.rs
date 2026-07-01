@@ -266,8 +266,22 @@ fn stage_app_env() -> Result<PathBuf, String> {
             sdk.display()
         ));
     }
+
+    // The PEP 723 inline-dependency staging dir. Created up front (empty) so it is
+    // present under the `/app` preopen from first instantiation; the dispatcher
+    // prepends `/app/site-packages` to `sys.path`, and `ducklink_run`'s bind
+    // unzips a script's resolved pure-Python wheels into this SAME host dir before
+    // the script is imported (the preopen is a live host dir, so files added
+    // per-call are visible to the resident interpreter).
+    std::fs::create_dir_all(app.join(SITE_PACKAGES_DIR))
+        .map_err(|e| format!("create {}: {e}", app.join(SITE_PACKAGES_DIR).display()))?;
     Ok(app)
 }
+
+/// The `site-packages` subdirectory (under the `/app` preopen) that a script's
+/// PEP 723 pure-Python dependencies are unzipped into; the pylon dispatcher adds
+/// `/app/site-packages` to `sys.path`.
+const SITE_PACKAGES_DIR: &str = "site-packages";
 
 /// Recursively copy `src` dir into `dst` (skipping `__pycache__`).
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
@@ -302,6 +316,27 @@ fn stage_script(app_dir: &Path, script_path: &Path) -> Result<String, String> {
     std::fs::copy(script_path, &dst)
         .map_err(|e| format!("ducklink_run: stage script {}: {e}", script_path.display()))?;
     Ok(stem)
+}
+
+/// Parse the script's PEP 723 inline dependencies, resolve each to a pure-Python
+/// wheel on PyPI, and unzip them into the resident interpreter's
+/// `/app/site-packages` (Part 1). Returns the `name version` strings staged (for
+/// the summary/log). A native/C-extension-only dependency fails with a clear
+/// Phase-5-boundary error. No PEP 723 block / no `dependencies` key -> nothing
+/// staged (the common case).
+fn stage_script_dependencies(rt: &PylonRuntime, script_path: &Path) -> Result<Vec<String>, String> {
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("ducklink_run: read {}: {e}", script_path.display()))?;
+    let reqs = crate::pydeps::parse_dependencies(&source)?;
+    if reqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let site_packages = rt.app_dir.join(SITE_PACKAGES_DIR);
+    let staged = crate::pydeps::stage_dependencies(&reqs, &site_packages)?;
+    Ok(staged
+        .into_iter()
+        .map(|(n, v)| format!("{n} {v}"))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -900,27 +935,55 @@ impl VTab for WasmRun {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let arg = bind.get_parameter(0).to_string();
-        let script_path = PathBuf::from(&arg);
-        if !script_path.exists() {
-            return Err(format!("ducklink_run: script not found: {}", script_path.display()).into());
-        }
+
+        // Argument 0 is EITHER a filesystem PATH to a `.py` OR an `http(s)://…`
+        // URL (the load-your-own / unsigned path). A URL is downloaded + cached
+        // (opt-in via DUCKLINK_ALLOW_URL, optional `sha256 :=` verify) and then
+        // run exactly like a local script.
+        let script_path: PathBuf = if crate::url_fetch::is_http_url(&arg) {
+            let sha = bind.get_named_parameter("sha256").map(|v| v.to_string());
+            crate::url_fetch::resolve_url_to_cache(
+                "ducklink_run",
+                &arg,
+                "py",
+                sha.as_deref(),
+            )
+            .map_err(to_boxed)?
+        } else {
+            let p = PathBuf::from(&arg);
+            if !p.exists() {
+                return Err(format!("ducklink_run: script not found: {}", p.display()).into());
+            }
+            p
+        };
 
         let rt = PylonRuntime::get_or_init().map_err(to_boxed)?;
 
-        // 1. Stage the user script into the resident interpreter's /app env.
+        // 1. Resolve + stage the script's PEP 723 inline dependencies (Part 1).
+        //    Parse the `# /// script` block, resolve each requirement to a
+        //    PURE-PYTHON wheel on PyPI, and unzip it into the `/app/site-packages`
+        //    dir the resident interpreter imports from — BEFORE the script is
+        //    loaded, so its `import <dep>` resolves. A native/C-extension-only dep
+        //    fails here with a clear Phase-5-boundary message.
+        let deps_staged = stage_script_dependencies(rt, &script_path).map_err(to_boxed)?;
+
+        // 2. Stage the user script into the resident interpreter's /app env.
         let module = stage_script(&rt.app_dir, &script_path).map_err(to_boxed)?;
 
-        // 2. runtime.load: import the script so its @ducklink decorators fire.
+        // 3. runtime.load: import the script so its @ducklink decorators fire.
         let n_raw = rt.call("runtime.load", &load_payload(&module)).map_err(to_boxed)?;
         let n_loaded = mp_decode(&n_raw)?.as_i64().unwrap_or(-1);
         eprintln!("[ducklink] ducklink_run: loaded '{module}' -> {n_loaded} function(s) authored");
+        if !deps_staged.is_empty() {
+            eprintln!("[ducklink] ducklink_run: staged {} PEP 723 dep(s): {}", deps_staged.len(), deps_staged.join(", "));
+        }
 
-        // 3. runtime.manifest: read what registered.
+        // 4. runtime.manifest: read what registered.
         let manifest_raw = rt.call("runtime.manifest", &[]).map_err(to_boxed)?;
         let manifest = mp_decode(&manifest_raw)?;
         let sigs = parse_manifest(&manifest);
 
-        // 4. Register each scalar on the PERSISTENT connection captured at init
+        // 5. Register each scalar on the PERSISTENT connection captured at init
         //    (never a reconnect through the dangling `db` handle — see the
         //    DucklinkRuntime safety note). Database-wide, so the functions are
         //    visible on the caller's NEXT statement.
@@ -982,7 +1045,17 @@ impl VTab for WasmRun {
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // Positional arg 0: a `.py` filesystem path OR an `http(s)://…` URL.
         Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        // Optional `sha256 :=` to verify a URL-hosted script's bytes (the
+        // load-your-own / unsigned path); ignored for a local-path arg.
+        Some(vec![(
+            "sha256".to_string(),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        )])
     }
 }
 

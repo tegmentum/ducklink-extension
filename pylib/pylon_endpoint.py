@@ -103,6 +103,21 @@ def _resolve_entry(entry: str):
     return _reduce(getattr, attr_path.split("."), obj)
 
 
+# PEP 723 inline dependencies the host resolves+stages are unzipped into
+# ``/app/site-packages`` (under the same ``/app`` preopen this dispatcher and the
+# user script live in). Prepend it to ``sys.path`` so a script's ``import <dep>``
+# resolves against a staged pure-Python wheel. Idempotent: added once, ahead of
+# ``/app`` so a staged dependency shadows nothing but is found before the stdlib.
+_SITE_PACKAGES = "/app/site-packages"
+
+
+def _ensure_site_packages_on_path():
+    if _SITE_PACKAGES not in sys.path:
+        sys.path.insert(0, _SITE_PACKAGES)
+        # A newly-created dir may not be reflected in importer caches yet.
+        _importlib.invalidate_caches()
+
+
 def _m_runtime_load(payload: bytes):
     """Import the user script so its ``@ducklink`` decorators register.
 
@@ -115,6 +130,8 @@ def _m_runtime_load(payload: bytes):
     module = req["module"]
     if not isinstance(module, str) or not module:
         raise EndpointError("runtime.load 'module' must be a non-empty string")
+    # Make any host-staged PEP 723 pure-Python deps importable before the script.
+    _ensure_site_packages_on_path()
     _importlib.import_module(module)
     import ducklink  # resident once imported; on the /app search path
 

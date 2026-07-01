@@ -1135,6 +1135,7 @@ dependencies = [
  "sha2",
  "wasmtime",
  "wasmtime-wasi",
+ "zip",
 ]
 
 [[package]]

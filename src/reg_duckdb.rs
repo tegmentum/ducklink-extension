@@ -1665,14 +1665,28 @@ pub unsafe fn load_wasm_into_db(
         .get()
         .ok_or_else(|| "LOAD WASM: runtime not initialised (LOAD ducklink first)".to_string())?;
 
-    // Resolve the arg to (display name, on-disk .wasm path): a path-looking arg
-    // is a filesystem path; anything else is a catalog NAME (live catalog with a
-    // bundled-snapshot fallback). Mirrors `ducklink_load`'s heuristic.
-    let looks_like_path = arg.contains('/')
-        || arg.contains('\\')
-        || arg.ends_with(".wasm")
-        || Path::new(arg).exists();
-    let (name, path): (String, PathBuf) = if looks_like_path {
+    // Resolve the arg to (display name, on-disk .wasm path): an `http(s)://…` URL
+    // is downloaded + cached (the load-your-own / unsigned path, opt-in via
+    // DUCKLINK_ALLOW_URL — the parser shim carries no named args, so no `sha256`
+    // here); a path-looking arg is a filesystem path; anything else is a catalog
+    // NAME (live catalog with a bundled-snapshot fallback). Mirrors
+    // `ducklink_load`'s heuristic.
+    let is_url = crate::url_fetch::is_http_url(arg);
+    let looks_like_path = !is_url
+        && (arg.contains('/')
+            || arg.contains('\\')
+            || arg.ends_with(".wasm")
+            || Path::new(arg).exists());
+    let (name, path): (String, PathBuf) = if is_url {
+        let cached = crate::url_fetch::resolve_url_to_cache("LOAD WASM", arg, "wasm", None)
+            .map_err(|e| e.to_string())?;
+        let name = cached
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("component")
+            .to_string();
+        (name, cached)
+    } else if looks_like_path {
         let path = PathBuf::from(arg);
         let name = path
             .file_stem()
@@ -1782,15 +1796,39 @@ impl VTab for WasmLoad {
             let arg_val = bind.get_parameter(0);
             let arg_str = arg_val.to_string();
 
-            let looks_like_path = arg_str.contains('/')
-                || arg_str.contains('\\')
-                || arg_str.ends_with(".wasm")
-                || Path::new(&arg_str).exists();
+            let is_url = crate::url_fetch::is_http_url(&arg_str);
+            let looks_like_path = !is_url
+                && (arg_str.contains('/')
+                    || arg_str.contains('\\')
+                    || arg_str.ends_with(".wasm")
+                    || Path::new(&arg_str).exists());
 
-            // Resolve to (display name, on-disk .wasm path). For a path arg the
-            // name defaults to the file stem (overridable via `name :=`); for a
-            // catalog name the arg IS the name and the path is the cached blob.
-            let (name, path): (String, PathBuf) = if looks_like_path {
+            // Resolve to (display name, on-disk .wasm path). Three shapes:
+            //   * an `http(s)://…` URL -> download + cache (opt-in via
+            //     DUCKLINK_ALLOW_URL, optional `sha256 :=` verify) — the
+            //     load-your-own / unsigned path;
+            //   * a filesystem PATH -> loaded straight from disk; name defaults to
+            //     the file stem (overridable via `name :=`);
+            //   * a catalog NAME -> resolved + fetched + digest-verified.
+            let (name, path): (String, PathBuf) = if is_url {
+                let sha = bind.get_named_parameter("sha256").map(|v| v.to_string());
+                let cached = crate::url_fetch::resolve_url_to_cache(
+                    "ducklink_load",
+                    &arg_str,
+                    "wasm",
+                    sha.as_deref(),
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                let name = match bind.get_named_parameter("name") {
+                    Some(v) => v.to_string(),
+                    None => cached
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("component")
+                        .to_string(),
+                };
+                (name, cached)
+            } else if looks_like_path {
                 let path = PathBuf::from(&arg_str);
                 let name = match bind.get_named_parameter("name") {
                     Some(v) => v.to_string(),
@@ -1933,11 +1971,19 @@ impl VTab for WasmLoad {
     }
 
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
-        // Optional `name :=` override; defaults to the file stem.
-        Some(vec![(
-            "name".to_string(),
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        )])
+        // Optional `name :=` override (defaults to the file stem) and, for a
+        // URL-hosted component (the load-your-own / unsigned path), `sha256 :=`
+        // to verify the download.
+        Some(vec![
+            (
+                "name".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "sha256".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+        ])
     }
 }
 

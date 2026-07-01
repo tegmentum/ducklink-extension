@@ -72,6 +72,10 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # Verify a downloaded component blob's bytes against the catalog entry's
 # content_digest (sha256) before caching/loading it.
 sha2 = "0.10"
+# Unzip pure-Python wheels for the `ducklink_run` PEP 723 inline-dependency
+# staging (a wheel is a zip). Deflate is the only codec wheels use; disable the
+# rest to keep the build lean.
+zip = { version = "6", default-features = false, features = ["deflate"] }
 # MessagePack for the Python source tier (`ducklink_run`): the offload envelope
 # the resident pylon endpoint speaks over compose:dynlink/endpoint. The per-row
 # `offload` fallback (unsupported types) marshals args/results as msgpack; the
