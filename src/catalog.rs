@@ -192,23 +192,80 @@ impl CatalogEntry {
         self.providers.iter().filter(|p| p.is_wasm())
     }
 
+    /// The entry's own contract generation MAJOR, from `wit_contract_version`
+    /// (e.g. `"4.0.0"` → `4`). This is the AUTHORITATIVE generation of the entry's
+    /// default artifact; a `providers[]` member's `abi` is stale build metadata
+    /// (the current catalog stamps gen-4 artifacts with an `abi` of `@2.2.0` /
+    /// `@3.1.0`) and is NOT used to decide the entry's generation. `None` when
+    /// absent or unparseable.
+    pub fn generation_major(&self) -> Option<u64> {
+        self.wit_contract_version
+            .as_deref()
+            .and_then(abi_major_of)
+    }
+
     /// Choose the wasm provider (and hence blob digest) this HOST should load,
     /// given its contract generation `host_major`.
     ///
-    /// The compat model is BACKWARD-COMPATIBLE: empirically the gen-4 host loads
-    /// and dispatches gen-2 (@2.2.0) scalar / table / aggregate blobs, so a host
-    /// runs any generation ≤ its own. The rule is therefore: pick the NEWEST wasm
-    /// provider whose generation major ≤ `host_major`. A provider whose `abi` is
-    /// absent or unparseable is skipped (never mis-selected). Returns `None` when
-    /// no wasm provider qualifies — the caller then falls back to the entry's
-    /// top-level [`content_digest`].
+    /// The compat model is STRICT SAME-MAJOR: a host runs ONLY artifacts of its
+    /// own generation (matching the ducklink-runtime CLI and the browser host).
+    /// The rule is therefore: pick the wasm provider whose generation major
+    /// `== host_major` exactly. A provider whose `abi` is absent, unparseable, or
+    /// of a different major is skipped (never mis-selected). Returns `None` when
+    /// no wasm provider matches — the caller then falls back to the entry's
+    /// top-level [`content_digest`], but ONLY if the entry's own generation
+    /// matches the host (see [`CatalogEntry::resolve_digest`]).
     pub fn select_provider(&self, host_major: u64) -> Option<&Provider> {
         self.wasm_providers()
             .filter(|p| p.content_digest.is_some())
             .filter_map(|p| p.abi_major().map(|m| (m, p)))
-            .filter(|(m, _)| *m <= host_major)
-            .max_by_key(|(m, _)| *m)
+            .find(|(m, _)| *m == host_major)
             .map(|(_, p)| p)
+    }
+
+    /// Resolve the blob digest this HOST should load under the STRICT same-major
+    /// compat model, or a clear error naming the generation mismatch.
+    ///
+    /// Order:
+    /// 1. A wasm provider whose `abi` major `== host_major` (exact match).
+    /// 2. Else the entry's top-level [`content_digest`], but ONLY when the
+    ///    entry's own generation ([`generation_major`](Self::generation_major))
+    ///    `== host_major`. The current catalog is 100% gen-4 with providers whose
+    ///    `abi` is stale (`@2.2.0`/`@3.1.0`); those entries take THIS path — their
+    ///    top-level digest IS the gen-4 blob.
+    /// 3. Else the module is NOT loadable on this host: cross-major → error.
+    pub fn resolve_digest(&self, host_major: u64) -> Result<String, String> {
+        if let Some(p) = self.select_provider(host_major) {
+            return Ok(p
+                .content_digest
+                .clone()
+                .expect("selected provider has a digest"));
+        }
+        match self.generation_major() {
+            // Entry generation matches the host: the top-level digest is loadable.
+            Some(g) if g == host_major => self.content_digest.clone().ok_or_else(|| {
+                format!(
+                    "ducklink_load: catalog entry '{}' is generation {g} (matching host {host_major}) \
+                     but carries no content_digest; cannot fetch blob",
+                    self.name
+                )
+            }),
+            // Entry generation differs from the host: strict same-major rejects it.
+            Some(g) => Err(format!(
+                "ducklink_load: '{}' is generation {g} but this host is generation {host_major}; \
+                 strict same-major compatibility refuses to load a cross-major module",
+                self.name
+            )),
+            // No parseable entry generation: fall back to the top-level digest if
+            // present (single-generation entries with no version metadata), else error.
+            None => self.content_digest.clone().ok_or_else(|| {
+                format!(
+                    "ducklink_load: catalog entry '{}' has no wit_contract_version and no \
+                     content_digest; cannot determine a loadable blob for host generation {host_major}",
+                    self.name
+                )
+            }),
+        }
     }
 }
 
@@ -332,12 +389,12 @@ static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
 /// from.
 ///
 /// `host_major` is the host's `wasm_abi` contract-generation major (e.g. `4`),
-/// read from `HostCaps` by the caller. It drives per-generation provider
-/// selection ([`CatalogEntry::select_provider`]): the newest wasm provider whose
-/// generation ≤ the host's is chosen, falling back to the entry's top-level
-/// `content_digest` when no provider matches (or the entry carries none — the
-/// common case in the current catalog). This keeps single-generation entries
-/// (aba, etc.) loading exactly as before.
+/// read from `HostCaps` by the caller. It drives STRICT same-major resolution
+/// ([`CatalogEntry::resolve_digest`]): a wasm provider whose generation `==` the
+/// host's is chosen; else the entry's top-level `content_digest` when the
+/// entry's OWN generation (`wit_contract_version`) matches the host (the common
+/// case in the current all-gen-4 catalog); else a clear cross-major-mismatch
+/// error — a module of another major is NOT loadable on this host.
 pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, String> {
     let catalog = resolve_catalog();
     let entry = catalog.find(name).ok_or_else(|| {
@@ -353,8 +410,9 @@ pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, Stri
         )
     })?;
 
-    // Per-generation provider selection: prefer a wasm provider matching the
-    // host generation; otherwise fall back to the entry's top-level digest.
+    // STRICT same-major resolution: an exact-generation wasm provider, else the
+    // entry's top-level digest only if the entry's own generation matches the
+    // host, else a clear cross-major-mismatch error.
     let digest = match entry.select_provider(host_major) {
         Some(p) => {
             let digest = p.content_digest.clone().expect("selected provider has a digest");
@@ -371,18 +429,9 @@ pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, Stri
             digest
         }
         None => {
-            let digest = entry.content_digest.clone().ok_or_else(|| {
-                format!(
-                    "ducklink_load: catalog entry '{name}' has no provider for host \
-                     generation {host_major} and no top-level content_digest; cannot fetch blob"
-                )
+            let digest = entry.resolve_digest(host_major).inspect_err(|e| {
+                crate::events::emit("generation_reject", Some(name), e.clone());
             })?;
-            if !entry.providers.is_empty() {
-                eprintln!(
-                    "[ducklink] '{name}': no wasm provider ≤ host generation {host_major}; \
-                     falling back to top-level digest"
-                );
-            }
             crate::events::emit(
                 "select_provider",
                 Some(name),
@@ -498,7 +547,7 @@ mod tests {
         let aba = cat.find("aba").expect("aba present");
         assert_eq!(
             aba.content_digest.as_deref(),
-            Some("21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b")
+            Some("068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15")
         );
         assert!(aba.exports.iter().any(|e| e == "aba_validate"));
     }
@@ -569,21 +618,26 @@ mod tests {
     }
 
     #[test]
-    fn bundled_provider_entries_select_gen2_for_gen4_host() {
-        // aba carries a wasm provider at duckdb:extension@2.2.0; a gen-4 host is
-        // backward-compatible, so selection picks that provider's digest.
+    fn bundled_aba_resolves_gen4_top_level_digest_on_gen4_host() {
+        // aba is a gen-4 entry (wit_contract_version 4.0.0) whose only wasm
+        // provider carries a STALE abi (@2.2.0). Under strict same-major, that
+        // provider is NOT selected (abi major 2 != host 4); resolution falls back
+        // to the entry's top-level gen-4 digest because the entry's own
+        // generation matches the host.
         let cat = bundled_catalog();
         let aba = cat.find("aba").expect("aba present");
-        let p = aba.select_provider(4).expect("aba has a wasm provider <= gen 4");
-        assert_eq!(p.abi_major(), Some(2));
+        assert_eq!(aba.generation_major(), Some(4), "aba is a gen-4 entry");
+        // No exact-generation wasm provider on a gen-4 host (provider abi is @2.2.0).
+        assert!(aba.select_provider(4).is_none());
+        // resolve_digest falls back to the entry's gen-4 top-level digest.
         assert_eq!(
-            p.content_digest.as_deref(),
-            Some("21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b")
+            aba.resolve_digest(4).as_deref(),
+            Ok("068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15")
         );
     }
 
     #[test]
-    fn provider_selection_picks_newest_le_host_and_respects_ceiling() {
+    fn provider_selection_is_strict_same_major() {
         let mk = |abi: &str, dig: &str| Provider {
             id: Some("wasm-component".into()),
             kind: Some("wasm".into()),
@@ -608,12 +662,68 @@ mod tests {
             ],
             functions: vec![],
         };
-        // Gen-4 host: newest <= 4 is the gen-4 provider.
+        // Gen-4 host: picks the EXACT gen-4 provider (not the newest <= host).
         assert_eq!(entry.select_provider(4).unwrap().content_digest.as_deref(), Some("d4"));
-        // Gen-3 host: newest <= 3 is the gen-2 provider (no gen-3 available).
-        assert_eq!(entry.select_provider(3).unwrap().content_digest.as_deref(), Some("d2"));
-        // Gen-0 host: nothing qualifies -> None (caller falls back to top-level).
+        // Gen-2 host: picks the exact gen-2 provider.
+        assert_eq!(entry.select_provider(2).unwrap().content_digest.as_deref(), Some("d2"));
+        // Gen-3 host: NO exact match -> None (strict rejects the gen-2 provider).
+        assert!(entry.select_provider(3).is_none());
+        // Gen-0 host: nothing matches -> None.
         assert!(entry.select_provider(0).is_none());
+    }
+
+    #[test]
+    fn resolve_digest_rejects_cross_major_and_accepts_same_major() {
+        let mk = |abi: &str, dig: &str| Provider {
+            id: Some("wasm-component".into()),
+            kind: Some("wasm".into()),
+            abi: Some(abi.into()),
+            content_digest: Some(dig.into()),
+            status: None,
+        };
+        // A gen-2 entry (its wit_contract_version + provider are both gen-2).
+        let gen2 = CatalogEntry {
+            name: "old".into(),
+            version: None,
+            description: None,
+            categories: vec![],
+            exports: vec![],
+            requires: vec![],
+            crates: vec![],
+            content_digest: Some("top2".into()),
+            wit_contract_version: Some("2.2.0".into()),
+            providers: vec![mk("duckdb:extension@2.2.0", "d2")],
+            functions: vec![],
+        };
+        // On a gen-4 host: the gen-2 provider is not selected AND the entry's own
+        // generation (2) != host (4) -> a clear cross-major REJECTION.
+        assert!(gen2.select_provider(4).is_none());
+        let err = gen2.resolve_digest(4).expect_err("gen-2 module must be rejected on a gen-4 host");
+        assert!(
+            err.contains("generation 2") && err.contains("generation 4"),
+            "error must name both generations: {err}"
+        );
+        // On a gen-2 host: the exact gen-2 provider is selected -> accepted.
+        assert_eq!(gen2.resolve_digest(2).as_deref(), Ok("d2"));
+
+        // A gen-4 entry whose provider carries a STALE @2.2.0 abi (the real
+        // catalog shape). On a gen-4 host: no exact provider, but the entry's own
+        // generation (4) == host (4) -> falls back to the gen-4 top-level digest.
+        let gen4_stale = CatalogEntry {
+            name: "modern".into(),
+            version: None,
+            description: None,
+            categories: vec![],
+            exports: vec![],
+            requires: vec![],
+            crates: vec![],
+            content_digest: Some("top4".into()),
+            wit_contract_version: Some("4.0.0".into()),
+            providers: vec![mk("duckdb:extension@2.2.0", "top4")],
+            functions: vec![],
+        };
+        assert!(gen4_stale.select_provider(4).is_none());
+        assert_eq!(gen4_stale.resolve_digest(4).as_deref(), Ok("top4"));
     }
 
     #[test]
@@ -647,7 +757,7 @@ mod tests {
         // White-box: bytes that don't hash to the claimed digest must be
         // rejected. We exercise the same comparison resolve_name_to_blob uses.
         let bytes = b"not the real component";
-        let claimed = "21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b";
+        let claimed = "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15";
         let got = sha256_hex(bytes);
         assert_ne!(got, claimed, "test bytes must not match the real digest");
     }

@@ -2592,8 +2592,9 @@ struct VersionRow {
     generation: String,
     /// Lifecycle status from `providers[].status`, else `unknown`.
     status: String,
-    /// Whether THIS host generation can run this provider generation. Per the
-    /// verified backward-compat model, a host runs any generation ≤ its own.
+    /// Whether THIS host can run this module. Per the STRICT same-major model, a
+    /// host runs ONLY modules whose own generation (`wit_contract_version`)
+    /// equals the host generation.
     runnable: bool,
     /// Whether this provider is the one the host would select (== the entry's
     /// selected/top-level digest).
@@ -2614,6 +2615,11 @@ fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
             .select_provider(host_major)
             .and_then(|p| p.content_digest.clone())
             .or_else(|| e.content_digest.clone());
+        // STRICT same-major: a module is runnable iff its OWN generation
+        // (`wit_contract_version`) equals the host generation. The provider `abi`
+        // is stale build metadata (gen-4 artifacts stamped `@2.2.0`/`@3.1.0`) and
+        // is NOT used to decide runnability — only to label the generation row.
+        let entry_runnable = e.generation_major().map(|m| m == host_major).unwrap_or(false);
         let wasm: Vec<_> = e.wasm_providers().collect();
         if wasm.is_empty() {
             // No per-generation providers: one synthetic row for the default
@@ -2622,27 +2628,23 @@ fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
                 .wit_contract_version
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let major = crate::catalog::abi_major_of(&generation);
             rows.push(VersionRow {
                 module: e.name.clone(),
                 generation,
                 status: "unknown".to_string(),
-                // Unknown generation -> conservatively not runnable; a known
-                // generation is runnable iff <= host (backward-compat model).
-                runnable: major.map(|m| m <= host_major).unwrap_or(false),
+                runnable: entry_runnable,
                 is_default: true,
             });
         } else {
             for p in wasm {
                 let generation = p.abi.clone().unwrap_or_else(|| "unknown".to_string());
-                let major = p.abi_major();
                 let is_default = p.content_digest.is_some()
                     && p.content_digest == selected_digest;
                 rows.push(VersionRow {
                     module: e.name.clone(),
                     generation,
                     status: p.status.clone().unwrap_or_else(|| "unknown".to_string()),
-                    runnable: major.map(|m| m <= host_major).unwrap_or(false),
+                    runnable: entry_runnable,
                     is_default,
                 });
             }
@@ -2989,16 +2991,17 @@ mod tests {
 
         // Seed the cache from the committed aba fixture at its catalog digest, so
         // the name resolver returns it as a cache hit (no network needed). The
-        // fixture is the @2.2.0 production blob, matching the bundled snapshot's
-        // aba content_digest, so the sha256 verify succeeds offline.
-        let digest = "21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b";
+        // fixture is the gen-4 production blob, matching the bundled snapshot's
+        // aba content_digest, so the sha256 verify succeeds offline (and a strict
+        // gen-4 host accepts it).
+        let digest = "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15";
         let seed_target = cache_root
             .join("ducklink")
             .join("wasm")
             .join("sha256")
             .join(digest)
             .join("aba.wasm");
-        // The committed fixture (production @2.2.0 aba blob at the snapshot digest).
+        // The committed fixture (production gen-4 aba blob at the snapshot digest).
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/aba.wasm");
         if !src.is_file() {
             eprintln!("[test] skipping name-based test: aba fixture not found at {}", src.display());
@@ -3155,8 +3158,10 @@ mod tests {
                 .expect("capabilities rows");
             assert_eq!(n_caps, 2, "scalar + load_wasm capability rows present");
 
-            // ducklink.versions lists aba's @2.2.0 generation, runnable on this
-            // (gen-4) host and marked default (its selected provider digest).
+            // ducklink.versions lists aba's provider row (its provider carries a
+            // stale @2.2.0 abi label). aba is a gen-4 ENTRY, so on this gen-4 host
+            // it is runnable under strict same-major, and it is the default (its
+            // gen-4 top-level digest is the resolved blob).
             let (vgen, vrun, vdef): (String, bool, bool) = con
                 .query_row(
                     "SELECT generation, runnable, is_default FROM ducklink.versions \
@@ -3164,10 +3169,10 @@ mod tests {
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
-                .expect("aba @2.2.0 row in ducklink.versions");
+                .expect("aba provider row in ducklink.versions");
             assert_eq!(vgen, "duckdb:extension@2.2.0");
-            assert!(vrun, "gen-4 host runs a gen-2 provider (backward-compat)");
-            assert!(vdef, "aba's @2.2.0 provider is the selected default");
+            assert!(vrun, "gen-4 aba runs on a gen-4 host (strict same-major)");
+            assert!(vdef, "aba's gen-4 digest is the selected default");
 
             // IDEMPOTENCY: re-loading aba must NOT hard-error.
             let again = con.query_row(

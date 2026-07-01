@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "updated": "2026-06-21",
+  "updated": "2026-07-01T02:46:27Z",
   "registry_url": "https://github.com/tegmentum/ducklink",
   "_schema": {
     "description": "Catalog of componentized DuckDB-wasm extensions. Each entry describes one extension component built against the duckdb:extension world. The full planned roadmap (with per-extension batch + native-coverage notes) lives in PLAN-duckdb-extensions.md.",
@@ -169,7 +169,7 @@
       "prefix": "sample_extension",
       "expansion": "com.tegmentum.ducklink.sample_extension",
       "wit_contract_version": "4.0.0",
-      "content_digest": "83e081ac26e7ce329142a3137f654800f7cbcfd7c4625d66107c9ce9de74b57b",
+      "content_digest": "5d2948655d769f74fca8d1acaba3bd69da993dbf7356448a70c7eef7b0f5fadf",
       "providers": [
         {
           "id": "wasm-component",
@@ -177,13 +177,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/sample_extension.wasm",
-          "content_digest": "83e081ac26e7ce329142a3137f654800f7cbcfd7c4625d66107c9ce9de74b57b",
+          "content_digest": "5d2948655d769f74fca8d1acaba3bd69da993dbf7356448a70c7eef7b0f5fadf",
           "conformance": {
             "suite": "sample_extension@4",
             "suite_digest": "4c6fae795ef67612e82f4a4ea960848a039d25d11aa554139577db829d1694be",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -281,7 +282,7 @@
       "prefix": "isin",
       "expansion": "com.tegmentum.ducklink.isin",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f418726d15a50792c8e3b1a4704c6148973b2b5a55c43ebd418c82477fa0921a",
+      "content_digest": "ac1c0f86b660c823179bd54e1263c5d0b75da21410ea4ce2d15c64b6b1550e81",
       "providers": [
         {
           "id": "wasm-component",
@@ -289,13 +290,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/isin.wasm",
-          "content_digest": "f418726d15a50792c8e3b1a4704c6148973b2b5a55c43ebd418c82477fa0921a",
+          "content_digest": "ac1c0f86b660c823179bd54e1263c5d0b75da21410ea4ce2d15c64b6b1550e81",
           "conformance": {
             "suite": "isin@4",
             "suite_digest": "72d666116e2c6ea14bb52afb8a24b27521b25017803262b598c34a571727263b",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -385,7 +387,7 @@
       "prefix": "baseN",
       "expansion": "com.tegmentum.ducklink.baseN",
       "wit_contract_version": "4.0.0",
-      "content_digest": "7988c5c77abea8ae424495de9362c6025c071e6981a498beaadb4f1f856f6b83",
+      "content_digest": "c367dbc4394512b441feb233782e29bbc039710e47595bcc213987001c6883c3",
       "providers": [
         {
           "id": "wasm-component",
@@ -393,13 +395,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/baseN.wasm",
-          "content_digest": "7988c5c77abea8ae424495de9362c6025c071e6981a498beaadb4f1f856f6b83",
+          "content_digest": "c367dbc4394512b441feb233782e29bbc039710e47595bcc213987001c6883c3",
           "conformance": {
             "suite": "baseN@4",
             "suite_digest": "82d734bb13c74c3686d45284b6e41a43bbc23a945759ba83ded926042336de70",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -505,7 +508,7 @@
       "prefix": "luhn",
       "expansion": "com.tegmentum.ducklink.luhn",
       "wit_contract_version": "4.0.0",
-      "content_digest": "400c78b4f2d8a703d0fcc70d79d5cc6fc9d7e15f6db16a88c5edcebb123295bf",
+      "content_digest": "531cc06687d18c091b4b81c7259e02126ff1342f8f58ca654a4bc821c8702caf",
       "functions": [
         {
           "name": "luhn_validate",
@@ -568,7 +571,7 @@
       "prefix": "iban",
       "expansion": "com.tegmentum.ducklink.iban",
       "wit_contract_version": "4.0.0",
-      "content_digest": "19ac3adab60dee3261c08262c269edb52fda416d339cbdc0aa8663c7dd10f70b",
+      "content_digest": "c754998007649ae8927445a574450cd2ec7fff148377a6b232512d0a45dd7044",
       "functions": [
         {
           "name": "iban_validate",
@@ -642,7 +645,7 @@
       "prefix": "ean",
       "expansion": "com.tegmentum.ducklink.ean",
       "wit_contract_version": "4.0.0",
-      "content_digest": "67bbcfac69c255c21eb6652058c02c2fe3d12892c115e381616c46fceef85bd9",
+      "content_digest": "6084c5d6ffbf32f317bdf6d35bc81141e9395e405ac362dbaf1a5f2fb2fbd443",
       "functions": [
         {
           "name": "ean_validate",
@@ -723,7 +726,7 @@
       "prefix": "aba",
       "expansion": "com.tegmentum.ducklink.aba",
       "wit_contract_version": "4.0.0",
-      "content_digest": "21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b",
+      "content_digest": "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15",
       "providers": [
         {
           "id": "wasm-component",
@@ -731,13 +734,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/aba.wasm",
-          "content_digest": "21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b",
+          "content_digest": "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15",
           "conformance": {
             "suite": "aba@4",
             "suite_digest": "e2833ab9fdc2e3b09994610b006002a54c0e37ce82f0964bee33e3fd17328dcc",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         },
         {
           "id": "native-arm64-macos",
@@ -757,7 +761,8 @@
             "suite_digest": "e2833ab9fdc2e3b09994610b006002a54c0e37ce82f0964bee33e3fd17328dcc",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -835,7 +840,7 @@
       "prefix": "creditcard",
       "expansion": "com.tegmentum.ducklink.creditcard",
       "wit_contract_version": "4.0.0",
-      "content_digest": "43766a8783f0f5988b591f252ff2eb26d1f8ad93300d89408df2816368261685",
+      "content_digest": "50a8587b411021abd9374b695274732970262f7380e0df94b0a471ccf2e713cd",
       "providers": [
         {
           "id": "wasm-component",
@@ -843,13 +848,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/creditcard.wasm",
-          "content_digest": "43766a8783f0f5988b591f252ff2eb26d1f8ad93300d89408df2816368261685",
+          "content_digest": "50a8587b411021abd9374b695274732970262f7380e0df94b0a471ccf2e713cd",
           "conformance": {
             "suite": "creditcard@4",
             "suite_digest": "6c0e5ed82a82412bc37faa293125f18440742a3afef5902839c4af70cd88282e",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -968,7 +974,7 @@
       "prefix": "uuidx",
       "expansion": "com.tegmentum.ducklink.uuidx",
       "wit_contract_version": "4.0.0",
-      "content_digest": "8701e71ec7398e640e206316af5e1a97e015bcd94ea1610d5fa5308c3148a7cf",
+      "content_digest": "3bf565af587c742156904cf905f016dd0355644abc00072c808154e950b6c12f",
       "functions": [
         {
           "name": "uuid_v7",
@@ -1044,7 +1050,7 @@
       "prefix": "crypto",
       "expansion": "com.tegmentum.ducklink.crypto",
       "wit_contract_version": "4.0.0",
-      "content_digest": "83408e3aadfcd7645faf1dfa16acb4078ac3d7e3bf0620b3bcd3d82e710f22b7",
+      "content_digest": "22ddc5da4a42578e2775b682a28cb6bc149c059130dbee8624a1850b51e14c8d",
       "providers": [
         {
           "id": "wasm-component",
@@ -1052,13 +1058,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/crypto.wasm",
-          "content_digest": "83408e3aadfcd7645faf1dfa16acb4078ac3d7e3bf0620b3bcd3d82e710f22b7",
+          "content_digest": "22ddc5da4a42578e2775b682a28cb6bc149c059130dbee8624a1850b51e14c8d",
           "conformance": {
             "suite": "crypto@4",
             "suite_digest": "b11bf7ce1601360c5ab2e819c9980b35a35f3b402a2a68188e09d8c8b3b2e2a1",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -1155,7 +1162,7 @@
       "prefix": "markdown",
       "expansion": "com.tegmentum.ducklink.markdown",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d9dba9071244a4adc3dd0aa9274265a4d9ae3fbcd51e25eabb0431be2ffcd9e2",
+      "content_digest": "e028996e5e6ab98cf10098904f20e3be32b099c0350b72bfe6906e06138207f7",
       "functions": [
         {
           "name": "md_to_html",
@@ -1221,7 +1228,7 @@
       "prefix": "hashfuncs",
       "expansion": "com.tegmentum.ducklink.hashfuncs",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e3f251efe3974dda3c1becceb3d68ce716beabab9dad83d5d3bbaf3112a96abc",
+      "content_digest": "dabfd1bf114dde2d2c1e8e670696c805f0c087c7200c2a6b902e4a323b5a3cd3",
       "functions": [
         {
           "name": "xxh32",
@@ -1307,7 +1314,7 @@
       "prefix": "rapidfuzz",
       "expansion": "com.tegmentum.ducklink.rapidfuzz",
       "wit_contract_version": "4.0.0",
-      "content_digest": "821832e46ff897b34ebeb48ad4bf73bf6e58fb3840900f85a861b3b8af738a26",
+      "content_digest": "a134fe7240a63611fb6d205fd5cea29a9b090e070d0afb52dfbfe68d50362c80",
       "functions": [
         {
           "name": "fuzz_ratio",
@@ -1412,7 +1419,7 @@
       "prefix": "casing",
       "expansion": "com.tegmentum.ducklink.casing",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9ba8008d11ec5ca9ccfc697a479f33a29c7d72e8e2d9c41f3f2d6c2e848075ba",
+      "content_digest": "48967200189a0ed1c1e12659e898618ce6a0bd1b7f97715eb4419142b97ff6f0",
       "functions": [
         {
           "name": "to_snake_case",
@@ -1519,7 +1526,7 @@
       "prefix": "csscolor",
       "expansion": "com.tegmentum.ducklink.csscolor",
       "wit_contract_version": "4.0.0",
-      "content_digest": "822eba1c03a9440208090cf49e4061f51d4687bcd4efd1243cbb1535bde8f6db",
+      "content_digest": "d0b4c683c24088be793646cac9a8ac6c70a32c9af203fc7bb0818a78ab19588a",
       "functions": [
         {
           "name": "css_to_hex",
@@ -1594,7 +1601,7 @@
       "prefix": "url",
       "expansion": "com.tegmentum.ducklink.url",
       "wit_contract_version": "4.0.0",
-      "content_digest": "4f625407168287546623fa04a7061aef4160dcf9c2813b2f8bd984daeddd5681",
+      "content_digest": "fea11001fb229c88c843c696df1044f43eba32c663ce3d46d58cb0f5a9611d83",
       "providers": [
         {
           "id": "wasm-component",
@@ -1602,13 +1609,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/url.wasm",
-          "content_digest": "4f625407168287546623fa04a7061aef4160dcf9c2813b2f8bd984daeddd5681",
+          "content_digest": "fea11001fb229c88c843c696df1044f43eba32c663ce3d46d58cb0f5a9611d83",
           "conformance": {
             "suite": "url@4",
             "suite_digest": "c5d3eb272b70cc5ec9b92c69ce76d1d3f2ebf0372a6128bea829bc5880428b21",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -1705,7 +1713,7 @@
       "prefix": "email",
       "expansion": "com.tegmentum.ducklink.email",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ff0a18dbc6c9407adaf07baf2b74d67b5d01ba6437d6a79f13b4e895f3f22899",
+      "content_digest": "a50a4f9df7a7b09c61e4429ef2205d745ca921bf15d38192a916abe3050719cd",
       "providers": [
         {
           "id": "wasm-component",
@@ -1713,13 +1721,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/email.wasm",
-          "content_digest": "ff0a18dbc6c9407adaf07baf2b74d67b5d01ba6437d6a79f13b4e895f3f22899",
+          "content_digest": "a50a4f9df7a7b09c61e4429ef2205d745ca921bf15d38192a916abe3050719cd",
           "conformance": {
             "suite": "email@4",
             "suite_digest": "894323cb99caa3ca6e83cac0b9c4fdc307786b324edbd302e976e6d7de4d0b22",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -1796,7 +1805,7 @@
       "prefix": "semver",
       "expansion": "com.tegmentum.ducklink.semver",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e14e539d58b0c06bc893bd17055a34a52944a1fdd8b424961c81454c69f752a6",
+      "content_digest": "50191736e1f680214430b7657910f1b5fcb8dab5dda2e1f504ff0ce96683e9a2",
       "providers": [
         {
           "id": "wasm-component",
@@ -1804,13 +1813,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/semver.wasm",
-          "content_digest": "e14e539d58b0c06bc893bd17055a34a52944a1fdd8b424961c81454c69f752a6",
+          "content_digest": "50191736e1f680214430b7657910f1b5fcb8dab5dda2e1f504ff0ce96683e9a2",
           "conformance": {
             "suite": "semver@4",
             "suite_digest": "49f6f5ab2bcf456ee94112167b48933ce1f731984560550560c791b9ee02ed6b",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -1909,7 +1919,7 @@
       "prefix": "slug",
       "expansion": "com.tegmentum.ducklink.slug",
       "wit_contract_version": "4.0.0",
-      "content_digest": "20a30531dd2a2a8a6d3f7a9f92e54118d05ddcd5e998de0362b861d6b4bf486a",
+      "content_digest": "85562b4ab7f59afaff2c89acfaf7b1fa8e3ba74127c133ea7c1c32bff695b43e",
       "functions": [
         {
           "name": "slugify",
@@ -1963,7 +1973,7 @@
       "prefix": "escape",
       "expansion": "com.tegmentum.ducklink.escape",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2eddf699ee3dc45f07501ef302c69b79d318f21c220e36011c7beb88a76679d7",
+      "content_digest": "d764e23603be77202a0977b921551902150cc7b67499ac57c60396b5b5627390",
       "functions": [
         {
           "name": "html_escape",
@@ -2045,7 +2055,7 @@
       "prefix": "natsort",
       "expansion": "com.tegmentum.ducklink.natsort",
       "wit_contract_version": "4.0.0",
-      "content_digest": "bcd935a235f377a343421708b0f3894b84d0049df717e22479a38dfe115f54f3",
+      "content_digest": "9c4a84c7994a65355516a1b5e78cb2b91c8448008287e7089908a24657714c7f",
       "functions": [
         {
           "name": "natsort_compare",
@@ -2102,7 +2112,7 @@
       "prefix": "roman",
       "expansion": "com.tegmentum.ducklink.roman",
       "wit_contract_version": "4.0.0",
-      "content_digest": "bc5bcebc03a5a6f87f7cf748df2014fc1721151ca491f99d30e5cc85a4ed4c7d",
+      "content_digest": "2421cc60cf4e2bfe4b931f1e550cff56d0740015f6026cf448041a336c7f920b",
       "providers": [
         {
           "id": "wasm-component",
@@ -2110,13 +2120,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/roman.wasm",
-          "content_digest": "bc5bcebc03a5a6f87f7cf748df2014fc1721151ca491f99d30e5cc85a4ed4c7d",
+          "content_digest": "2421cc60cf4e2bfe4b931f1e550cff56d0740015f6026cf448041a336c7f920b",
           "conformance": {
             "suite": "roman@4",
             "suite_digest": "512904f3cdd0188a81e32a429b712a908c385910da65f72d9e015e95f49e0c03",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -2212,7 +2223,7 @@
       "prefix": "humansize",
       "expansion": "com.tegmentum.ducklink.humansize",
       "wit_contract_version": "4.0.0",
-      "content_digest": "c4d3bd2bda49ae28d12cc5861774f36e9d0e0c3457b69eb00a044629b12226ae",
+      "content_digest": "95732363ec9d5999f19118a03ea573c4e5eb9fdc6cc374bbfcbc6eb0e9c9e535",
       "functions": [
         {
           "name": "humansize",
@@ -2276,7 +2287,7 @@
       "prefix": "ids",
       "expansion": "com.tegmentum.ducklink.ids",
       "wit_contract_version": "4.0.0",
-      "content_digest": "753500b9971aae28a8dd32576f2ecebc964227afc9d33d9ccd0554dcde708c74",
+      "content_digest": "461f8e0e1e67422a7723366001b7fc462bd944cb699b7ae6b84a665fe00f2fff",
       "functions": [
         {
           "name": "ulid",
@@ -2339,7 +2350,7 @@
       "prefix": "idna",
       "expansion": "com.tegmentum.ducklink.idna",
       "wit_contract_version": "4.0.0",
-      "content_digest": "4d4c58fdad59663f786bfc6ba73f52b5398cda2fb61be79777263f05a6d8ca3c",
+      "content_digest": "ef5e813ff354d6bfd38b5113b22bd385e81335c4127cebd86224d5d5bded3949",
       "functions": [
         {
           "name": "idna_to_ascii",
@@ -2401,7 +2412,7 @@
       "prefix": "mac",
       "expansion": "com.tegmentum.ducklink.mac",
       "wit_contract_version": "4.0.0",
-      "content_digest": "5ece5e8401753015ff4500e6ae063a7a834ed04bfe5d9bb73eedfdfc44929454",
+      "content_digest": "f2ba422fcfaa359fb9ec6ce1b7e0c359be3e33969e59faf0d55dea4fe8d9ed94",
       "functions": [
         {
           "name": "mac_valid",
@@ -2461,7 +2472,7 @@
       "prefix": "isbn",
       "expansion": "com.tegmentum.ducklink.isbn",
       "wit_contract_version": "4.0.0",
-      "content_digest": "7ebd96b58b19ee071bfa7958e32666867c3ffd0c0e6cfc11e2b598fb4a420157",
+      "content_digest": "c74ac740b432eb25de4a2325d20a6950b6d00cc7c216cad029b45dcc8eb5bd9f",
       "functions": [
         {
           "name": "isbn_valid",
@@ -2523,7 +2534,7 @@
       "prefix": "humantime",
       "expansion": "com.tegmentum.ducklink.humantime",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9d5b0a999188b535c29f64e9dbf50982824b431aad49847c3e0c715f736d1e84",
+      "content_digest": "5d0a710735a2e7f3233b996d42d30ebfa06d52580ced6efc0b517af8c880a3d6",
       "functions": [
         {
           "name": "humantime_parse",
@@ -2586,7 +2597,7 @@
       "prefix": "iso",
       "expansion": "com.tegmentum.ducklink.iso",
       "wit_contract_version": "4.0.0",
-      "content_digest": "990c9961a0b1b9cbcdecb08a2b7121ec04423183a6d4233ca8b265ee0895c517",
+      "content_digest": "4ffe1061aeb851e36002d69558a794487c1b5bad4bf4bf07dec995d677980b9e",
       "functions": [
         {
           "name": "iso_country_name",
@@ -2657,7 +2668,7 @@
       "prefix": "morse",
       "expansion": "com.tegmentum.ducklink.morse",
       "wit_contract_version": "4.0.0",
-      "content_digest": "dc5a1372f6c015b8d1f7456c89dad82fe15f2ac41d044d473ceb4c91e32ebaf2",
+      "content_digest": "68fb4c3405b1ec9efd2d9e10d5eebd58bc130e5e9761816a3e2f41460a3618c0",
       "functions": [
         {
           "name": "morse_encode",
@@ -2719,7 +2730,7 @@
       "prefix": "color",
       "expansion": "com.tegmentum.ducklink.color",
       "wit_contract_version": "4.0.0",
-      "content_digest": "59b26063a05fa5aa35ec31196ba7fc56fb500d793c28fdc5c39ab29f7bdaed3a",
+      "content_digest": "78ace88e50f94945a773f9d02ffd2ca4283dd65d95a4e7efc2eab625e04a660d",
       "functions": [
         {
           "name": "color_luminance",
@@ -2786,7 +2797,7 @@
       "prefix": "geohash",
       "expansion": "com.tegmentum.ducklink.geohash",
       "wit_contract_version": "4.0.0",
-      "content_digest": "13bb70c0776396b89f60fbce06ab70ece524c5e5a72e5cd6d0dbefeab19c9494",
+      "content_digest": "5967073f257b52b358b4794504debc131a232c9706e08e75c5a30ece20ecb64f",
       "providers": [
         {
           "id": "wasm-component",
@@ -2794,13 +2805,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/geohash.wasm",
-          "content_digest": "13bb70c0776396b89f60fbce06ab70ece524c5e5a72e5cd6d0dbefeab19c9494",
+          "content_digest": "5967073f257b52b358b4794504debc131a232c9706e08e75c5a30ece20ecb64f",
           "conformance": {
             "suite": "geohash@4",
             "suite_digest": "0c4a779da6606ebe682fbe3bf150d17d1a6aada4765fcfb96ba3e81ec2434841",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -2884,7 +2896,7 @@
       "prefix": "parsertools",
       "expansion": "com.tegmentum.ducklink.parsertools",
       "wit_contract_version": "4.0.0",
-      "content_digest": "71099489f53c3cb068456fc236e1bb3ecab6307b1f0621145339a50e5f187afe",
+      "content_digest": "8c7dda2a318e85e028cf1d34bfdfabe8a67200c682e23fdcc15ff8506e44fda3",
       "functions": [
         {
           "name": "sql_tables",
@@ -2959,7 +2971,7 @@
       "prefix": "currency",
       "expansion": "com.tegmentum.ducklink.currency",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1e1deff7de8c4af53322b757276d8c059ee48605e053f0b876b2f2f4de1ffae3",
+      "content_digest": "6ecf48a0788874d9faed9bfb73fda4c7d8e05d99c038a3cdf596a1f39a260150",
       "functions": [
         {
           "name": "currency_name",
@@ -3044,7 +3056,7 @@
       "prefix": "hmac",
       "expansion": "com.tegmentum.ducklink.hmac",
       "wit_contract_version": "4.0.0",
-      "content_digest": "37d4d36ced4348cbba14075f70016a3609319177e012519628dabd763da9d62a",
+      "content_digest": "3adcb12c03c9581b34171f27f41ede5c2c28bd163a908d84456d3410deb70aa7",
       "functions": [
         {
           "name": "hmac_sha256",
@@ -3114,7 +3126,7 @@
       "prefix": "phonetic",
       "expansion": "com.tegmentum.ducklink.phonetic",
       "wit_contract_version": "4.0.0",
-      "content_digest": "221d5480d2fbad1d7bd2e2a22a4c0fe6543825623cfce6c239de9f845f3ba686",
+      "content_digest": "c38aff58e7a76f8c0283bf09d649247a014b6a79794f84e20b8fa5eaabcc7f21",
       "functions": [
         {
           "name": "soundex",
@@ -3176,7 +3188,7 @@
       "prefix": "jwt",
       "expansion": "com.tegmentum.ducklink.jwt",
       "wit_contract_version": "4.0.0",
-      "content_digest": "5a42cb0a912085d2c98b0b3f0e19077b93f61c4daec6cc4794fcbabd8d01b1b9",
+      "content_digest": "f3133ceac5ab2bd63293c72a5eb4b5ac08019deab381fd27acf0abd37dafd1cb",
       "functions": [
         {
           "name": "jwt_header",
@@ -3239,7 +3251,7 @@
       "prefix": "totp",
       "expansion": "com.tegmentum.ducklink.totp",
       "wit_contract_version": "4.0.0",
-      "content_digest": "3d8676d2b49de8417f13a4551dff579b2fdc51584673fcab2aa19c30dfdcf4bd",
+      "content_digest": "e38070b719620d8a5b82dca8704ef42a372b94d1de802c1fb78c483416a442e7",
       "functions": [
         {
           "name": "totp",
@@ -3299,7 +3311,7 @@
       "prefix": "baseconv",
       "expansion": "com.tegmentum.ducklink.baseconv",
       "wit_contract_version": "4.0.0",
-      "content_digest": "6daee1281ee28dbce44de9f205b149461295938bc0fbb04062d1de29667e325e",
+      "content_digest": "476ec989af7478a2712903afbf395917c8d01ab6518bb3fd35eadbb3d4c81b5d",
       "functions": [
         {
           "name": "from_base",
@@ -3355,7 +3367,7 @@
       "prefix": "emoji",
       "expansion": "com.tegmentum.ducklink.emoji",
       "wit_contract_version": "4.0.0",
-      "content_digest": "c73b3cab475dcaeebcc0e2e981f82d9341597c816b3c8888079f1ceee377e38b",
+      "content_digest": "685c689cf2b98fbae76eaabd9a50b9d021a717e10f6e7a17c74ba4e70be1cdf7",
       "functions": [
         {
           "name": "emoji_name",
@@ -3429,7 +3441,7 @@
       "prefix": "whatlang",
       "expansion": "com.tegmentum.ducklink.whatlang",
       "wit_contract_version": "4.0.0",
-      "content_digest": "489be5e6d286c228a785fae760c89e170627f56b8df989eb0fb322aaa3382b11",
+      "content_digest": "294a06a3ea12688ef33ecdfb54efd73e70da1ff77265c241534ebc97a479573b",
       "functions": [
         {
           "name": "detect_language",
@@ -3501,7 +3513,7 @@
       "prefix": "ipaddr",
       "expansion": "com.tegmentum.ducklink.ipaddr",
       "wit_contract_version": "4.0.0",
-      "content_digest": "eb81af9c774e0ffa8f5f5dda304ca6e2c838a35331c4e4d4ee7a555bd56dab62",
+      "content_digest": "38f257f8ad0010d74cd7ad663a81ed5a344065622b17228f17aa27cf3bb877ba",
       "functions": [
         {
           "name": "ip_valid",
@@ -3574,7 +3586,7 @@
       "prefix": "mime",
       "expansion": "com.tegmentum.ducklink.mime",
       "wit_contract_version": "4.0.0",
-      "content_digest": "8d76697bf48d13601d242bdb15fcccbc9f448b88934518038705300dc49c1541",
+      "content_digest": "bc6731c074b10d98d8ffc47f7a83c74435ec320cb748341fec6435c046aac4bc",
       "functions": [
         {
           "name": "mime_type",
@@ -3636,7 +3648,7 @@
       "prefix": "pluralize",
       "expansion": "com.tegmentum.ducklink.pluralize",
       "wit_contract_version": "4.0.0",
-      "content_digest": "eb1c51c374fd2e26de080b083e5c58d20fceca02577a08858f17d1b351a89cf2",
+      "content_digest": "159f7b87bff9e8547309cb53f565efe964e088165c7657f075178c63e1683c1b",
       "functions": [
         {
           "name": "pluralize",
@@ -3696,7 +3708,7 @@
       "prefix": "haversine",
       "expansion": "com.tegmentum.ducklink.haversine",
       "wit_contract_version": "4.0.0",
-      "content_digest": "000f0d7a5e79e5d06b855b220286841d2b8b4fed554e0bde5bed51f734ee8368",
+      "content_digest": "84316d8a925d5f51d49e7ccc5e165845f238e2c04dbf4db0fd4525c8a2d22c40",
       "functions": [
         {
           "name": "haversine_km",
@@ -3782,7 +3794,7 @@
       "prefix": "numwords",
       "expansion": "com.tegmentum.ducklink.numwords",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d927a000c931a46b79f93a52fe9879093e22b2f27c79705b1ab176fa8f15e1d5",
+      "content_digest": "a6f1dee126e207bcf998460c5a770570c0cb33f3561eebbb0f54d15e140cafc1",
       "functions": [
         {
           "name": "num_to_words",
@@ -3841,7 +3853,7 @@
       "prefix": "ordinal",
       "expansion": "com.tegmentum.ducklink.ordinal",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f1336e885ec17fffc44bf43c6c0cff6381836c4c61cd710c2c188b0e838bc5c3",
+      "content_digest": "ed9222bda1d7a33576333299f16ad573c8e3746ba8839c2cc0fe49980750037a",
       "functions": [
         {
           "name": "ordinal",
@@ -3889,7 +3901,7 @@
       "prefix": "nato",
       "expansion": "com.tegmentum.ducklink.nato",
       "wit_contract_version": "4.0.0",
-      "content_digest": "a4e313642b0b4c16b71aa58bb1067500f7f3ebf439adee41b8d8d1b94d47f7df",
+      "content_digest": "76e341a3795fe1e04f243771a278767f80a366293ad4fbfb86dae943b38e3f3b",
       "functions": [
         {
           "name": "nato",
@@ -3939,7 +3951,7 @@
       "prefix": "ascii85",
       "expansion": "com.tegmentum.ducklink.ascii85",
       "wit_contract_version": "4.0.0",
-      "content_digest": "aa6401b2df7e8b99ba150f17a7b32948842027d913cf2b0c7396897a89250acf",
+      "content_digest": "ca6b76cc023ffbeb586127c32240710a1603fd222ea8fad13eb1ab84aea7caf8",
       "providers": [
         {
           "id": "wasm-component",
@@ -3947,13 +3959,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/ascii85.wasm",
-          "content_digest": "aa6401b2df7e8b99ba150f17a7b32948842027d913cf2b0c7396897a89250acf",
+          "content_digest": "ca6b76cc023ffbeb586127c32240710a1603fd222ea8fad13eb1ab84aea7caf8",
           "conformance": {
             "suite": "ascii85@4",
             "suite_digest": "df35bc9afa52d8b746e0023d5077fad6823719269b03e3320b9cc3c776703420",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -4017,7 +4030,7 @@
       "prefix": "quotedprintable",
       "expansion": "com.tegmentum.ducklink.quotedprintable",
       "wit_contract_version": "4.0.0",
-      "content_digest": "01c04555a842ec48ff1e52ea94d9959e163d0fa514b7ce49cbfec9313d8b0b63",
+      "content_digest": "2099b3ea8093d09350d31ce272868b412656d295d12f1b0f6c88d5cd64dc70ed",
       "functions": [
         {
           "name": "qp_encode",
@@ -4077,7 +4090,7 @@
       "prefix": "unitconv",
       "expansion": "com.tegmentum.ducklink.unitconv",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2d822a23718ec943f9a4bba8c204d826fa427accc813650bc9d4f696e3bf6c06",
+      "content_digest": "c434ad05004919763d434a0242d1c30a297a865c6ab6e445e47a02bf19554cfa",
       "functions": [
         {
           "name": "unit_convert",
@@ -4135,7 +4148,7 @@
       "prefix": "wordwrap",
       "expansion": "com.tegmentum.ducklink.wordwrap",
       "wit_contract_version": "4.0.0",
-      "content_digest": "b327daa2720263d58972355758b55656b6109e7a1988509c81f72c0ce6d652ed",
+      "content_digest": "ee3e96bc7fc09e2102e80b77d8caf3b589daa0f9800dca8d752a1e34a3665c23",
       "functions": [
         {
           "name": "word_wrap",
@@ -4192,7 +4205,7 @@
       "prefix": "timezone",
       "expansion": "com.tegmentum.ducklink.timezone",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e9af63abc54bddd83a46779d2de17d37025bc2ed0c59c7b4924867eaae004785",
+      "content_digest": "6dc11928728453ecf5afeaa634f07e7bc760c6f257b51b34ee184f4056906cae",
       "functions": [
         {
           "name": "tz_valid",
@@ -4271,7 +4284,7 @@
       "prefix": "rot13",
       "expansion": "com.tegmentum.ducklink.rot13",
       "wit_contract_version": "4.0.0",
-      "content_digest": "853f1edbd0a894042b610f10ddac3e7d35f6b35d80b4ce2b87ea41fee8f0b95f",
+      "content_digest": "9b88cd4e7ca34d0a9868a5e4f3213d4fac57eea8bb4799f17560446f23f0d476",
       "functions": [
         {
           "name": "rot13",
@@ -4334,7 +4347,7 @@
       "prefix": "leetspeak",
       "expansion": "com.tegmentum.ducklink.leetspeak",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1071ebeefbfcc5c5e68d5c1988852ebc60bd540cfdccf8f7430dae5f4276c64b",
+      "content_digest": "d2fb0fb5de0948cf1b1ce4db2ac31931c3f2922f31b8e0c3714f43697d91756f",
       "functions": [
         {
           "name": "to_leet",
@@ -4383,7 +4396,7 @@
       "prefix": "dms",
       "expansion": "com.tegmentum.ducklink.dms",
       "wit_contract_version": "4.0.0",
-      "content_digest": "369cfd6e9e0f8f6d62f6f0adf73147cc10b0f3b8e24fcdd5ef675c1d61abfeed",
+      "content_digest": "d74608332dcafdfefe35abac811f4ce5d5c235323a1b9d331b5d25e50b56b1b6",
       "functions": [
         {
           "name": "dms_to_decimal",
@@ -4455,7 +4468,7 @@
       "prefix": "cbor",
       "expansion": "com.tegmentum.ducklink.cbor",
       "wit_contract_version": "4.0.0",
-      "content_digest": "b1edd9af00ef9da91cb61648a1b7d69ce83bc85ed89ea3fd0f567dd79cb12099",
+      "content_digest": "5d765ff8adfcf941dc6c7f9b28ee7ced2efc55ad4e46737d12189174125b4299",
       "functions": [
         {
           "name": "cbor_from_json",
@@ -4519,7 +4532,7 @@
       "prefix": "msgpack",
       "expansion": "com.tegmentum.ducklink.msgpack",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9d9493ad245bec6b19d862bfb2489ad65e38b3ddcf5284916d9d6557a9b2f1eb",
+      "content_digest": "14a60d0dc7f6aaba2695bf3eeea4f2f89103cedbc7f071071916e3e90a6582fb",
       "functions": [
         {
           "name": "msgpack_from_json",
@@ -4582,7 +4595,7 @@
       "prefix": "elements",
       "expansion": "com.tegmentum.ducklink.elements",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d5025c0726ba08a0af77d8bed15d1f25da0eb77f789b82b4b35aaed4a84692ee",
+      "content_digest": "35d2137f91a9709f11ec61b060d70c80c583e5ee289dd6e68e0eda0b96a8628e",
       "functions": [
         {
           "name": "element_name",
@@ -4653,7 +4666,7 @@
       "prefix": "vigenere",
       "expansion": "com.tegmentum.ducklink.vigenere",
       "wit_contract_version": "4.0.0",
-      "content_digest": "dbddcbf2d8f5d70b59fa7c602432a6d352ae3be1c93671aef764e4f0a7d0a11a",
+      "content_digest": "74f00b669950b38cfd85a13458036216cd745298c40b65e1afc3633b4c888685",
       "functions": [
         {
           "name": "vigenere_encrypt",
@@ -4722,7 +4735,7 @@
       "prefix": "petname",
       "expansion": "com.tegmentum.ducklink.petname",
       "wit_contract_version": "4.0.0",
-      "content_digest": "60f00cb6693cc1ad9eb492f3fa44a966d3e4e936adae1c91cc1a3a1981c8e6d8",
+      "content_digest": "5519a3066ce209b3fae7fdb556663817ff4b686e5c94e562ee1952915fda24e2",
       "functions": [
         {
           "name": "petname",
@@ -4777,7 +4790,7 @@
       "prefix": "base58check",
       "expansion": "com.tegmentum.ducklink.base58check",
       "wit_contract_version": "4.0.0",
-      "content_digest": "3affac5d7b7abdefd34151146402332d19515154a07a1cd196a9c9f7c296e780",
+      "content_digest": "08f4d1d8083c0e89260600994dce28ca138e4c8f50071650b764823653d93338",
       "functions": [
         {
           "name": "base58check_encode",
@@ -4842,7 +4855,7 @@
       "prefix": "checksums",
       "expansion": "com.tegmentum.ducklink.checksums",
       "wit_contract_version": "4.0.0",
-      "content_digest": "31d5a0d6ed45c9115c61cfb74cc45c6439ede15da09afc06c370d76e744720dc",
+      "content_digest": "6f526ddc9400e387b6f96d3d76f91068e859e234eb92ff262048783ed097709b",
       "functions": [
         {
           "name": "crc16",
@@ -4925,7 +4938,7 @@
       "prefix": "siphash",
       "expansion": "com.tegmentum.ducklink.siphash",
       "wit_contract_version": "4.0.0",
-      "content_digest": "7036958d0d3c8150d575e70bb906162098687553bb029882ee15a05c7aaa1235",
+      "content_digest": "61d8a888df0facb7abf91f589a7a44c4a31674efae42bceeb439f4bb34df03eb",
       "functions": [
         {
           "name": "siphash",
@@ -4986,7 +4999,7 @@
       "prefix": "tiktoken",
       "expansion": "com.tegmentum.ducklink.tiktoken",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1e13e02b207ef1af312b37c2ff39414639a9b08579c6cac79d3037353eeef0a9",
+      "content_digest": "94ea70cc183bceacbe8a346a35d2c62c5b8c6cdd7f35984f41d109436450ccd6",
       "functions": [
         {
           "name": "tiktoken_count",
@@ -5073,7 +5086,7 @@
       "prefix": "bech32",
       "expansion": "com.tegmentum.ducklink.bech32",
       "wit_contract_version": "4.0.0",
-      "content_digest": "81540239da375d5c9aaae5fa4025f7535b5fe87b01650c73723cfc97d79a4e41",
+      "content_digest": "dcf68ecfc692aa90135f37b35d2007bc8cb86364ef7db6330c399d6566fe267d",
       "functions": [
         {
           "name": "bech32_encode",
@@ -5161,7 +5174,7 @@
       "prefix": "uuid5",
       "expansion": "com.tegmentum.ducklink.uuid5",
       "wit_contract_version": "4.0.0",
-      "content_digest": "3756ab4ac386cdc18fb26b583a28c1fbcfb8fa618adf30d59aa165faa50a8000",
+      "content_digest": "537542a0565be59c61eff5981afbd66c14f7c7d8bc147a200335fdc59da783db",
       "functions": [
         {
           "name": "uuid_v5",
@@ -5231,7 +5244,7 @@
       "prefix": "gravatar",
       "expansion": "com.tegmentum.ducklink.gravatar",
       "wit_contract_version": "4.0.0",
-      "content_digest": "cd86927d0ce74de51f57a68eecaa710c4a0f8efc90ab35dd609e4d140b65852a",
+      "content_digest": "923be983601dd5ab5fb6e27849fdb65c9391beb81f1bfba6df5de7fb1ba61d84",
       "functions": [
         {
           "name": "gravatar_hash",
@@ -5292,7 +5305,7 @@
       "prefix": "html2text",
       "expansion": "com.tegmentum.ducklink.html2text",
       "wit_contract_version": "4.0.0",
-      "content_digest": "db63a64915e8a889c2e5a9d31746bb269900fbc8541a841e0ccbc0bc98ee9863",
+      "content_digest": "fa89be624c678640f56fba211f617cce981f13f143a8242bb4ef5d93c78038b0",
       "functions": [
         {
           "name": "html_to_text",
@@ -5344,7 +5357,7 @@
       "prefix": "textstat",
       "expansion": "com.tegmentum.ducklink.textstat",
       "wit_contract_version": "4.0.0",
-      "content_digest": "11e67884419795031354a359d232346426480d7a6a53f34f49bac8b41c59e5e5",
+      "content_digest": "67ad3c68d1ba52bd7fd9e5661a1575babbfe991013076573999c6306c069b840",
       "functions": [
         {
           "name": "word_count",
@@ -5439,7 +5452,7 @@
       "prefix": "hashids",
       "expansion": "com.tegmentum.ducklink.hashids",
       "wit_contract_version": "4.0.0",
-      "content_digest": "544585037199c6f32d740316f038b396f51c86ae578bfab98476d671bbde1201",
+      "content_digest": "ce3a2542aeeb0174911da243325fe85e8fbaa896aac7be4d5cf6d80c47f631ec",
       "functions": [
         {
           "name": "hashids_encode",
@@ -5509,7 +5522,7 @@
       "prefix": "checkdigit",
       "expansion": "com.tegmentum.ducklink.checkdigit",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d9bb06fc924e3958b7e6767d69926a9f45347ee300b9d3ed06dc2a77579d8e24",
+      "content_digest": "91bbc152ab777b5ef59b1f8572fb77f6451215f7d0dc1ce23c2179ecef509dcf",
       "functions": [
         {
           "name": "verhoeff_validate",
@@ -5594,7 +5607,7 @@
       "prefix": "dice",
       "expansion": "com.tegmentum.ducklink.dice",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2cbaf07afd0d95c008cf971495ba0fcc6b0034bdd6d97ce45085e3a6b4e1ba8d",
+      "content_digest": "2e08d12ef99a0d426bfcfb6cc7dd9d3dd4180ca11cda7463641f01361e699385",
       "functions": [
         {
           "name": "dice_roll",
@@ -5665,7 +5678,7 @@
       "prefix": "graycode",
       "expansion": "com.tegmentum.ducklink.graycode",
       "wit_contract_version": "4.0.0",
-      "content_digest": "489defa46a4e74904b279a01b43c1df53de8ba4aa314943bb06ccc982c9dcbb8",
+      "content_digest": "932f2276c3ac44644502050730111b67227b829dc9c775e7f2b7eb6cf40cb856",
       "functions": [
         {
           "name": "gray_encode",
@@ -5724,7 +5737,7 @@
       "prefix": "cardtype",
       "expansion": "com.tegmentum.ducklink.cardtype",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9874307a8e9a306ff6140cb0c1eb236f7db1962abbf6da31faf53bb8d0d0657c",
+      "content_digest": "59db3a2e2c4004389adbd38af664c887e1da5eedd88a121b2d002abb76e86711",
       "functions": [
         {
           "name": "card_brand",
@@ -5774,7 +5787,7 @@
       "prefix": "money",
       "expansion": "com.tegmentum.ducklink.money",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9d53ba4823b2dbfe02efc4e36cdd5c3d1b2823694d2b06264e862e3d6a290060",
+      "content_digest": "03e096dc2a1f9897230d440636a252e48730c4732ed5c3462c34949c00d13261",
       "functions": [
         {
           "name": "format_money",
@@ -5829,7 +5842,7 @@
       "prefix": "ngrams",
       "expansion": "com.tegmentum.ducklink.ngrams",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1bb0c3e87e8274e5b926a79ee44cfd96f38ddbd85751bd338cc889bd0fd9a7fb",
+      "content_digest": "34722b0fc920e2a2e262baca694c7fd0954ea2363ea666e0ac5806621d045b38",
       "functions": [
         {
           "name": "char_ngrams",
@@ -5898,7 +5911,7 @@
       "prefix": "stem",
       "expansion": "com.tegmentum.ducklink.stem",
       "wit_contract_version": "4.0.0",
-      "content_digest": "7ae880c033917bd1280de99a2865c32a3576778ff556fc589c05d64e7c248d33",
+      "content_digest": "c481c826058aea69054e9d3041d30ff0b6517a392f6dd85e5a116d4f0ad1b5e2",
       "functions": [
         {
           "name": "stem",
@@ -5952,7 +5965,7 @@
       "prefix": "transliterate",
       "expansion": "com.tegmentum.ducklink.transliterate",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f5fbbeed4ac863cb78fc223e145ee683803a61ea2b99697f0c7e4f9b019d9547",
+      "content_digest": "026512c1590598fa2737b7aa0b3a8422aed3320d959fdd539f0057cc972e477e",
       "functions": [
         {
           "name": "deunicode",
@@ -6006,7 +6019,7 @@
       "prefix": "pluscode",
       "expansion": "com.tegmentum.ducklink.pluscode",
       "wit_contract_version": "4.0.0",
-      "content_digest": "edfd8a9c5c60d6499bb5d98c031c3679545b743c93b4e758cd4515e296861306",
+      "content_digest": "3c797495cc754c39297ec8fecb340dafb3546d2fe66bd773dfcf0e9d7916ac3c",
       "functions": [
         {
           "name": "pluscode_encode",
@@ -6095,7 +6108,7 @@
       "prefix": "rot47",
       "expansion": "com.tegmentum.ducklink.rot47",
       "wit_contract_version": "4.0.0",
-      "content_digest": "6bdd8d4a9baf8101b9b16614a9b0f308c2220729f1bff14c6918d65cf9a262a9",
+      "content_digest": "fddc88a0191b019b434ed71ccb9a78048d8a479d3e530980b78e04dd0d5cab52",
       "functions": [
         {
           "name": "rot47",
@@ -6146,7 +6159,7 @@
       "prefix": "stopwords",
       "expansion": "com.tegmentum.ducklink.stopwords",
       "wit_contract_version": "4.0.0",
-      "content_digest": "df2b8970b0171f6ec401864379b13acb90269c9254519048c608efcaf5fa3073",
+      "content_digest": "03492d94fc06905cdb7324df41dea442d22761d616e38f80f14f3c5ffb412285",
       "functions": [
         {
           "name": "is_stopword",
@@ -6214,7 +6227,7 @@
       "prefix": "isbnconv",
       "expansion": "com.tegmentum.ducklink.isbnconv",
       "wit_contract_version": "4.0.0",
-      "content_digest": "c40a6763cd62cbd6bbb1f54138e4ab7c027396b584e2e3e5481703812dba59c5",
+      "content_digest": "1e38ddd1bd100e1ed574ded66af53cb458ccb7e1b638018d05dd8b37579ec27e",
       "functions": [
         {
           "name": "isbn10_to_13",
@@ -6276,7 +6289,7 @@
       "prefix": "passgen",
       "expansion": "com.tegmentum.ducklink.passgen",
       "wit_contract_version": "4.0.0",
-      "content_digest": "fd1e18a9f3601f154020c94fbfc893f4151eec6adb4ce784b5b04080b4ed7c82",
+      "content_digest": "5bf1e4e3c4a6036f2d3e9550590afbde1d93a1013e1d40a130fd7248a8c2f42e",
       "functions": [
         {
           "name": "gen_password",
@@ -6335,7 +6348,7 @@
       "prefix": "braille",
       "expansion": "com.tegmentum.ducklink.braille",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1b547602169618fcb63a08531d5ab7a1a5262c65f4c87cfd91a0ee64e0e69135",
+      "content_digest": "66ddde696ba8818df0eab3451c3c0b90285170848c20fbdc68e5b8ea8ebecabb",
       "functions": [
         {
           "name": "to_braille",
@@ -6387,7 +6400,7 @@
       "prefix": "toml",
       "expansion": "com.tegmentum.ducklink.toml",
       "wit_contract_version": "4.0.0",
-      "content_digest": "b2357f6e77fc12eea20de7c31f3afb566086462860542242225f8dc6ce2b16a5",
+      "content_digest": "147926ae9ade4302eed438d80f35c8e4bb53235656f3122f479d2ccdb1f09869",
       "functions": [
         {
           "name": "toml_to_json",
@@ -6450,7 +6463,7 @@
       "prefix": "yaml",
       "expansion": "com.tegmentum.ducklink.yaml",
       "wit_contract_version": "4.0.0",
-      "content_digest": "44c202e9310ca16012b7f721c619413a0dfef3d9ea204382666a7d7865ce06f5",
+      "content_digest": "2446af404fc86f84ea758e4165c442a46329fbfa560b0326b1529f83c3c4607f",
       "functions": [
         {
           "name": "yaml_to_json",
@@ -6514,7 +6527,7 @@
       "prefix": "unicodenorm",
       "expansion": "com.tegmentum.ducklink.unicodenorm",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f401ef59e3dbda47e1d614d2ceea095f28ef28cbb1f61a63476d26ae9fafc2ca",
+      "content_digest": "093f45a4ecd63a2012a1a8aa779e5725e8c93973234a1ebfb649851f7dc9606b",
       "functions": [
         {
           "name": "nfc",
@@ -6599,7 +6612,7 @@
       "prefix": "unicodewidth",
       "expansion": "com.tegmentum.ducklink.unicodewidth",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2e2d0d63b69cb77a4937e8d4f651abf906af0d086649ff522ebfbc59dfd4c6fe",
+      "content_digest": "29ee6a9dfaa674bea2412b95aa9a809340339e82d6daed1c84a94d1ab452b919",
       "functions": [
         {
           "name": "grapheme_count",
@@ -6660,7 +6673,7 @@
       "prefix": "colorconv",
       "expansion": "com.tegmentum.ducklink.colorconv",
       "wit_contract_version": "4.0.0",
-      "content_digest": "30a26d9dfde2e9cd8683b162447346c9196831b5d51d2c725d97c0bbf8f3ab9f",
+      "content_digest": "dc3fb9830b141b6e82396a8de3c832723a9c6d311b6f29c44f304c6ff38bc96a",
       "functions": [
         {
           "name": "hex_to_hsl",
@@ -6740,7 +6753,7 @@
       "prefix": "jsonschema",
       "expansion": "com.tegmentum.ducklink.jsonschema",
       "wit_contract_version": "4.0.0",
-      "content_digest": "0716c163a4d98d8d72abc72f21924225781f63d508d466832927fd1e9ca0a5f3",
+      "content_digest": "b920068681e22ac01231d6289b0ad5812b9dad563139ead4e1ab4278b46e952c",
       "functions": [
         {
           "name": "json_schema_valid",
@@ -6793,7 +6806,7 @@
       "prefix": "simhash",
       "expansion": "com.tegmentum.ducklink.simhash",
       "wit_contract_version": "4.0.0",
-      "content_digest": "5ad96281afab64759475d76c4a37f8715d055b3e714cae5f8831726074f342e3",
+      "content_digest": "fa264596464f5811031a082c0a0b0b34420a4f0b21784a7e07ff73d576cf61bd",
       "functions": [
         {
           "name": "simhash",
@@ -6860,7 +6873,7 @@
       "prefix": "idextra",
       "expansion": "com.tegmentum.ducklink.idextra",
       "wit_contract_version": "4.0.0",
-      "content_digest": "6c2fcd876a48b0b039c163f1703ad9a0dcf1a6c462c524dd9107535758d6b262",
+      "content_digest": "dc85613c8303bd7082c695aa50dc452770e2f181db32100cbf2351ccd5e4c110",
       "functions": [
         {
           "name": "ksuid",
@@ -6913,7 +6926,7 @@
       "prefix": "phonetic2",
       "expansion": "com.tegmentum.ducklink.phonetic2",
       "wit_contract_version": "4.0.0",
-      "content_digest": "c614d5130951ee365e3861b436e7bbe55221cc011a09569c61bbf39f48522667",
+      "content_digest": "f0bf6207f8c32294b1f5b5cf6cc7bf17d11699c63cc338ae67d5c349fb8955f8",
       "functions": [
         {
           "name": "nysiis",
@@ -6986,7 +6999,7 @@
       "prefix": "z85",
       "expansion": "com.tegmentum.ducklink.z85",
       "wit_contract_version": "4.0.0",
-      "content_digest": "23d78954e180a980af73a6f11451b41d0f12d04fead451bbf3fa0a9c6e76c440",
+      "content_digest": "91cf984bcde740137802ca0760c47d0719671807ded37d8279e6e6b8a538ab5e",
       "functions": [
         {
           "name": "z85_encode",
@@ -7046,7 +7059,7 @@
       "prefix": "initials",
       "expansion": "com.tegmentum.ducklink.initials",
       "wit_contract_version": "4.0.0",
-      "content_digest": "3688fc4b8ac7cf0c4d480978ac29f4d8390d6955b344b5dca2dd509c3ad2e7a2",
+      "content_digest": "ee3e5e71ab719fc72c8f0d2b2b345e0ff8136a6850323133fbac2ef1168ee68d",
       "functions": [
         {
           "name": "initials",
@@ -7106,7 +7119,7 @@
       "prefix": "luhngen",
       "expansion": "com.tegmentum.ducklink.luhngen",
       "wit_contract_version": "4.0.0",
-      "content_digest": "c1b5e8de10d8849cc28862a9de349a05a349c642858cfc411e7de58d2b087024",
+      "content_digest": "f8ee7a1ba7ee12c16e83109e9a69103961c8fdead739eb8ef670ae2fce860b79",
       "functions": [
         {
           "name": "luhn_check_digit",
@@ -7164,7 +7177,7 @@
       "crates": [],
       "min_duckdb_version": "1.0.0",
       "wit_contract_version": "4.0.0",
-      "content_digest": "06ec7392a84fa342747c1fc89bb0f3455596cda80c0d77a3273c0a8804214ee1",
+      "content_digest": "e54b36bfb58a41da426ba0d8823c4bc85d0e6e436e3637fe1d73b6e38a9f0c54",
       "functions": [
         {
           "name": "pin_probe",
@@ -7206,7 +7219,7 @@
       "crates": [],
       "min_duckdb_version": "1.0.0",
       "wit_contract_version": "4.0.0",
-      "content_digest": "4333e5026bd95df1fa1337c5f390fbc940daf16e8a0e02340f45673e3fe10901",
+      "content_digest": "3768199fb35f13dd8253f1aba26ccfff98381bb4b07d560a3ac8e063d390f894",
       "functions": [
         {
           "name": "pin_probe",
@@ -7249,7 +7262,7 @@
       "prefix": "atbash",
       "expansion": "com.tegmentum.ducklink.atbash",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d90c1c3563a5421bcb104e815f666e847d90bfee5891b5bdb6e890688329db0a",
+      "content_digest": "da6ffb4f6f6f2a6075169002cce022e2df15443dc09077c42a870ee0803e2fd6",
       "providers": [
         {
           "id": "wasm-component",
@@ -7257,13 +7270,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/atbash.wasm",
-          "content_digest": "d90c1c3563a5421bcb104e815f666e847d90bfee5891b5bdb6e890688329db0a",
+          "content_digest": "da6ffb4f6f6f2a6075169002cce022e2df15443dc09077c42a870ee0803e2fd6",
           "conformance": {
             "suite": "atbash@4",
             "suite_digest": "618f290b2e4031a00c48453fbfbff5c9128d05f124adbfe12e71eb813493e719",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -7313,7 +7327,7 @@
       "prefix": "piglatin",
       "expansion": "com.tegmentum.ducklink.piglatin",
       "wit_contract_version": "4.0.0",
-      "content_digest": "bf2715913e6d673de258b1d8865e25dbbfa5cf8b8f2e8bd25f28e20e30372ac3",
+      "content_digest": "39e937afb02ed3a8fac17a4acd24d89b9fd03a8d023e87affdc5b80253d1f445",
       "functions": [
         {
           "name": "to_pig_latin",
@@ -7362,7 +7376,7 @@
       "prefix": "rle",
       "expansion": "com.tegmentum.ducklink.rle",
       "wit_contract_version": "4.0.0",
-      "content_digest": "8198728f27d7a74d39a3eaee01deaadc1fe1c516c189b4075e6b6e901bb77655",
+      "content_digest": "16e45533a8cf02a3ba5a044280d5c5053d634136e6c9987acd347f16b5567df1",
       "functions": [
         {
           "name": "rle_encode",
@@ -7421,7 +7435,7 @@
       "prefix": "bbcode",
       "expansion": "com.tegmentum.ducklink.bbcode",
       "wit_contract_version": "4.0.0",
-      "content_digest": "cfba346e27f5ce219b0653078a38fc409c6fa6dbbd7b9fb109ee8bc01f38e563",
+      "content_digest": "6ff22f6b3ba698ecad8f08bed2b1befd359e2771d5f0dbfe8187b725378a9812",
       "functions": [
         {
           "name": "bbcode_to_html",
@@ -7473,7 +7487,7 @@
       "prefix": "phonenumber",
       "expansion": "com.tegmentum.ducklink.phonenumber",
       "wit_contract_version": "4.0.0",
-      "content_digest": "6d333dace53cdc83424b0a11f628a7f9d6d838131c7bc42a5a7ecc59446301a0",
+      "content_digest": "fe8d6e914546ae738b682e9391c98e1dde4bebe6db591d398f3b6f47bda774d0",
       "functions": [
         {
           "name": "phone_valid",
@@ -7562,7 +7576,7 @@
       "prefix": "pwstrength",
       "expansion": "com.tegmentum.ducklink.pwstrength",
       "wit_contract_version": "4.0.0",
-      "content_digest": "33ff2e166c0fd6b2bf681648468b7273f64f48d98140ef9a6f3199eaa28f0af2",
+      "content_digest": "ba0abfd648d3f5b9ad374e4d3839e039a879c317914e9898d49b679dbc025502",
       "functions": [
         {
           "name": "password_score",
@@ -7623,7 +7637,7 @@
       "prefix": "qrcode",
       "expansion": "com.tegmentum.ducklink.qrcode",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9721e490d94e9e7a2b9069dac5725e0f11209befc20566023b3db39f1ed9e911",
+      "content_digest": "76679efabfad700beb510375900d1c1f728c6eb47122439275de1ad8fe135994",
       "functions": [
         {
           "name": "qr_svg",
@@ -7671,7 +7685,7 @@
       "prefix": "aggstat",
       "expansion": "com.tegmentum.ducklink.aggstat",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1f7307b77993a9eb300681224eedb741ffa4109c4746e5dbdd42efde88756287",
+      "content_digest": "cde65cb1e7f55d30a8e135c6a2110c57b4833c1760532279233cd11f3131e5be",
       "providers": [
         {
           "id": "wasm-component",
@@ -7679,13 +7693,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/aggstat.wasm",
-          "content_digest": "1f7307b77993a9eb300681224eedb741ffa4109c4746e5dbdd42efde88756287",
+          "content_digest": "cde65cb1e7f55d30a8e135c6a2110c57b4833c1760532279233cd11f3131e5be",
           "conformance": {
             "suite": "aggstat@4",
             "suite_digest": "14eec21dc0c9373b3c83730b7d2b0d11615595e2fafea5005828a9992a34093e",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -7737,7 +7752,7 @@
       "prefix": "bloom",
       "expansion": "com.tegmentum.ducklink.bloom",
       "wit_contract_version": "4.0.0",
-      "content_digest": "079e7fcbdfbd6394ba87c4f751908c4d9860dd6273bc6c6a4aaf644c2d5a5cf2",
+      "content_digest": "ffc5528f8c0f81f99145d5d54eb6cf08ffad022901fbd9033077f7067c587bfb",
       "functions": [
         {
           "name": "bloom_contains",
@@ -7802,7 +7817,7 @@
       "prefix": "minhash",
       "expansion": "com.tegmentum.ducklink.minhash",
       "wit_contract_version": "4.0.0",
-      "content_digest": "5a351426970e986dd74db66825f91b92547881b375ba7bdd5e98c8170d150048",
+      "content_digest": "6b12e60021db92f754211cbeb8b29ecdc643f0e1c39883f8fc60a61dc8b1ba36",
       "functions": [
         {
           "name": "minhash_similarity",
@@ -7867,7 +7882,7 @@
       "prefix": "countmin",
       "expansion": "com.tegmentum.ducklink.countmin",
       "wit_contract_version": "4.0.0",
-      "content_digest": "69abf67f1ee8e04f9b21211551d3dbf89ee51ca34ddfc69a02e4594867c987a9",
+      "content_digest": "a4f17308cd177afa7c9795df4fc955cf3bf0ca373a4b3aea567979e1ba10a6fb",
       "functions": [
         {
           "name": "cms_estimate",
@@ -7932,7 +7947,7 @@
       "prefix": "dns",
       "expansion": "com.tegmentum.ducklink.dns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "03ef3b433eaaf1ce64c1f37288298f80de82e92151962566cb5e2e6f3a61accd",
+      "content_digest": "84c62d4bbd738b4a9ee1d41d42926adfb4936eaffc387a01d27c380e0ed3a770",
       "functions": [
         {
           "name": "dns_lookup",
@@ -7998,7 +8013,7 @@
       "prefix": "httpclient",
       "expansion": "com.tegmentum.ducklink.httpclient",
       "wit_contract_version": "4.0.0",
-      "content_digest": "be52228fd2724cdbf6ed73e0762e9253b67c6a2d2b18257a0c182a2ca60d9969",
+      "content_digest": "5fc306269a96b434913f159075383e97649dd3b16bf69a67d21db24019bd3bf5",
       "functions": [
         {
           "name": "http_get",
@@ -8075,7 +8090,7 @@
       "prefix": "lorem",
       "expansion": "com.tegmentum.ducklink.lorem",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ae45ed592e741a737b3c3469dceb1fe271c4847a83beb7bfc7b4459507db0744",
+      "content_digest": "db119f3573aa8db6468c6ecf4438fc383544ea4f57fd5cfbb26b0955fe09fa46",
       "functions": [
         {
           "name": "lorem_words",
@@ -8135,7 +8150,7 @@
       "prefix": "faker",
       "expansion": "com.tegmentum.ducklink.faker",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9880bcd806e9658946193460cc3310d9e766f83cb0d9b7390a78ed3aca03fd73",
+      "content_digest": "6bcf7aec31c6adab1bd2c0a4122081461ed99fb31affddf9ee1dd46280526b7b",
       "functions": [
         {
           "name": "fake_name",
@@ -8204,7 +8219,7 @@
       "prefix": "passphrase",
       "expansion": "com.tegmentum.ducklink.passphrase",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e20d419a9068ed2739d562484e670df319d8441ccb4f26b556648e08ebd277d6",
+      "content_digest": "1fcb4f1398d1fb8085a7fba5c997e0486038caba379a4ea9e5c4bee1cbc77037",
       "functions": [
         {
           "name": "passphrase",
@@ -8254,7 +8269,7 @@
       "prefix": "h3",
       "expansion": "com.tegmentum.ducklink.h3",
       "wit_contract_version": "4.0.0",
-      "content_digest": "41a6224daf315dfd2c417fb20268096d5fb9f2d2a09bf9844264c223fc77f120",
+      "content_digest": "b1c79dd5c00dc0cea0ad2f34c20d7d77180a3d0a3967e68edc6d83cfb6a6957d",
       "providers": [
         {
           "id": "wasm-component",
@@ -8262,13 +8277,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/h3.wasm",
-          "content_digest": "41a6224daf315dfd2c417fb20268096d5fb9f2d2a09bf9844264c223fc77f120",
+          "content_digest": "b1c79dd5c00dc0cea0ad2f34c20d7d77180a3d0a3967e68edc6d83cfb6a6957d",
           "conformance": {
             "suite": "h3@4",
             "suite_digest": "bdac7a0ab7cc22fe084b3064a14a558c6ad77ed08691726f94b24fc126fb63dc",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -8394,7 +8410,7 @@
       "prefix": "lindel",
       "expansion": "com.tegmentum.ducklink.lindel",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1c5eaf086d1bb2503e0a4ba546ab0d3357d0bc71f6fdbee419b66a0afbb228b0",
+      "content_digest": "e83af9ebbb1d7ba6b06c04d80af14d114aec676d456c5cf66283e51e1984cc06",
       "functions": [
         {
           "name": "morton_encode",
@@ -8510,7 +8526,7 @@
       "prefix": "magic",
       "expansion": "com.tegmentum.ducklink.magic",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1088597b322019497235b1c126da6577880f916c50adc9c5a03d963adb8a8c8f",
+      "content_digest": "c2a0d8dfc124d0d373a789dd4e325fa461e6ea0370ab5bd89b8844f80728ed8d",
       "functions": [
         {
           "name": "magic_mime",
@@ -8594,7 +8610,7 @@
       "prefix": "tsid",
       "expansion": "com.tegmentum.ducklink.tsid",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d955776e0adace0eb1506634dd9c2e86c524babc125e278c8705ca120c727535",
+      "content_digest": "d900348ea6b8263bffad39ed74d02443a4d6b760ab79ac19aa592229558f0f68",
       "functions": [
         {
           "name": "tsid_encode",
@@ -8679,7 +8695,7 @@
       "prefix": "rhai",
       "expansion": "com.tegmentum.ducklink.rhai",
       "wit_contract_version": "4.0.0",
-      "content_digest": "9dd91831e8012f3305eeea3cf2116c741cf219dca28b2efc27adf6a7e64de165",
+      "content_digest": "e86e9f36aecdb344eedc42e4dd5b6af2a387e3471d97bf7cec606d1ccc7b56ef",
       "functions": [
         {
           "name": "rhai_eval",
@@ -8754,7 +8770,7 @@
       "prefix": "bitfilters",
       "expansion": "com.tegmentum.ducklink.bitfilters",
       "wit_contract_version": "4.0.0",
-      "content_digest": "99ce291947229c84f66d1e74ba5d4e5fdfbcf73b0ab4d69b9b1d86e3db1e3267",
+      "content_digest": "08b0797c2dca186962ce2099d9370f9d20f6c05e93b2ed56341aa885f5086c6a",
       "functions": [
         {
           "name": "xor_filter_contains",
@@ -8814,7 +8830,7 @@
       "prefix": "prql",
       "expansion": "com.tegmentum.ducklink.prql",
       "wit_contract_version": "4.0.0",
-      "content_digest": "bf337d1feee0a20c6d39232550051c21bb72f973a4621ec3918c2eecdafb7687",
+      "content_digest": "4be949b6c2cd8ee2d677193646f2951fefa1177319ee92b87bf71add0d1db93e",
       "functions": [
         {
           "name": "prql_to_sql",
@@ -8872,7 +8888,7 @@
       "prefix": "jaq",
       "expansion": "com.tegmentum.ducklink.jaq",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f9d9a4e882338fbc73fc021854d2cc7be453e4722b3ea0dbb3f297bfcaedf0c7",
+      "content_digest": "faa452af886d1aefb7e9b314b52bda4b54ca6b1ab5febbcda36b5313a527813c",
       "functions": [
         {
           "name": "jq",
@@ -8937,7 +8953,7 @@
       "prefix": "cron",
       "expansion": "com.tegmentum.ducklink.cron",
       "wit_contract_version": "4.0.0",
-      "content_digest": "345947606146386883baebb81094257d4dcb412525adac71146e8263373cc0ea",
+      "content_digest": "994a33a9588bef95ce1e5e0e282c59df32cf6540c40e12feba1a163e4adc0758",
       "functions": [
         {
           "name": "cron_is_valid",
@@ -9013,7 +9029,7 @@
       "prefix": "xml",
       "expansion": "com.tegmentum.ducklink.xml",
       "wit_contract_version": "4.0.0",
-      "content_digest": "10c8cc7718e62c3551a5eba0bb06eefdb1aacc5d79649c9fe354656beade613b",
+      "content_digest": "7f630466cf86736e3d267596dc73012f6fbea7949425fe37c10d1ecf98bc7612",
       "functions": [
         {
           "name": "xml_valid",
@@ -9089,7 +9105,7 @@
       "prefix": "pinyin",
       "expansion": "com.tegmentum.ducklink.pinyin",
       "wit_contract_version": "4.0.0",
-      "content_digest": "88206048592d844b9433db628290c75dc79bb1649896af2b16931a2def70be14",
+      "content_digest": "43735b6ee494184519c15cf8f931e3c847b41c2d2e14f2b7ef926bc8e109afab",
       "functions": [
         {
           "name": "to_pinyin",
@@ -9156,7 +9172,7 @@
       "prefix": "sqlformat",
       "expansion": "com.tegmentum.ducklink.sqlformat",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1eb1c1ff7b4e271894b985c28b17366fa41601f567301bc40f7e263f5f9cd909",
+      "content_digest": "26e3b882f7edc0e1f6b449d2fe78a8c5adb3e28529d9d2f1af13d282f79c9d78",
       "functions": [
         {
           "name": "sql_format",
@@ -9212,7 +9228,7 @@
       "prefix": "bencode",
       "expansion": "com.tegmentum.ducklink.bencode",
       "wit_contract_version": "4.0.0",
-      "content_digest": "7c04e08c7d71c0a426693ccf2e6e64c5107f51d6e314ae02e33b5cdab5e79801",
+      "content_digest": "252dce17cd1273ad08a350023a8d6fd2ad582e5b12d2b4c3ac9ab1022de7240a",
       "functions": [
         {
           "name": "bencode_to_json",
@@ -9267,7 +9283,7 @@
       "prefix": "maidenhead",
       "expansion": "com.tegmentum.ducklink.maidenhead",
       "wit_contract_version": "4.0.0",
-      "content_digest": "dc21d530d9b4fd7de31016accdf4669d2e2d9bc556a99e3722618dfa661ab4e0",
+      "content_digest": "e5a6141b36895514eb951ed4127bba8c61b4fafea81072a2f302ec7ccd101b00",
       "functions": [
         {
           "name": "to_maidenhead",
@@ -9342,7 +9358,7 @@
       "prefix": "base45",
       "expansion": "com.tegmentum.ducklink.base45",
       "wit_contract_version": "4.0.0",
-      "content_digest": "83cc90d658a8a0269c9941a13348148dc9c4717498875dadabfc5a7e91b09f83",
+      "content_digest": "d0695a6583a78e593cabfea345a18e98205993a898e19361d7087255ba4b77e8",
       "providers": [
         {
           "id": "wasm-component",
@@ -9350,13 +9366,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/base45.wasm",
-          "content_digest": "83cc90d658a8a0269c9941a13348148dc9c4717498875dadabfc5a7e91b09f83",
+          "content_digest": "d0695a6583a78e593cabfea345a18e98205993a898e19361d7087255ba4b77e8",
           "conformance": {
             "suite": "base45@4",
             "suite_digest": "e57aa548585622a8e25905b4c4ca03f1f27d95cda9e07ea49f2746a719b00a7b",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -9412,7 +9429,7 @@
       "prefix": "numfmt",
       "expansion": "com.tegmentum.ducklink.numfmt",
       "wit_contract_version": "4.0.0",
-      "content_digest": "6477756983b4bf3c8154145a3f3b057661d5d1324eecd106e05b53df8f875f95",
+      "content_digest": "aff1100fd0b85500e66ddc974b20b7124230cb6d1b3a67c302ad76b2eca25301",
       "functions": [
         {
           "name": "num_group",
@@ -9473,7 +9490,7 @@
       "prefix": "mailto",
       "expansion": "com.tegmentum.ducklink.mailto",
       "wit_contract_version": "4.0.0",
-      "content_digest": "284d2296925c98d7c2c8c56663db533cb606a6f8e2b26799bc735699bd7547a9",
+      "content_digest": "a2584490bf33ba5e38f3555962b6c7691cce830502f9ce7a8b3a34e91e96989f",
       "functions": [
         {
           "name": "mailto_to",
@@ -9542,7 +9559,7 @@
       "prefix": "hexdump",
       "expansion": "com.tegmentum.ducklink.hexdump",
       "wit_contract_version": "4.0.0",
-      "content_digest": "26ec7c0cf5557695de963bd9e99c7884025e8109a47f56d0688c80477b98ae44",
+      "content_digest": "7aeedcb90fb4ff3ba0fc7dfdf86d6e02d34db4bda28ce1fb6baaf1d04d0a12f4",
       "functions": [
         {
           "name": "hexdump",
@@ -9599,7 +9616,7 @@
       "prefix": "secp256k1",
       "expansion": "com.tegmentum.ducklink.secp256k1",
       "wit_contract_version": "4.0.0",
-      "content_digest": "5475b1c8848dcf0ef9acb04bb56e697f00496825a5b3bf2dd65b7ead802a36aa",
+      "content_digest": "01594daa67b476399fed79b6913770e9c7e7735f877facbe042c7fc2b5cef3ff",
       "functions": [
         {
           "name": "secp256k1_pubkey",
@@ -9679,7 +9696,7 @@
       "prefix": "bibtex",
       "expansion": "com.tegmentum.ducklink.bibtex",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e8dd62fe6a96d07e1115783ce9e518e168dece503a5d1012dfbd2addacdf20e4",
+      "content_digest": "502a8330618d5164e2d1c0c493b7ffb7783cd9645d723c853763e07a53284a74",
       "functions": [
         {
           "name": "bibtex_count",
@@ -9749,7 +9766,7 @@
       "prefix": "useragent",
       "expansion": "com.tegmentum.ducklink.useragent",
       "wit_contract_version": "4.0.0",
-      "content_digest": "fb44e727201636aa4922c1da968d84c4580e50be041df511e91768f71dac3cab",
+      "content_digest": "aac0093509957f896f49c89248a19f1760d6a40bef036ff0396b70ed7caad07f",
       "functions": [
         {
           "name": "ua_browser",
@@ -9840,7 +9857,7 @@
       "prefix": "ical",
       "expansion": "com.tegmentum.ducklink.ical",
       "wit_contract_version": "4.0.0",
-      "content_digest": "cf54403d46511005a06d6afdedc748282c31f09ec0d006fb0444ac71368aea52",
+      "content_digest": "1c1d138495d7fe6b8f8017e0f31f3f1ec670595b2ed74d956384137614fca459",
       "functions": [
         {
           "name": "ical_event_count",
@@ -9910,7 +9927,7 @@
       "prefix": "tdigest",
       "expansion": "com.tegmentum.ducklink.tdigest",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ccc00fdeb9255992c731aace9a1f3e03af6bf188126d93e3519de194d0912068",
+      "content_digest": "761ace4462640df39e024c428a39dd17b3227ca7027070724b952a255babd06c",
       "providers": [
         {
           "id": "wasm-component",
@@ -9918,13 +9935,14 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/tdigest.wasm",
-          "content_digest": "ccc00fdeb9255992c731aace9a1f3e03af6bf188126d93e3519de194d0912068",
+          "content_digest": "761ace4462640df39e024c428a39dd17b3227ca7027070724b952a255babd06c",
           "conformance": {
             "suite": "tdigest@4",
             "suite_digest": "e46de89c85e237d8bf8f6b787c30e70ab800968243e67f4151234e40fd23348e",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -10002,7 +10020,7 @@
       "prefix": "mlkmeans",
       "expansion": "com.tegmentum.ducklink.mlkmeans",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1804a8eefc8cca2f336fee413cea7510abd121142dcc11a56483038f7be2304e",
+      "content_digest": "445dda3ab2b030fb6c65fd84a87c1489aa3e98cf9a0ccca37b3514b25f0094f5",
       "functions": [
         {
           "name": "ml_kmeans",
@@ -10055,7 +10073,7 @@
       "prefix": "urlpattern",
       "expansion": "com.tegmentum.ducklink.urlpattern",
       "wit_contract_version": "4.0.0",
-      "content_digest": "5e28761542c75eb1a027f8389b861c827bcacf5b8842b84acee457b26f0ff860",
+      "content_digest": "caa293c0656f5deba72a2635ee8eddabb16438930f131bec113161e12f136474",
       "functions": [
         {
           "name": "url_pattern_test",
@@ -10120,7 +10138,7 @@
       "prefix": "celestial",
       "expansion": "com.tegmentum.ducklink.celestial",
       "wit_contract_version": "4.0.0",
-      "content_digest": "62ea52075560558e2c1b34cbe90520985c02a542fd3cd6b87a7827865650650d",
+      "content_digest": "aa74b1773c79857705be80586fd5ca1c332005ef917efd8fa1d836b9ff4cd2c5",
       "functions": [
         {
           "name": "equatorial_to_galactic_l",
@@ -10242,7 +10260,7 @@
       "prefix": "textlines",
       "expansion": "com.tegmentum.ducklink.textlines",
       "wit_contract_version": "4.0.0",
-      "content_digest": "8aaa67ac2d3e2ad0e1492684c0eccfd435efb8d989b56a73ff738a5ab22b117d",
+      "content_digest": "480d1e9f5bfc096d4102b98fc5023df472a1413dfe3b9787c66975e55e280a17",
       "functions": [
         {
           "name": "split_lines",
@@ -10298,7 +10316,7 @@
       "prefix": "netquack",
       "expansion": "com.tegmentum.ducklink.netquack",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f93fb88fd45764d9061497f23d172d7ae674fc4119475e6328ead49631b53767",
+      "content_digest": "5e339d4be300212726e832e5e9a9f0909b72854d44aa305d0b0dcb11d0f3a209",
       "functions": [
         {
           "name": "registrable_domain",
@@ -10378,7 +10396,7 @@
       "prefix": "openprompt",
       "expansion": "com.tegmentum.ducklink.openprompt",
       "wit_contract_version": "4.0.0",
-      "content_digest": "b9ca8fc081de3a8656de41aa3fc000e6a1977d78166adf33a12019f6794adb07",
+      "content_digest": "902771b7fd6262f4ae661a24ad62b4b9be733641fe08fe67c4ba7254ff6a1fa3",
       "functions": [
         {
           "name": "prompt",
@@ -10437,7 +10455,7 @@
       "prefix": "dbf",
       "expansion": "com.tegmentum.ducklink.dbf",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2665334b80a13f79020e58f0f2bfea5b260da7f9f9cb59a2fd33fd1925c2ccfd",
+      "content_digest": "b0d19c69a0109d96b92713895d045b203f81fa51d881ccba2c4274ece5d9e3f4",
       "functions": [
         {
           "name": "read_dbf",
@@ -10494,7 +10512,7 @@
       "prefix": "shapefile",
       "expansion": "com.tegmentum.ducklink.shapefile",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f57eb7e4d6a523792910db8cf8590bb7fea185b916716d42b8ee1b194b1d785b",
+      "content_digest": "b964afa893bf39c0e3f992b1b088d3b5f645bc959f6c66e21e26a36b3bc7db5b",
       "functions": [
         {
           "name": "read_shp",
@@ -10551,7 +10569,7 @@
       "prefix": "fit",
       "expansion": "com.tegmentum.ducklink.fit",
       "wit_contract_version": "4.0.0",
-      "content_digest": "01191d2241ad0d2d2215baee3d9deb250152ca6d2f63d29f9661cc5e0449ba73",
+      "content_digest": "9d6f049bf088d1cf2ceef8acfecfb76582589cf771837f790aa2667f647654b6",
       "functions": [
         {
           "name": "read_fit",
@@ -10612,7 +10630,7 @@
       "prefix": "warc",
       "expansion": "com.tegmentum.ducklink.warc",
       "wit_contract_version": "4.0.0",
-      "content_digest": "89083be7165f851323a48af9df78b4ecd00456a103cb25e7fa73db02b9f82329",
+      "content_digest": "78f4d52881c76e30bbf258a2c26f205558c763295e97c5e55085d666dbbca104",
       "functions": [
         {
           "name": "read_warc",
@@ -10679,7 +10697,7 @@
       "prefix": "html",
       "expansion": "com.tegmentum.ducklink.html",
       "wit_contract_version": "4.0.0",
-      "content_digest": "870941859780c82ee4460399f2b0038397a1102402b6bdc62c6cdd340e37146f",
+      "content_digest": "4d56f88567df0f548445f02a5c3dc692f19b90e423381fa6af4b6368f50fba0d",
       "functions": [
         {
           "name": "html_extract",
@@ -10764,7 +10782,7 @@
       "prefix": "vcard",
       "expansion": "com.tegmentum.ducklink.vcard",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2eab153c895899ec36a18b06eaacb4f80a4bc8b86f5772e3e3d182031bbd66a0",
+      "content_digest": "9b89c669357893840c357d0db58bef1c8cf11c248173502703f2572f5b7b094c",
       "functions": [
         {
           "name": "vcard_count",
@@ -10833,7 +10851,7 @@
       "prefix": "ini",
       "expansion": "com.tegmentum.ducklink.ini",
       "wit_contract_version": "4.0.0",
-      "content_digest": "a145d4f0ed631c8ec82180058fd71b0bb4e47fb513e11555ed55ee13b0c64d27",
+      "content_digest": "17fac7c7620a2ca09cdc2acda8c01f5610617b9517d2aacc05df4774dfaa807a",
       "functions": [
         {
           "name": "ini_to_json",
@@ -10908,7 +10926,7 @@
       "prefix": "plist",
       "expansion": "com.tegmentum.ducklink.plist",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f0038133c331aec623ae84f37d53fdc206ec2b0207fbc2421cdae78ae7ba9b66",
+      "content_digest": "f9a4f7f12eb34cc622f4b5f12d7e9a387ac331cdfc988bf5c1250fec114fd311",
       "functions": [
         {
           "name": "plist_to_json",
@@ -10967,7 +10985,7 @@
       "prefix": "dotenv",
       "expansion": "com.tegmentum.ducklink.dotenv",
       "wit_contract_version": "4.0.0",
-      "content_digest": "1c36671bf5be36991289b5e5e38aa833735c4be10d7c7cb6eb1447c49335965d",
+      "content_digest": "b31f5ca830e39015193b0ae090c17aa7074e62193e1beb4229310e4f505ca29c",
       "functions": [
         {
           "name": "dotenv_to_json",
@@ -11038,7 +11056,7 @@
       "prefix": "hocon",
       "expansion": "com.tegmentum.ducklink.hocon",
       "wit_contract_version": "4.0.0",
-      "content_digest": "a618402c2aca572b3a1bd2a20bf8442f2baa3aa7cce87a38281f0a1c19c9133b",
+      "content_digest": "68e884d4b59bb700a330ffcbfb27b4dde07355a34920b32d9bd1153c0c1a35fa",
       "functions": [
         {
           "name": "hocon_to_json",
@@ -11099,7 +11117,7 @@
       "prefix": "uuid7",
       "expansion": "com.tegmentum.ducklink.uuid7",
       "wit_contract_version": "4.0.0",
-      "content_digest": "55165dd7edabe1a6c5375c4475e56026f3ee1bb94049bd37d6a9a8825789f8f4",
+      "content_digest": "14504d06c8669828a1adc38601ae0be19f9fcc95be30ae3524ab5efb8029a3cb",
       "functions": [
         {
           "name": "uuid7_build",
@@ -11171,7 +11189,7 @@
       "prefix": "textdiff",
       "expansion": "com.tegmentum.ducklink.textdiff",
       "wit_contract_version": "4.0.0",
-      "content_digest": "b277ea0d8eb5f69b48be70db262a8e48e49fa035c19fe3c08ba0071f0df1e3cc",
+      "content_digest": "29f1ade586fbd5fdfa5537f5471dd707f9f313ebdf133e052867ae25a951198b",
       "functions": [
         {
           "name": "text_diff",
@@ -11250,7 +11268,7 @@
       "prefix": "polyline",
       "expansion": "com.tegmentum.ducklink.polyline",
       "wit_contract_version": "4.0.0",
-      "content_digest": "835a1cade22b7d6097419c3536258fd143af02018009cd7c4f38a4470bcda243",
+      "content_digest": "418b07617f4c42fb0ab341d96a4f1a97ee7614a174ec43a0210e7fbc23d5ae11",
       "functions": [
         {
           "name": "polyline_encode",
@@ -11314,7 +11332,7 @@
       "prefix": "json_schema",
       "expansion": "com.tegmentum.ducklink.json_schema",
       "wit_contract_version": "4.0.0",
-      "content_digest": "63c0c64a05dddd3ffa3dcea1cf7de316ceef5aeb2aefe67a2fd9987c164c5a27",
+      "content_digest": "cd900d8cdd8a336320ed8d20df427c5bcbe8e559b03c46d69fd968057f8ff4c6",
       "functions": [
         {
           "name": "json_schema_valid",
@@ -11383,7 +11401,7 @@
       "prefix": "stochastic",
       "expansion": "com.tegmentum.ducklink.stochastic",
       "wit_contract_version": "4.0.0",
-      "content_digest": "014e35ce6d0c7e6cc6e949a5dcf031c66f077c4b1680fa29a8e2057eaa06267b",
+      "content_digest": "9430466901d442e89f6b575e824ffa02d42bc913d7ee65aaeee08a0b2e7e6775",
       "functions": [
         {
           "name": "normal_cdf",
@@ -11543,7 +11561,7 @@
       "prefix": "ion",
       "expansion": "com.tegmentum.ducklink.ion",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ac2a826b7081e1db7bf029782a10581031153ee356d489d2ee5ccd7a025d98a6",
+      "content_digest": "c9f5b697cd30afec0a58bb0af2bbd9eb728c62279b16839eb77fa5df73f4b61c",
       "functions": [
         {
           "name": "ion_to_json",
@@ -11615,7 +11633,7 @@
       "prefix": "textplot",
       "expansion": "com.tegmentum.ducklink.textplot",
       "wit_contract_version": "4.0.0",
-      "content_digest": "344cd64518185ca98577dbcb3a4f1228b46de5fe82a4fe73214406c426019471",
+      "content_digest": "c3ca280a03fe6df93581b1029b2df3bf4f9745c72c2bf8fabd5a289a88b01432",
       "functions": [
         {
           "name": "plot_sparkline",
@@ -11687,7 +11705,7 @@
       "prefix": "marisa",
       "expansion": "com.tegmentum.ducklink.marisa",
       "wit_contract_version": "4.0.0",
-      "content_digest": "b24e9dd2b773ca9d3aae893331d8f9475b1a72aaffeb648bd92865360b3b59d5",
+      "content_digest": "97b09f554a769828d962f523857e6c32332866b92ef52b076dd0e5187f413526",
       "functions": [
         {
           "name": "fst_contains",
@@ -11760,7 +11778,7 @@
       "prefix": "frequentitems",
       "expansion": "com.tegmentum.ducklink.frequentitems",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d3825a0b1e592f3a14710921500afb1d4dc3268b9c102d168f0dec5904633298",
+      "content_digest": "2a7df199a162576535bb36e628dfb8c03fdf427bb1a53dea1d912b2d4aa15ee2",
       "functions": [
         {
           "name": "top_k",
@@ -11824,7 +11842,7 @@
       "prefix": "sqlitewasm",
       "expansion": "com.tegmentum.ducklink.sqlitewasm",
       "wit_contract_version": "4.0.0",
-      "content_digest": "337eda726d77b77ebfc0cf8cfbb7cdfc4ed8b14df711ebead87e5973d2723acd",
+      "content_digest": "2343406b43bddd815501c9e5a7705217060d8ca166e465dec9810260c70d7c38",
       "functions": [
         {
           "name": "sqlite_blob_scan",
@@ -11894,7 +11912,7 @@
       ],
       "min_duckdb_version": "1.0.0",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2917d7a4873b2e30a2fec0257dae4e11b4463fe3111cd1cef521486f43f8c59c",
+      "content_digest": "0159b0fcecb4b425042d2b10aaaa390cf296c0827e1a9e0194422daf66571402",
       "functions": [
         {
           "name": "json_valid",
@@ -12088,7 +12106,7 @@
       ],
       "min_duckdb_version": "1.0.0",
       "wit_contract_version": "4.0.0",
-      "content_digest": "65e5b4f5c632b8fd96e638caf9e07bb0fa3d9f5c06d32978ced3139a1eb53096",
+      "content_digest": "fb28a8a372b5ecc8d438bf3278309d5a1902aee8973c7f30738613a428b861d2",
       "functions": [
         {
           "name": "host",
@@ -12193,7 +12211,7 @@
       "prefix": "excelfns",
       "expansion": "com.tegmentum.ducklink.excelfns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2a6b492e056d725d28802ab94e9965cf2ce627b6768254da35f270a3c6860ca3",
+      "content_digest": "381db22df235a613af0c4a4196f8b692e83b68d19bb7f2149f05ee989074afdd",
       "functions": [
         {
           "name": "xlsx_sheets",
@@ -12297,7 +12315,7 @@
       "prefix": "avrofns",
       "expansion": "com.tegmentum.ducklink.avrofns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "60a488fad67f4d268653a9c9632c2271b2c20ee37dea11e995832ed33f8371bd",
+      "content_digest": "9c991c331d0ac8d4621caf35e8f3c3280386c6ec62ab4ec8333340af5683f8d0",
       "functions": [
         {
           "name": "avro_record_count",
@@ -12400,7 +12418,7 @@
       ],
       "min_duckdb_version": "1.0.0",
       "wit_contract_version": "4.0.0",
-      "content_digest": "f941394f72077237ae4bcfb4ed947bca80a570b1b682b2606181d90fa661ba7a",
+      "content_digest": "b2da9bd6abc3df807c5fea7680513398d9cddf6d6c17ba6b9de7b207c4bebdae",
       "functions": [
         {
           "name": "ST_Point",
@@ -12611,7 +12629,7 @@
       "prefix": "ftsfns",
       "expansion": "com.tegmentum.ducklink.ftsfns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "572ef656a790e13d62dfe8d6d2fe36bd5bf8c9c0fb63b3ac0148b77c32ae3efe",
+      "content_digest": "edca625b1ca897f74f3ac3cb1cdb7c9538aa8c93aa09a3661a08e05d2c64d10b",
       "functions": [
         {
           "name": "fts_tokenize",
@@ -12725,7 +12743,7 @@
       "prefix": "icufns",
       "expansion": "com.tegmentum.ducklink.icufns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2c3f9c7eaeecd323e731d0c263a45b2136bae34b71525f35ca8822388f8dc40b",
+      "content_digest": "c3b2a4b67c1f5d0e24ece51698eb43badff981e844db7cdb9c3c349c493b38b1",
       "functions": [
         {
           "name": "icu_sort_key",
@@ -12836,7 +12854,7 @@
       "prefix": "vssfns",
       "expansion": "com.tegmentum.ducklink.vssfns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "6862365d93db2ebd84db2e2b6a9f0aea09611bf7b667c76b6dbd0975525d163b",
+      "content_digest": "4e7d9f12249e764ca05f028001c896cb9e766b3dffa60d2dbe5947802edf139a",
       "functions": [
         {
           "name": "vec_l1_distance",
@@ -12913,7 +12931,7 @@
       "prefix": "rtreefns",
       "expansion": "com.tegmentum.ducklink.rtreefns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "2d988b9a3ece23911d38892b2c6b99e391e3e46959d1acab0910639a8401f5e4",
+      "content_digest": "755683a81d477a245dcbc71fe9bade057bf0bb8ef3bc319c6fe16124b7f3fa54",
       "functions": [
         {
           "name": "bbox4",
@@ -12982,7 +13000,7 @@
       "prefix": "hnswfns",
       "expansion": "com.tegmentum.ducklink.hnswfns",
       "wit_contract_version": "4.0.0",
-      "content_digest": "17d3ee07b639c035778c98a68f2da7bcf6261ed3c08eb1a002c86b5ccb37cb79",
+      "content_digest": "f3dc9e67ff48809b67e4a491cd9a3334ef4b6300b2562d08f288a911a4677139",
       "functions": [
         {
           "name": "hnsw_search",
@@ -13046,7 +13064,7 @@
       "prefix": "geomtype",
       "expansion": "com.tegmentum.ducklink.geomtype",
       "wit_contract_version": "4.0.0",
-      "content_digest": "4410bd63db05883758e8e9e64d1cf1a9bdad6fd849f52e3d8cd60002d967b448",
+      "content_digest": "3e5d49a8cffa73c38067ea2852000eb9f3deecd8d4e27cc471ea1dde481705ef",
       "functions": [
         {
           "name": "geom_area",
@@ -13106,7 +13124,7 @@
       "prefix": "spatialproj",
       "expansion": "com.tegmentum.ducklink.spatialproj",
       "wit_contract_version": "4.0.0",
-      "content_digest": "52cfcd483bf2d8ce3d1d2bdd2491f0cded91427099e0bc1651b9f83ed555aae2",
+      "content_digest": "249eeb88ee79d7fb2c123acec9b98ecb2544f326246bf493dfb529c3d49799a2",
       "functions": [
         {
           "name": "ST_Transform",
@@ -13167,7 +13185,7 @@
       "prefix": "tpchgen",
       "expansion": "com.tegmentum.ducklink.tpchgen",
       "wit_contract_version": "4.0.0",
-      "content_digest": "4ee6eedb6a1f177bdfed2036f3e1e67882ca615f0f875b8df2878405f3e3168f",
+      "content_digest": "48361ffb0e41097be21d86bb17d88788f1a3b18f99d534c718577d2ce3ff09f3",
       "functions": [
         {
           "name": "tpch_query",
@@ -13540,7 +13558,7 @@
       "prefix": "tpcdsgen",
       "expansion": "com.tegmentum.ducklink.tpcdsgen",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e3537f111e1da0dedfd5ded6b8a34a692031194d59a327bf31e0f06b6b90ffff",
+      "content_digest": "81dc4e59a3ff69a4be80471f4f75fd1e4b04956f3e16def35062e937d6dfa731",
       "functions": [
         {
           "name": "tpcds_income_band",
@@ -13620,7 +13638,7 @@
       "prefix": "deltascan",
       "expansion": "com.tegmentum.ducklink.deltascan",
       "wit_contract_version": "4.0.0",
-      "content_digest": "72f82981c817f7d7c09397a77d305404eaed300636eafb674ba1e153402333d2",
+      "content_digest": "debeada3f1214f467bb6055b19dfd60035f9420a4172cb4b9dba46735e23b9d6",
       "functions": [
         {
           "name": "delta_log_info",
@@ -13703,7 +13721,7 @@
       "prefix": "icebergscan",
       "expansion": "com.tegmentum.ducklink.icebergscan",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e3bbaee24d4f2135d86df17dc26037462e2c8a7697a7a345a5d524fd3da28cce",
+      "content_digest": "66d36995361ebfe1759580ff40654f9ad71256c3fdb4b62e49dd95ccff836c54",
       "functions": [
         {
           "name": "iceberg_metadata",
@@ -13811,7 +13829,7 @@
       "prefix": "autocomplete",
       "expansion": "com.tegmentum.ducklink.autocomplete",
       "wit_contract_version": "4.0.0",
-      "content_digest": "b0ee0dffa65c22366563b6af2ccb1a3d3dc97e3d578563f47b0db6f224ccc305",
+      "content_digest": "3f8b490994d38d8f04a2dfe527b081ba188bcb8f365fd8804883d9a565e7da84",
       "functions": [
         {
           "name": "sql_complete",
@@ -13895,7 +13913,7 @@
       "prefix": "statsduck",
       "expansion": "com.tegmentum.ducklink.stats",
       "wit_contract_version": "4.0.0",
-      "content_digest": "52cd2f60d1f3137cf5c37cf786f3c70d844767e55ab2eb600a17e3c9abc6db65",
+      "content_digest": "a1ce3f407070dd39e2bdb57243a281f25c09ebdaab881d1bcd11dce4c80c0498",
       "functions": [
         {
           "name": "ttest_1samp",
@@ -14545,7 +14563,7 @@
       "prefix": "math",
       "expansion": "com.tegmentum.ducklink.math",
       "wit_contract_version": "4.0.0",
-      "content_digest": "e87d3d82cb085fb0e62b93fc6edddacf29657d420f6ff552611067097ce21fae",
+      "content_digest": "143b4cce0ffabe1f3a3fb834072d560ee6cf8b5f2b185eeae8fe6672377648dd",
       "providers": [
         {
           "id": "wasm-component",
@@ -14553,7 +14571,8 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/math.wasm",
-          "content_digest": "e87d3d82cb085fb0e62b93fc6edddacf29657d420f6ff552611067097ce21fae"
+          "content_digest": "143b4cce0ffabe1f3a3fb834072d560ee6cf8b5f2b185eeae8fe6672377648dd",
+          "status": "supported"
         }
       ],
       "functions": [
@@ -14659,7 +14678,7 @@
       "prefix": "text_utils",
       "expansion": "com.tegmentum.ducklink.text_utils",
       "wit_contract_version": "4.0.0",
-      "content_digest": "3c52be286e9caa2fb50d3a04223bfda1fd36adc343b564a9005b035e3737c4cf",
+      "content_digest": "4fe95fb99110150ec3df93faa1eded6939bd5673007368f27ad403b75cf76c62",
       "providers": [
         {
           "id": "wasm-component",
@@ -14667,7 +14686,8 @@
           "reference": true,
           "abi": "duckdb:extension@2.2.0",
           "artifact": "artifacts/extensions/text_utils.wasm",
-          "content_digest": "3c52be286e9caa2fb50d3a04223bfda1fd36adc343b564a9005b035e3737c4cf"
+          "content_digest": "4fe95fb99110150ec3df93faa1eded6939bd5673007368f27ad403b75cf76c62",
+          "status": "supported"
         }
       ],
       "functions": [
@@ -14823,7 +14843,7 @@
       "expansion": "com.tegmentum.ducklink.chrono",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "3ae43e02c387c3d885a2bed87a18083b166fe61223d5b8af5c1604ff2b45fe7e",
+      "content_digest": "0cfe3da4634b8073c0a79e256b035eeb88ffa2136c340535ce79878fe009de59",
       "functions": [
         {
           "name": "date_parse",
@@ -15535,7 +15555,7 @@
       "expansion": "com.tegmentum.ducklink.list",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "d4c324e01cdfd1abdb900ae695e6b92cf82215b74be9c133a9c8c8de2298812c",
+      "content_digest": "1f67507d83a385771f4b2b80abf525ab3d4fb5170f07763522f6a5659807c7e5",
       "functions": [
         {
           "name": "array_remove",
@@ -15777,7 +15797,7 @@
       "expansion": "com.tegmentum.ducklink.stdsql",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ce93bd1a69356ab35bdf57a482c184f366e510b5739ffa0f1df2ef908048f389",
+      "content_digest": "61a8cef5d5e3972532e0bcd3702f4fcf3d25b3abc18a680ce896ac929424fad2",
       "functions": [
         {
           "name": "space",
@@ -16068,7 +16088,7 @@
       "expansion": "com.tegmentum.ducklink.stats",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ed09175cf12ec22b1121d10eadfa4eef1721d3c9b52d4a95b393a2a888e9ecfa",
+      "content_digest": "03a4a4f6a8f59ac25f839d6986ddad5d33f24b6768f5fd2b804ae2993b3ab61e",
       "functions": [
         {
           "name": "percentile",
@@ -16153,7 +16173,7 @@
       "expansion": "com.tegmentum.ducklink.sys_compat",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "943bccbc627f74dfedd36eb00046eded602f7fdd957d56efa25f2acf02d7a55c",
+      "content_digest": "f3ea0982b0384b55362c380569bebc76a9c3a930e4f03001d5df356f7dbdae2e",
       "functions": [
         {
           "name": "system_user",
@@ -16214,7 +16234,7 @@
       "artifact": "artifacts/extensions/ggsql.wasm",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "665c6d1d7a9676982987f7619814002cdd838a1c68e7b39e6831c5d592f54608",
+      "content_digest": "90f8624ec31724fb9cc07475883dd57080817e64cbbf887dd2cbcf5eb2db861b",
       "providers": [
         {
           "id": "wasm-component",
@@ -16222,13 +16242,14 @@
           "reference": true,
           "abi": "duckdb:extension@3.1.0",
           "artifact": "artifacts/extensions/ggsql.wasm",
-          "content_digest": "665c6d1d7a9676982987f7619814002cdd838a1c68e7b39e6831c5d592f54608",
+          "content_digest": "90f8624ec31724fb9cc07475883dd57080817e64cbbf887dd2cbcf5eb2db861b",
           "conformance": {
             "suite": "ggsql@4",
             "suite_digest": "48ff6b2da8a744ab45ceae52faca754c7f854d65ec41f90965a859d21b5ca256",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": []
@@ -16261,7 +16282,7 @@
       "artifact": "artifacts/extensions/dplyr.wasm",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "c492f99fa7a8abb57604a2c1fc740ed12c516e8c04cbab642d0613c08c8b0b5f",
+      "content_digest": "1c0d3807e17815c07d31427bc035333b9b3bf383b8af53132b8553ca4fbc28ef",
       "providers": [
         {
           "id": "wasm-component",
@@ -16269,13 +16290,14 @@
           "reference": true,
           "abi": "duckdb:extension@3.1.0",
           "artifact": "artifacts/extensions/dplyr.wasm",
-          "content_digest": "c492f99fa7a8abb57604a2c1fc740ed12c516e8c04cbab642d0613c08c8b0b5f",
+          "content_digest": "1c0d3807e17815c07d31427bc035333b9b3bf383b8af53132b8553ca4fbc28ef",
           "conformance": {
             "suite": "dplyr@4",
             "suite_digest": "73c189bc18a13ad0eec6df00e3f872984b253d652cfa27e218d93f26578cce58",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": []
@@ -16310,7 +16332,7 @@
       "artifact": "artifacts/extensions/prql_parser.wasm",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "eb28c8900b0124dd8d3db204645cd97dd60c02acca4dc5ae88a909b31ea0cca9",
+      "content_digest": "181761c2db814b3fd895c9a4bcfeb98c50d0d3191d7bdb563485848104b95525",
       "providers": [
         {
           "id": "wasm-component",
@@ -16318,13 +16340,14 @@
           "reference": true,
           "abi": "duckdb:extension@3.1.0",
           "artifact": "artifacts/extensions/prql_parser.wasm",
-          "content_digest": "eb28c8900b0124dd8d3db204645cd97dd60c02acca4dc5ae88a909b31ea0cca9",
+          "content_digest": "181761c2db814b3fd895c9a4bcfeb98c50d0d3191d7bdb563485848104b95525",
           "conformance": {
             "suite": "prql_parser@4",
             "suite_digest": "6719bade3ff2cd734b77e63cbf2a57b88c7f586d76418eed00462f6148b4f235",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": []
@@ -16360,7 +16383,7 @@
       "artifact": "artifacts/extensions/talib.wasm",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "4da827e08aecc3787022b3e07eac9fe88cc0e59a59d6eed2ccc214fcf88208e9",
+      "content_digest": "a0cc83241eb83f5304c61f63d1bbddef5f6e9c2d2aadfda1d8bcaa552d8446ee",
       "providers": [
         {
           "id": "wasm-component",
@@ -16368,13 +16391,14 @@
           "reference": true,
           "abi": "duckdb:extension@3.1.0",
           "artifact": "artifacts/extensions/talib.wasm",
-          "content_digest": "4da827e08aecc3787022b3e07eac9fe88cc0e59a59d6eed2ccc214fcf88208e9",
+          "content_digest": "a0cc83241eb83f5304c61f63d1bbddef5f6e9c2d2aadfda1d8bcaa552d8446ee",
           "conformance": {
             "suite": "talib@4",
             "suite_digest": "c6c03904e744ec9bd6a98f510f8555077dc9ccb95c294ed9416ac9571db36990",
             "at": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
             "passed": true
-          }
+          },
+          "status": "supported"
         }
       ],
       "functions": [
@@ -16450,18 +16474,18 @@
       "expansion": "com.tegmentum.ducklink.minijinja",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "448074036bb9f027559b2b7f88fe6118846ec22d53ee6f058cb0b502c3103633",
+      "content_digest": "d011efac8dc94a443966bdbe12598ea6681ae3167c2788e4a41066459682969a",
       "functions": [
         {
           "name": "jinja_render",
           "kind": "scalar",
           "arguments": [
             {
-              "name": "value",
+              "name": "arg0",
               "type": "VARCHAR"
             },
             {
-              "name": "value",
+              "name": "arg1",
               "type": "VARCHAR"
             }
           ],
@@ -16478,7 +16502,8 @@
           ],
           "returns": "BOOLEAN"
         }
-      ]
+      ],
+      "providers": null
     },
     {
       "name": "tera",
@@ -16517,18 +16542,18 @@
       "expansion": "com.tegmentum.ducklink.tera",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ea523f36951cd45ba6a2d87948c9a8786486778ad2ad284fa9da764667c5f955",
+      "content_digest": "b578d2c78404a09db33af1fb18fc411a30c2b509f44509022047098f1f8c7379",
       "functions": [
         {
           "name": "tera_render",
           "kind": "scalar",
           "arguments": [
             {
-              "name": "value",
+              "name": "arg0",
               "type": "VARCHAR"
             },
             {
-              "name": "value",
+              "name": "arg1",
               "type": "VARCHAR"
             }
           ],
@@ -16545,7 +16570,8 @@
           ],
           "returns": "BOOLEAN"
         }
-      ]
+      ],
+      "providers": null
     },
     {
       "name": "pcap",
@@ -16583,7 +16609,7 @@
       "expansion": "com.tegmentum.ducklink.pcap",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "886223a88934ec0daabfd631d77982ea73d5e6df6650323acc5b9514f66bafff",
+      "content_digest": "efca04df4aaf9880fe1c824b66579ce473231a1433e1fe93fa6d2d0a0d10967c",
       "functions": [
         {
           "name": "read_pcap",
@@ -16621,7 +16647,8 @@
             }
           ]
         }
-      ]
+      ],
+      "providers": null
     },
     {
       "name": "a5",
@@ -16666,22 +16693,22 @@
       "expansion": "com.tegmentum.ducklink.a5",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "ef73ae33dde5c1f26de60ac926b3ea1c82ed448ac87e8c6edbbf79dcb5cb9535",
+      "content_digest": "30e3d5005b1bce8827f02f97ca966de2b26a960d00b48aeb7afa411a622ff620",
       "functions": [
         {
           "name": "a5_lonlat_to_cell",
           "kind": "scalar",
           "arguments": [
             {
-              "name": "value",
+              "name": "arg0",
               "type": "DOUBLE"
             },
             {
-              "name": "value",
+              "name": "arg1",
               "type": "DOUBLE"
             },
             {
-              "name": "value",
+              "name": "arg2",
               "type": "BIGINT"
             }
           ],
@@ -16725,11 +16752,11 @@
           "kind": "scalar",
           "arguments": [
             {
-              "name": "value",
+              "name": "arg0",
               "type": "BIGINT"
             },
             {
-              "name": "value",
+              "name": "arg1",
               "type": "BIGINT"
             }
           ],
@@ -16768,7 +16795,8 @@
           ],
           "returns": "BIGINT"
         }
-      ]
+      ],
+      "providers": null
     },
     {
       "name": "jsonata",
@@ -16806,24 +16834,25 @@
       "expansion": "com.tegmentum.ducklink.jsonata",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "40ce03b4336415820440e8d097ed79e86e34aff03aab9b94739528cc73457ffd",
+      "content_digest": "4c720717962304f82c1b7e04c7226fd359d7a5d4211260a1013d5a9b8a97b68a",
       "functions": [
         {
           "name": "jsonata",
           "kind": "scalar",
           "arguments": [
             {
-              "name": "value",
+              "name": "arg0",
               "type": "VARCHAR"
             },
             {
-              "name": "value",
+              "name": "arg1",
               "type": "VARCHAR"
             }
           ],
           "returns": "VARCHAR"
         }
-      ]
+      ],
+      "providers": null
     },
     {
       "name": "sqlitecompat",
@@ -16863,17 +16892,8 @@
       "expansion": "com.tegmentum.ducklink.sqlitecompat",
       "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
       "wit_contract_version": "4.0.0",
-      "content_digest": "db3d3e63918ae782de46fb0074e50689d2ca7e6dfa00939d7c9e9443bd758b8b",
-      "providers": [
-        {
-          "id": "wasm-component",
-          "kind": "wasm",
-          "reference": true,
-          "abi": "duckdb:extension@2.2.0",
-          "artifact": "artifacts/extensions/sqlitecompat.wasm",
-          "content_digest": "db3d3e63918ae782de46fb0074e50689d2ca7e6dfa00939d7c9e9443bd758b8b"
-        }
-      ],
+      "content_digest": "c8fdb599e1aabf3c583abf61b490055ee98801535eb946c322ee5c97a690cca9",
+      "providers": null,
       "functions": [
         {
           "name": "zeroblob",
@@ -16924,11 +16944,11 @@
           "kind": "scalar",
           "arguments": [
             {
-              "name": "value",
+              "name": "arg0",
               "type": "BOOLEAN"
             },
             {
-              "name": "value",
+              "name": "arg1",
               "type": "DOUBLE"
             }
           ],
