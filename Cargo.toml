@@ -73,9 +73,21 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # content_digest (sha256) before caching/loading it.
 sha2 = "0.10"
 # MessagePack for the Python source tier (`ducklink_run`): the offload envelope
-# the resident pylon endpoint speaks over compose:dynlink/endpoint. Per-row
-# scalar args/results cross as msgpack (arrow-columnar is Phase 2).
+# the resident pylon endpoint speaks over compose:dynlink/endpoint. The per-row
+# `offload` fallback (unsupported types) marshals args/results as msgpack; the
+# default `offload_arrow` path carries the arrow IPC bytes inside a msgpack
+# envelope.
 rmpv = "1"
+# arrow-rs: the HOST side of the arrow-columnar scalar dispatch. Each DuckDB
+# DataChunk's argument columns are read (with validity) into Arrow arrays,
+# assembled into a RecordBatch, and serialized to an Arrow IPC STREAM crossing
+# compose:dynlink/endpoint once per chunk (not per row); the result column comes
+# back the same way. `arrow-array`/`arrow-schema` build the batch; `arrow-ipc`
+# does the stream (de)serialization.
+arrow-array = { version = "58", default-features = false }
+arrow-schema = { version = "58", default-features = false }
+arrow-buffer = { version = "58", default-features = false }
+arrow-ipc = { version = "58", default-features = false }
 
 # DuckDB C Extension API (loadable-extension build). Pinned to the DuckDB version
 # the community-extensions CI builds against (v1.5.4); bumped per release.

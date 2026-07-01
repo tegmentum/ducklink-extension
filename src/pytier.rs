@@ -7,15 +7,22 @@
 //! and registers each authored function as a real DuckDB SQL function whose
 //! dispatch closure calls back into the resident interpreter per row.
 //!
-//! ## Mechanism (proven in Wave 1)
+//! ## Mechanism
 //!
-//!   run  -> `runtime.load`     import the script; @ducklink decorators fire
+//!   run      -> `runtime.load`      import the script; @ducklink decorators fire
 //!   manifest -> `runtime.manifest`  read the JSON-able registry
-//!   dispatch -> `offload`      call `module:callable` per row (MVP; msgpack)
+//!   dispatch -> `offload_arrow`     apply `module:callable` over one Arrow column
+//!                                   batch per DuckDB DataChunk (arrow-columnar)
 //!
-//! The offload envelope crosses `compose:dynlink/endpoint.handle(method, payload)`
-//! as opaque bytes; msgpack is the application encoding. Arrow-columnar batching
-//! is Phase 2 — this dispatches one row per WIT crossing.
+//! The dispatch is ARROW-COLUMNAR: [`PyScalar::invoke`] reads the whole
+//! DataChunk's argument columns (with validity) into Arrow arrays, serializes
+//! them to ONE Arrow IPC STREAM, and crosses
+//! `compose:dynlink/endpoint.handle("offload_arrow", payload)` ONCE per chunk
+//! (not once per row). The guest applies the fn row-wise with DuckDB NULL
+//! semantics and returns a one-column (`result`) Arrow IPC stream, decoded back
+//! into the output vector. The arrow bytes ride inside a small msgpack envelope
+//! (`{entry, arrow}`); the per-row msgpack `offload` path is retained as
+//! [`invoke_per_row`] for fallback / unsupported types.
 //!
 //! ## Where the dispatch logic lives
 //!
@@ -41,6 +48,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use std::sync::Arc;
+
+use arrow_array::builder::{
+    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
+};
+use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Field, Schema};
 
 use duckdb::core::{DataChunkHandle, FlatVector, Inserter, LogicalTypeHandle, LogicalTypeId};
 use duckdb::ffi;
@@ -317,6 +334,226 @@ fn offload_payload(entry: &str, args: Vec<rmpv::Value>) -> Vec<u8> {
     ]))
 }
 
+/// Build an `offload_arrow` payload: `{"entry": "<mod:fn>", "arrow": <ipc bytes>}`.
+/// The arrow bytes are one Arrow IPC STREAM carrying the whole DataChunk's
+/// argument columns (`arg0`, `arg1`, ...); the guest applies the fn row-wise and
+/// returns one Arrow IPC stream with a single `result` column.
+fn offload_arrow_payload(entry: &str, arrow: Vec<u8>) -> Vec<u8> {
+    mp_encode(&rmpv::Value::Map(vec![
+        (rmpv::Value::from("entry"), rmpv::Value::from(entry)),
+        (rmpv::Value::from("arrow"), rmpv::Value::Binary(arrow)),
+    ]))
+}
+
+// ---------------------------------------------------------------------------
+// arrow-columnar dispatch: encode the DataChunk's arg columns into one Arrow
+// IPC stream, decode the returned single-column result stream.
+// ---------------------------------------------------------------------------
+
+/// Read column `j` of the DataChunk (type `ty`, length `len`, validity mask
+/// `validity`) into an Arrow array. NULLs (per the validity bitmap; a null
+/// pointer means all-valid) become Arrow nulls, so the guest sees `None` and
+/// applies DuckDB NULL semantics. Reading a NULL VARCHAR cell's `duckdb_string_t`
+/// would deref garbage, so a NULL row is appended as null WITHOUT touching the
+/// slot.
+fn column_to_arrow(
+    ty: PyType,
+    col: &FlatVector,
+    len: usize,
+    validity: *const u64,
+) -> ArrayRef {
+    let valid = |i: usize| validity.is_null() || unsafe { row_valid(validity, i) };
+    match ty {
+        PyType::Varchar => {
+            let s = unsafe { col.as_slice_with_len::<duckdb_string_t>(len) };
+            let mut b = StringBuilder::new();
+            for i in 0..len {
+                if valid(i) {
+                    let mut t = s[i];
+                    b.append_value(DuckString::new(&mut t).as_str());
+                } else {
+                    b.append_null();
+                }
+            }
+            Arc::new(b.finish())
+        }
+        PyType::Bigint => {
+            let s = unsafe { col.as_slice_with_len::<i64>(len) };
+            let mut b = Int64Builder::with_capacity(len);
+            for i in 0..len {
+                if valid(i) {
+                    b.append_value(s[i]);
+                } else {
+                    b.append_null();
+                }
+            }
+            Arc::new(b.finish())
+        }
+        PyType::Double => {
+            let s = unsafe { col.as_slice_with_len::<f64>(len) };
+            let mut b = Float64Builder::with_capacity(len);
+            for i in 0..len {
+                if valid(i) {
+                    b.append_value(s[i]);
+                } else {
+                    b.append_null();
+                }
+            }
+            Arc::new(b.finish())
+        }
+        PyType::Boolean => {
+            let s = unsafe { col.as_slice_with_len::<bool>(len) };
+            let mut b = BooleanBuilder::with_capacity(len);
+            for i in 0..len {
+                if valid(i) {
+                    b.append_value(s[i]);
+                } else {
+                    b.append_null();
+                }
+            }
+            Arc::new(b.finish())
+        }
+    }
+}
+
+fn arrow_field(ty: PyType, name: &str) -> Field {
+    let dt = match ty {
+        PyType::Varchar => DataType::Utf8,
+        PyType::Bigint => DataType::Int64,
+        PyType::Double => DataType::Float64,
+        PyType::Boolean => DataType::Boolean,
+    };
+    Field::new(name, dt, true)
+}
+
+/// Serialize the argument columns into one Arrow IPC STREAM (columns `arg0`,
+/// `arg1`, ...). One stream per DataChunk -> one WIT crossing per chunk.
+fn encode_arg_batch(
+    arg_types: &[PyType],
+    cols: &[FlatVector],
+    len: usize,
+    validities: &[*const u64],
+) -> Result<Vec<u8>, String> {
+    let mut fields = Vec::with_capacity(arg_types.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(arg_types.len());
+    for (j, &ty) in arg_types.iter().enumerate() {
+        fields.push(arrow_field(ty, &format!("arg{j}")));
+        arrays.push(column_to_arrow(ty, &cols[j], len, validities[j]));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), arrays)
+        .map_err(|e| format!("arrow: build arg batch: {e}"))?;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut w = StreamWriter::try_new(&mut buf, &schema)
+            .map_err(|e| format!("arrow: stream writer: {e}"))?;
+        w.write(&batch).map_err(|e| format!("arrow: write batch: {e}"))?;
+        w.finish().map_err(|e| format!("arrow: finish stream: {e}"))?;
+    }
+    Ok(buf)
+}
+
+/// Decode the returned Arrow IPC stream (one `result` column of `expect_len`
+/// rows) into the output FlatVector per `ret`. Concatenates all batches the
+/// guest emitted (it emits one, but the reader is batch-agnostic). NULLs come
+/// from the Arrow validity bitmap -> `out.set_null(i)`.
+fn decode_result_into(
+    ret: PyType,
+    bytes: &[u8],
+    out: &mut FlatVector,
+    expect_len: usize,
+) -> Result<(), String> {
+    let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(|e| format!("arrow: result stream reader: {e}"))?;
+    let mut row = 0usize;
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("arrow: read result batch: {e}"))?;
+        if batch.num_columns() != 1 {
+            return Err(format!(
+                "arrow: result batch must have 1 column, got {}",
+                batch.num_columns()
+            ));
+        }
+        let arr = batch.column(0);
+        let n = arr.len();
+        match ret {
+            PyType::Varchar => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| format!("arrow: expected utf8 result, got {}", arr.data_type()))?;
+                for i in 0..n {
+                    if a.is_null(i) {
+                        out.set_null(row + i);
+                    } else {
+                        out.insert(row + i, a.value(i));
+                    }
+                }
+            }
+            PyType::Bigint => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| format!("arrow: expected int64 result, got {}", arr.data_type()))?;
+                // Set nulls first (needs &mut out), then fill values via the slice
+                // (a distinct &mut borrow) — the two can't overlap.
+                for i in 0..n {
+                    if a.is_null(i) {
+                        out.set_null(row + i);
+                    }
+                }
+                let slot = unsafe { out.as_mut_slice::<i64>() };
+                for i in 0..n {
+                    if !a.is_null(i) {
+                        slot[row + i] = a.value(i);
+                    }
+                }
+            }
+            PyType::Double => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| format!("arrow: expected float64 result, got {}", arr.data_type()))?;
+                for i in 0..n {
+                    if a.is_null(i) {
+                        out.set_null(row + i);
+                    }
+                }
+                let slot = unsafe { out.as_mut_slice::<f64>() };
+                for i in 0..n {
+                    if !a.is_null(i) {
+                        slot[row + i] = a.value(i);
+                    }
+                }
+            }
+            PyType::Boolean => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| format!("arrow: expected bool result, got {}", arr.data_type()))?;
+                for i in 0..n {
+                    if a.is_null(i) {
+                        out.set_null(row + i);
+                    }
+                }
+                let slot = unsafe { out.as_mut_slice::<bool>() };
+                for i in 0..n {
+                    if !a.is_null(i) {
+                        slot[row + i] = a.value(i);
+                    }
+                }
+            }
+        }
+        row += n;
+    }
+    if row != expect_len {
+        return Err(format!(
+            "arrow: result length {row} != chunk length {expect_len}"
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // manifest
 // ---------------------------------------------------------------------------
@@ -443,6 +680,45 @@ thread_local! {
 
 struct PyScalar;
 
+/// The per-row msgpack `offload` dispatch — RETAINED as a fallback for types the
+/// arrow-columnar path does not (yet) cover. One WIT crossing per row: read each
+/// arg cell to msgpack, `offload`, decode the scalar result. `PyScalar::invoke`
+/// now defaults to the arrow-columnar path (one crossing per chunk); this stays
+/// wired so a future unsupported-type arm can route to it.
+#[allow(dead_code)]
+fn invoke_per_row(
+    rt: &PylonRuntime,
+    state: &PyScalarState,
+    cols: &[FlatVector],
+    validities: &[*const u64],
+    len: usize,
+    out: &mut FlatVector,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let arity = state.args.len();
+    for i in 0..len {
+        let row_null = (0..arity).any(|j| {
+            let val = validities[j];
+            !val.is_null() && unsafe { !row_valid(val, i) }
+        });
+        if row_null {
+            out.set_null(i);
+            continue;
+        }
+        let args: Vec<rmpv::Value> = (0..arity)
+            .map(|j| read_cell(state.args[j], &cols[j], i))
+            .collect();
+        let payload = offload_payload(&state.entry, args);
+        let resp = rt.call("offload", &payload).map_err(to_boxed)?;
+        let val = mp_decode(&resp).map_err(to_boxed)?;
+        if let rmpv::Value::Nil = val {
+            out.set_null(i);
+        } else {
+            write_cell(state.ret, out, i, &val)?;
+        }
+    }
+    Ok(())
+}
+
 impl VScalar for PyScalar {
     type State = PyScalarState;
 
@@ -457,8 +733,8 @@ impl VScalar for PyScalar {
         let cols: Vec<FlatVector> = (0..arity).map(|j| input.flat_vector(j)).collect();
         // Fetch each column's validity mask once (null when the column has no
         // NULLs). Reading a NULL VARCHAR row's duckdb_string_t would dereference
-        // garbage, so a row with any NULL input yields NULL (SQL semantics) and
-        // is never sent to the interpreter.
+        // garbage, so a NULL input row yields NULL (DuckDB scalar semantics) and
+        // the target fn is never called for it — enforced guest-side.
         let raw_chunk = input.get_ptr();
         let validities: Vec<*const u64> = (0..arity)
             .map(|j| unsafe {
@@ -468,28 +744,15 @@ impl VScalar for PyScalar {
             .collect();
         let mut out = output.flat_vector();
 
-        // Dispatch one offload per row (MVP; arrow-columnar batching is Phase 2).
-        for i in 0..len {
-            let row_null = (0..arity).any(|j| {
-                let val = validities[j];
-                !val.is_null() && unsafe { !row_valid(val, i) }
-            });
-            if row_null {
-                out.set_null(i);
-                continue;
-            }
-            let args: Vec<rmpv::Value> = (0..arity)
-                .map(|j| read_cell(state.args[j], &cols[j], i))
-                .collect();
-            let payload = offload_payload(&state.entry, args);
-            let resp = rt.call("offload", &payload).map_err(to_boxed)?;
-            let val = mp_decode(&resp).map_err(to_boxed)?;
-            if let rmpv::Value::Nil = val {
-                out.set_null(i);
-            } else {
-                write_cell(state.ret, &mut out, i, &val)?;
-            }
-        }
+        // ARROW-COLUMNAR dispatch: one WIT crossing per DataChunk. Serialize the
+        // whole chunk's argument columns into a single Arrow IPC stream, offload
+        // once, decode the returned `result` column back into the output vector.
+        // (The per-row msgpack `offload` remains as `invoke_per_row` for
+        // unsupported/fallback types.)
+        let arrow = encode_arg_batch(&state.args, &cols, len, &validities).map_err(to_boxed)?;
+        let payload = offload_arrow_payload(&state.entry, arrow);
+        let resp = rt.call("offload_arrow", &payload).map_err(to_boxed)?;
+        decode_result_into(state.ret, &resp, &mut out, len).map_err(to_boxed)?;
         Ok(())
     }
 
