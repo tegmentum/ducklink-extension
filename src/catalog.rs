@@ -20,10 +20,10 @@ use serde::Deserialize;
 
 /// The default published catalog URL. Overridable with `DUCKLINK_CATALOG_URL`
 /// (an unreachable value forces the bundled-snapshot fallback).
-const DEFAULT_CATALOG_URL: &str = "https://datalink-ext.tegmentum.ai/ducklink/catalog.json";
+const DEFAULT_CATALOG_URL: &str = "https://ext.ducklink.dev/catalog.json";
 
 /// Base for component blobs: `<BASE>/<content_digest>/<name>.wasm` (RAW bytes).
-const BLOB_BASE: &str = "https://datalink-ext.tegmentum.ai/wasm/sha256";
+const BLOB_BASE: &str = "https://ext.ducklink.dev/wasm/sha256";
 
 /// The catalog snapshot embedded at build time — the offline fallback when the
 /// live catalog is unreachable. A copy of `ducklink/registry/index.json`.
