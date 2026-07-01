@@ -59,9 +59,60 @@ pub struct FunctionSig {
     pub columns: Vec<FunctionArg>,
 }
 
+/// One `providers[]` entry an enriched catalog entry MAY carry. The published
+/// `@2.2.0` catalog gives each entry a `providers[]` array whose members are
+/// either wasm components (`kind:"wasm"`, `abi:"duckdb:extension@X.Y.Z"`, a
+/// `content_digest`) or native/other artifacts. Only `wasm` providers are used
+/// for load resolution; the rest are ignored. Every field is optional so a
+/// partial provider (or an entry with `providers: null`, which is common in the
+/// current catalog) still parses.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Provider {
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The provider kind — `"wasm"` for a component blob, `"native"` for a
+    /// platform `.duckdb_extension`, etc. Only wasm providers are load candidates.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The contract generation this provider was built against, e.g.
+    /// `"duckdb:extension@2.2.0"`. Parsed to a major via [`Provider::abi_major`].
+    #[serde(default)]
+    pub abi: Option<String>,
+    /// The sha256 (hex) of THIS provider's blob (may differ per generation).
+    #[serde(default)]
+    pub content_digest: Option<String>,
+    /// Lifecycle status of this generation: `"supported"` / `"deprecated"` /
+    /// `"eol"`. Absent in the current catalog; rendered as `unknown` then.
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+impl Provider {
+    /// True for a wasm-component provider (the only load-candidate kind).
+    pub fn is_wasm(&self) -> bool {
+        self.kind.as_deref() == Some("wasm")
+    }
+
+    /// Parse the contract-generation MAJOR from `abi` (`"duckdb:extension@X.Y.Z"`
+    /// → `X`). `None` if `abi` is absent or unparseable, so a malformed provider
+    /// is simply skipped by selection rather than mis-selected.
+    pub fn abi_major(&self) -> Option<u64> {
+        abi_major_of(self.abi.as_deref()?)
+    }
+}
+
+/// Parse the MAJOR component of a `duckdb:extension@X.Y.Z` (or bare `X.Y.Z`)
+/// version string. Tolerant: takes whatever follows the last `@` (if any) and
+/// reads the leading integer up to the first `.`.
+pub fn abi_major_of(abi: &str) -> Option<u64> {
+    let ver = abi.rsplit('@').next().unwrap_or(abi);
+    let major = ver.split('.').next().unwrap_or(ver);
+    major.trim().parse::<u64>().ok()
+}
+
 /// A single catalog entry. Only the fields the loader / discovery functions
 /// need are modelled; unknown fields are ignored, so the rich published schema
-/// (providers, conformance, ...) parses without listing every field.
+/// (conformance, ...) parses without listing every field.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CatalogEntry {
     pub name: String,
@@ -84,11 +135,34 @@ pub struct CatalogEntry {
     #[serde(default)]
     pub crates: Vec<String>,
     /// The sha256 (hex) of the component blob; required to fetch + verify it.
+    /// This is the entry's DEFAULT/top-level digest, used when no `providers[]`
+    /// wasm entry matches the host generation.
     #[serde(default)]
     pub content_digest: Option<String>,
+    /// The contract-generation version string of the entry's default artifact
+    /// (e.g. `"4.0.0"`), when the catalog carries it. Used to label the
+    /// synthetic `ducklink.versions` row for entries that carry no `providers[]`.
+    #[serde(default)]
+    pub wit_contract_version: Option<String>,
+    /// The per-generation artifact providers. Each enriched entry MAY carry a
+    /// `providers[]` array; `null`/absent is common in the current catalog and
+    /// parses to an empty list. Wasm providers here drive generation selection.
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
+    pub providers: Vec<Provider>,
     /// The signature-enrichment field; absent in the current snapshot.
     #[serde(default)]
     pub functions: Vec<FunctionSig>,
+}
+
+/// Deserialize a possibly-`null` JSON array into an empty `Vec` (the catalog
+/// writes `"providers": null` for entries with no per-generation providers, and
+/// plain `#[serde(default)]` does not coerce an explicit `null` to `default`).
+fn null_to_empty_vec<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(de)?.unwrap_or_default())
 }
 
 impl CatalogEntry {
@@ -111,6 +185,30 @@ impl CatalogEntry {
     /// from their live registration instead.
     pub fn requires_kind(&self, kind: &str) -> bool {
         self.requires.iter().any(|r| r == kind)
+    }
+
+    /// All wasm providers of this entry, in catalog order.
+    pub fn wasm_providers(&self) -> impl Iterator<Item = &Provider> {
+        self.providers.iter().filter(|p| p.is_wasm())
+    }
+
+    /// Choose the wasm provider (and hence blob digest) this HOST should load,
+    /// given its contract generation `host_major`.
+    ///
+    /// The compat model is BACKWARD-COMPATIBLE: empirically the gen-4 host loads
+    /// and dispatches gen-2 (@2.2.0) scalar / table / aggregate blobs, so a host
+    /// runs any generation ≤ its own. The rule is therefore: pick the NEWEST wasm
+    /// provider whose generation major ≤ `host_major`. A provider whose `abi` is
+    /// absent or unparseable is skipped (never mis-selected). Returns `None` when
+    /// no wasm provider qualifies — the caller then falls back to the entry's
+    /// top-level [`content_digest`].
+    pub fn select_provider(&self, host_major: u64) -> Option<&Provider> {
+        self.wasm_providers()
+            .filter(|p| p.content_digest.is_some())
+            .filter_map(|p| p.abi_major().map(|m| (m, p)))
+            .filter(|(m, _)| *m <= host_major)
+            .max_by_key(|(m, _)| *m)
+            .map(|(_, p)| p)
     }
 }
 
@@ -220,10 +318,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// itself, but the resolve/download happens before that lock is taken).
 static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
 
-/// Resolve a catalog NAME to a local `.wasm` path, downloading + caching +
-/// sha256-verifying the blob if it is not already cached. Returns the cached
-/// path the engine can `load(name, path)` from.
-pub fn resolve_name_to_blob(name: &str) -> Result<PathBuf, String> {
+/// Resolve a catalog NAME to a local `.wasm` path for the given host contract
+/// generation, downloading + caching + sha256-verifying the blob if it is not
+/// already cached. Returns the cached path the engine can `load(name, path)`
+/// from.
+///
+/// `host_major` is the host's `wasm_abi` contract-generation major (e.g. `4`),
+/// read from `HostCaps` by the caller. It drives per-generation provider
+/// selection ([`CatalogEntry::select_provider`]): the newest wasm provider whose
+/// generation ≤ the host's is chosen, falling back to the entry's top-level
+/// `content_digest` when no provider matches (or the entry carries none — the
+/// common case in the current catalog). This keeps single-generation entries
+/// (aba, etc.) loading exactly as before.
+pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, String> {
     let catalog = resolve_catalog();
     let entry = catalog.find(name).ok_or_else(|| {
         let names = catalog.names();
@@ -237,9 +344,34 @@ pub fn resolve_name_to_blob(name: &str) -> Result<PathBuf, String> {
         )
     })?;
 
-    let digest = entry.content_digest.clone().ok_or_else(|| {
-        format!("ducklink_load: catalog entry '{name}' has no content_digest; cannot fetch blob")
-    })?;
+    // Per-generation provider selection: prefer a wasm provider matching the
+    // host generation; otherwise fall back to the entry's top-level digest.
+    let digest = match entry.select_provider(host_major) {
+        Some(p) => {
+            let digest = p.content_digest.clone().expect("selected provider has a digest");
+            eprintln!(
+                "[ducklink] '{name}': selected provider {} (abi {}) for host generation {host_major}",
+                p.id.as_deref().unwrap_or("wasm"),
+                p.abi.as_deref().unwrap_or("?"),
+            );
+            digest
+        }
+        None => {
+            let digest = entry.content_digest.clone().ok_or_else(|| {
+                format!(
+                    "ducklink_load: catalog entry '{name}' has no provider for host \
+                     generation {host_major} and no top-level content_digest; cannot fetch blob"
+                )
+            })?;
+            if !entry.providers.is_empty() {
+                eprintln!(
+                    "[ducklink] '{name}': no wasm provider ≤ host generation {host_major}; \
+                     falling back to top-level digest"
+                );
+            }
+            digest
+        }
+    };
 
     let cache_path = blob_cache_path(&digest, name)
         .ok_or_else(|| "ducklink_load: no cache directory (set HOME or XDG_CACHE_HOME)".to_string())?;
@@ -377,13 +509,106 @@ mod tests {
         unsafe {
             std::env::set_var("DUCKLINK_CATALOG_URL", "https://127.0.0.1:1/nope.json")
         };
-        let r = resolve_name_to_blob("this_name_does_not_exist_xyz");
+        let r = resolve_name_to_blob("this_name_does_not_exist_xyz", 4);
         assert!(r.is_err());
         let msg = r.unwrap_err();
         assert!(
             msg.contains("ducklink.modules"),
             "error should point at discovery: {msg}"
         );
+    }
+
+    #[test]
+    fn abi_major_parses_generation() {
+        assert_eq!(abi_major_of("duckdb:extension@2.2.0"), Some(2));
+        assert_eq!(abi_major_of("duckdb:extension@4.0.0"), Some(4));
+        assert_eq!(abi_major_of("4.0.0"), Some(4));
+        assert_eq!(abi_major_of("2"), Some(2));
+        assert_eq!(abi_major_of("garbage"), None);
+        assert_eq!(abi_major_of(""), None);
+    }
+
+    #[test]
+    fn providers_null_parses_to_empty() {
+        // The live catalog writes `"providers": null` for most entries.
+        let json = r#"{"name":"x","providers":null,"content_digest":"aa"}"#;
+        let e: CatalogEntry = serde_json::from_str(json).expect("null providers parses");
+        assert!(e.providers.is_empty());
+        assert_eq!(e.content_digest.as_deref(), Some("aa"));
+    }
+
+    #[test]
+    fn bundled_provider_entries_select_gen2_for_gen4_host() {
+        // aba carries a wasm provider at duckdb:extension@2.2.0; a gen-4 host is
+        // backward-compatible, so selection picks that provider's digest.
+        let cat = bundled_catalog();
+        let aba = cat.find("aba").expect("aba present");
+        let p = aba.select_provider(4).expect("aba has a wasm provider <= gen 4");
+        assert_eq!(p.abi_major(), Some(2));
+        assert_eq!(
+            p.content_digest.as_deref(),
+            Some("21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b")
+        );
+    }
+
+    #[test]
+    fn provider_selection_picks_newest_le_host_and_respects_ceiling() {
+        let mk = |abi: &str, dig: &str| Provider {
+            id: Some("wasm-component".into()),
+            kind: Some("wasm".into()),
+            abi: Some(abi.into()),
+            content_digest: Some(dig.into()),
+            status: None,
+        };
+        let entry = CatalogEntry {
+            name: "multi".into(),
+            version: None,
+            description: None,
+            categories: vec![],
+            exports: vec![],
+            requires: vec![],
+            crates: vec![],
+            content_digest: Some("top".into()),
+            wit_contract_version: None,
+            providers: vec![
+                mk("duckdb:extension@1.0.0", "d1"),
+                mk("duckdb:extension@2.2.0", "d2"),
+                mk("duckdb:extension@4.0.0", "d4"),
+            ],
+            functions: vec![],
+        };
+        // Gen-4 host: newest <= 4 is the gen-4 provider.
+        assert_eq!(entry.select_provider(4).unwrap().content_digest.as_deref(), Some("d4"));
+        // Gen-3 host: newest <= 3 is the gen-2 provider (no gen-3 available).
+        assert_eq!(entry.select_provider(3).unwrap().content_digest.as_deref(), Some("d2"));
+        // Gen-0 host: nothing qualifies -> None (caller falls back to top-level).
+        assert!(entry.select_provider(0).is_none());
+    }
+
+    #[test]
+    fn native_only_providers_do_not_select_and_fall_back() {
+        // An entry whose only providers are native artifacts must select no wasm
+        // provider (so the loader falls back to the top-level digest).
+        let entry = CatalogEntry {
+            name: "nativeonly".into(),
+            version: None,
+            description: None,
+            categories: vec![],
+            exports: vec![],
+            requires: vec![],
+            crates: vec![],
+            content_digest: Some("top".into()),
+            wit_contract_version: None,
+            providers: vec![Provider {
+                id: Some("native-arm64-macos".into()),
+                kind: Some("native".into()),
+                abi: None,
+                content_digest: Some("nativedigest".into()),
+                status: None,
+            }],
+            functions: vec![],
+        };
+        assert!(entry.select_provider(4).is_none());
     }
 
     #[test]

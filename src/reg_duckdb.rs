@@ -1487,6 +1487,17 @@ fn host_caps() -> HostCaps {
     HOST_CAPS.get().cloned().unwrap_or_default()
 }
 
+/// The host's wasm contract-generation MAJOR (e.g. `4` for `wasm_abi 4.0.0`),
+/// parsed from `HostCaps.abi_version`. Drives per-generation provider selection
+/// in the catalog. Defaults to the runtime's own contract major when the caps
+/// are somehow unset or the version is unparseable, so selection stays sane.
+fn host_generation_major() -> u64 {
+    let caps = host_caps();
+    crate::catalog::abi_major_of(&caps.abi_version)
+        .or_else(|| crate::catalog::abi_major_of(ducklink_runtime::CONTRACT_VERSION))
+        .unwrap_or(0)
+}
+
 /// The capability kinds the COMMON tier (always present, stable C API) satisfies.
 /// A module whose `requires` are all in this set is compatible on any host; a
 /// module requiring anything else needs the advanced tier.
@@ -1569,6 +1580,7 @@ pub fn register_load_function(
     con.register_table_function::<WasmFunctions>("ducklink_functions")?;
     con.register_table_function::<WasmCapabilities>("ducklink_capabilities")?;
     con.register_table_function::<WasmCache>("ducklink_cache")?;
+    con.register_table_function::<WasmVersions>("ducklink_versions")?;
 
     // Create the public `ducklink` SCHEMA of system VIEWS over the internal TFs.
     // This is the discovery API surface: `SELECT * FROM ducklink.modules`, etc.
@@ -1600,7 +1612,8 @@ fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
          CREATE OR REPLACE VIEW ducklink.modules AS SELECT * FROM ducklink_modules();
          CREATE OR REPLACE VIEW ducklink.functions AS SELECT * FROM ducklink_functions();
          CREATE OR REPLACE VIEW ducklink.capabilities AS SELECT * FROM ducklink_capabilities();
-         CREATE OR REPLACE VIEW ducklink.cache AS SELECT * FROM ducklink_cache();",
+         CREATE OR REPLACE VIEW ducklink.cache AS SELECT * FROM ducklink_cache();
+         CREATE OR REPLACE VIEW ducklink.versions AS SELECT * FROM ducklink_versions();",
     )
     // DEFERRED: `ducklink.events` — a query/load event log view — is a planned
     // follow-up. It needs an in-runtime event log (loads, errors, dispatch
@@ -1645,7 +1658,8 @@ pub unsafe fn load_wasm_into_db(
             .to_string();
         (name, path)
     } else {
-        let cached = crate::catalog::resolve_name_to_blob(arg).map_err(|e| e.to_string())?;
+        let cached =
+            crate::catalog::resolve_name_to_blob(arg, host_generation_major()).map_err(|e| e.to_string())?;
         (arg.to_string(), cached)
     };
     let path_str = path.to_string_lossy().into_owned();
@@ -1753,7 +1767,7 @@ impl VTab for WasmLoad {
                 (name, path)
             } else {
                 // Catalog NAME -> resolve + fetch/cache/verify the blob.
-                let cached = crate::catalog::resolve_name_to_blob(&arg_str)
+                let cached = crate::catalog::resolve_name_to_blob(&arg_str, host_generation_major())
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 let name = match bind.get_named_parameter("name") {
                     Some(v) => v.to_string(),
@@ -2461,6 +2475,146 @@ impl VTab for WasmCache {
     }
 }
 
+// --- ducklink_versions() ----------------------------------------------------
+
+/// One (module, generation) row for `ducklink_versions()`.
+struct VersionRow {
+    module: String,
+    /// The provider abi/version string (e.g. `duckdb:extension@2.2.0`, or the
+    /// entry `wit_contract_version` for a provider-less entry).
+    generation: String,
+    /// Lifecycle status from `providers[].status`, else `unknown`.
+    status: String,
+    /// Whether THIS host generation can run this provider generation. Per the
+    /// verified backward-compat model, a host runs any generation ≤ its own.
+    runnable: bool,
+    /// Whether this provider is the one the host would select (== the entry's
+    /// selected/top-level digest).
+    is_default: bool,
+}
+
+/// Build the `ducklink_versions()` rows from the resolved catalog: one row per
+/// (module, generation). Entries that carry a `providers[]` array emit one row
+/// per WASM provider (generation from `providers[].abi`); entries without
+/// providers emit a single synthetic row for their top-level default artifact
+/// (generation from `wit_contract_version`). `runnable` and `is_default` are
+/// decided against the host generation `host_major`.
+fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
+    let catalog = crate::catalog::resolve_catalog();
+    let mut rows = Vec::new();
+    for e in &catalog.extensions {
+        let selected_digest = e
+            .select_provider(host_major)
+            .and_then(|p| p.content_digest.clone())
+            .or_else(|| e.content_digest.clone());
+        let wasm: Vec<_> = e.wasm_providers().collect();
+        if wasm.is_empty() {
+            // No per-generation providers: one synthetic row for the default
+            // artifact, labelled with the entry's contract version if known.
+            let generation = e
+                .wit_contract_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let major = crate::catalog::abi_major_of(&generation);
+            rows.push(VersionRow {
+                module: e.name.clone(),
+                generation,
+                status: "unknown".to_string(),
+                // Unknown generation -> conservatively not runnable; a known
+                // generation is runnable iff <= host (backward-compat model).
+                runnable: major.map(|m| m <= host_major).unwrap_or(false),
+                is_default: true,
+            });
+        } else {
+            for p in wasm {
+                let generation = p.abi.clone().unwrap_or_else(|| "unknown".to_string());
+                let major = p.abi_major();
+                let is_default = p.content_digest.is_some()
+                    && p.content_digest == selected_digest;
+                rows.push(VersionRow {
+                    module: e.name.clone(),
+                    generation,
+                    status: p.status.clone().unwrap_or_else(|| "unknown".to_string()),
+                    runnable: major.map(|m| m <= host_major).unwrap_or(false),
+                    is_default,
+                });
+            }
+        }
+    }
+    rows
+}
+
+struct WasmVersionsBind {
+    rows: Vec<VersionRow>,
+}
+
+/// `ducklink_versions()` — one row per (module, generation), reflecting the
+/// per-generation providers in the resolved catalog and whether THIS host can
+/// run each generation.
+struct WasmVersions;
+
+impl VTab for WasmVersions {
+    type InitData = WasmTableInit;
+    type BindData = WasmVersionsBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_versions bind", || {
+            let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            let boolean = || LogicalTypeHandle::from(LogicalTypeId::Boolean);
+            bind.add_result_column("module", vc());
+            bind.add_result_column("generation", vc());
+            bind.add_result_column("status", vc());
+            bind.add_result_column("runnable", boolean());
+            bind.add_result_column("is_default", boolean());
+            Ok(WasmVersionsBind {
+                rows: build_version_rows(host_generation_major()),
+            })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_versions scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(0).insert(r, row.module.as_str());
+                output.flat_vector(1).insert(r, row.generation.as_str());
+                output.flat_vector(2).insert(r, row.status.as_str());
+            }
+            unsafe {
+                let mut rv = output.flat_vector(3);
+                let run = rv.as_mut_slice::<bool>();
+                let mut dv = output.flat_vector(4);
+                let def = dv.as_mut_slice::<bool>();
+                for r in 0..n {
+                    let row = &bind.rows[start + r];
+                    run[r] = row.runnable;
+                    def[r] = row.is_default;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
+}
+
 /// Load each component and register its functions, sharing one `engine`. Scalars
 /// and table functions register on the duckdb-rs `con`; aggregates (which need
 /// the raw C API) register on `raw_con` when supplied — pass `None` (e.g. the
@@ -2869,6 +3023,20 @@ mod tests {
                 )
                 .expect("capabilities rows");
             assert_eq!(n_caps, 2, "scalar + load_wasm capability rows present");
+
+            // ducklink.versions lists aba's @2.2.0 generation, runnable on this
+            // (gen-4) host and marked default (its selected provider digest).
+            let (vgen, vrun, vdef): (String, bool, bool) = con
+                .query_row(
+                    "SELECT generation, runnable, is_default FROM ducklink.versions \
+                     WHERE module='aba' AND generation LIKE '%@2.2.0'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("aba @2.2.0 row in ducklink.versions");
+            assert_eq!(vgen, "duckdb:extension@2.2.0");
+            assert!(vrun, "gen-4 host runs a gen-2 provider (backward-compat)");
+            assert!(vdef, "aba's @2.2.0 provider is the selected default");
 
             // IDEMPOTENCY: re-loading aba must NOT hard-error.
             let again = con.query_row(

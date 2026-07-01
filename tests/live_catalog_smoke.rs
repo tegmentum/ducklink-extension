@@ -19,7 +19,7 @@ fn live_fetch_downloads_and_verifies_aba() {
     // verified against the catalog content_digest, so a successful return into an
     // empty cache proves the live download + verify path. (The live catalog may
     // carry a NEWER digest than the bundled snapshot — we don't hardcode it.)
-    let path = catalog::resolve_name_to_blob("aba").expect("resolve aba live");
+    let path = catalog::resolve_name_to_blob("aba", 4).expect("resolve aba live");
     assert!(path.is_file(), "blob should be cached at {}", path.display());
     let bytes = std::fs::read(&path).expect("read cached blob");
     assert!(bytes.len() > 1000, "aba.wasm should be a real component");
