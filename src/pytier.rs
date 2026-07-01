@@ -17,6 +17,18 @@
 //! as opaque bytes; msgpack is the application encoding. Arrow-columnar batching
 //! is Phase 2 — this dispatches one row per WIT crossing.
 //!
+//! ## Where the dispatch logic lives
+//!
+//! The pylon endpoint is GENERIC — it carries zero ducklink code. Its reactor
+//! shim imports a `pylon_endpoint` dispatcher module from its `/app` preopen at
+//! runtime (the `.py` is not baked into the component), so the HOST decides the
+//! dispatcher by what it mounts at `/app`. ducklink therefore ships its OWN
+//! dispatcher (`pylib/pylon_endpoint.py` in this crate), which implements the
+//! `runtime.load` / `runtime.manifest` / `offload` methods, and stages it into
+//! `/app` alongside the ducklink SDK + the user script (see [`stage_app_env`]).
+//! A plain `pylon-endpoint.component.wasm` from pylon's `main` thus serves the
+//! ducklink Python source tier with no pylon-side ducklink code.
+//!
 //! ## Residency
 //!
 //! The pylon endpoint (~21 MB) is instantiated ONCE via a
@@ -79,16 +91,22 @@ fn ducklink_sdk_dir() -> PathBuf {
         })
 }
 
-/// The pylon dispatcher pylib (pylon_endpoint.py + _msgpack.py) to stage into the
-/// script env — the reactor shim imports `pylon_endpoint` from the `/app`
-/// preopen at runtime. Overridable via env.
+/// The DUCKLINK-OWNED dispatcher pylib (`pylon_endpoint.py` + `_msgpack.py`) to
+/// stage into the `/app` preopen.
+///
+/// The pylon reactor shim imports a module named `pylon_endpoint` from `/app` at
+/// runtime — the `.py` is NOT baked into the component, so the HOST controls the
+/// dispatcher by what it mounts there. ducklink therefore ships its OWN
+/// dispatcher (this crate's `pylib/`), which implements `runtime.load` /
+/// `runtime.manifest` / `offload`. That keeps the pylon endpoint generic (it
+/// carries zero ducklink code); a plain `pylon-endpoint.component.wasm` from
+/// pylon's `main` serves the ducklink Python source tier. Overridable via env
+/// (`DUCKLINK_PYLON_PYLIB`); the default is this crate's `pylib/` dir, resolved
+/// from `CARGO_MANIFEST_DIR` (baked in at compile time).
 fn pylon_pylib_dir() -> PathBuf {
     std::env::var_os("DUCKLINK_PYLON_PYLIB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home).join("git/python-wasm/bindings/pylon-endpoint/pylib")
-        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pylib"))
 }
 
 /// Process-wide resident pylon runtime for the Python source tier. Holds the
@@ -193,22 +211,32 @@ impl PylonRuntime {
 }
 
 /// Create a fresh per-process `/app` staging dir under the system temp dir,
-/// copying in the pylon dispatcher pylib and the ducklink SDK. User scripts are
-/// added into this same dir per-call (so `import <script>` resolves alongside
-/// `import ducklink`). Returns the host path mounted at `/app`.
+/// copying in the DUCKLINK-OWNED dispatcher pylib and the ducklink SDK. User
+/// scripts are added into this same dir per-call (so `import <script>` resolves
+/// alongside `import ducklink`). Returns the host path mounted at `/app`.
+///
+/// The dispatcher (`pylon_endpoint.py`) is ducklink's own — NOT pylon's — so the
+/// pylon endpoint stays generic. The reactor shim imports `pylon_endpoint` from
+/// `/app`, so mounting ours here is what wires the ducklink `runtime.*`/`offload`
+/// methods into an otherwise-plain pylon interpreter.
 fn stage_app_env() -> Result<PathBuf, String> {
     let base = std::env::temp_dir().join(format!("ducklink-pytier-{}", std::process::id()));
     let app = base.join("app");
     std::fs::create_dir_all(&app).map_err(|e| format!("create {}: {e}", app.display()))?;
 
-    // Pylon dispatcher + msgpack (imported by the reactor shim from /app).
+    // The ducklink-owned dispatcher + its msgpack codec (imported by the reactor
+    // shim as `pylon_endpoint` from /app). Both are shipped in this crate's
+    // `pylib/`, so a missing file is a build/packaging error, not a soft skip.
     let pylib = pylon_pylib_dir();
     for f in ["pylon_endpoint.py", "_msgpack.py"] {
         let src = pylib.join(f);
-        if src.exists() {
-            std::fs::copy(&src, app.join(f))
-                .map_err(|e| format!("stage {}: {e}", src.display()))?;
+        if !src.exists() {
+            return Err(format!(
+                "ducklink_run: dispatcher asset {} not found (set DUCKLINK_PYLON_PYLIB)",
+                src.display()
+            ));
         }
+        std::fs::copy(&src, app.join(f)).map_err(|e| format!("stage {}: {e}", src.display()))?;
     }
 
     // The ducklink authoring SDK package -> /app/ducklink.
