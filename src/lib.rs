@@ -16,6 +16,13 @@
 
 pub mod engine;
 
+/// Process-wide runtime event log — the bounded ring buffer behind the
+/// `ducklink.events` system view. Decoupled from any runtime handle so any code
+/// path (catalog resolution, load bind, the advanced `LOAD WASM` bridge) can
+/// [`events::emit`] an audit record without threading state through. Pure std,
+/// always compiled.
+pub mod events;
+
 /// Catalog resolution + name->blob fetch/cache/verify for `ducklink_load(<name>)`
 /// by catalog NAME. Live HTTPS fetch with a bundled-snapshot fallback; downloaded
 /// blobs are sha256-verified against the catalog `content_digest` before caching.

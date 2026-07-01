@@ -1581,6 +1581,7 @@ pub fn register_load_function(
     con.register_table_function::<WasmCapabilities>("ducklink_capabilities")?;
     con.register_table_function::<WasmCache>("ducklink_cache")?;
     con.register_table_function::<WasmVersions>("ducklink_versions")?;
+    con.register_table_function::<WasmEvents>("ducklink_events")?;
 
     // Create the public `ducklink` SCHEMA of system VIEWS over the internal TFs.
     // This is the discovery API surface: `SELECT * FROM ducklink.modules`, etc.
@@ -1613,11 +1614,9 @@ fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
          CREATE OR REPLACE VIEW ducklink.functions AS SELECT * FROM ducklink_functions();
          CREATE OR REPLACE VIEW ducklink.capabilities AS SELECT * FROM ducklink_capabilities();
          CREATE OR REPLACE VIEW ducklink.cache AS SELECT * FROM ducklink_cache();
-         CREATE OR REPLACE VIEW ducklink.versions AS SELECT * FROM ducklink_versions();",
+         CREATE OR REPLACE VIEW ducklink.versions AS SELECT * FROM ducklink_versions();
+         CREATE OR REPLACE VIEW ducklink.events AS SELECT * FROM ducklink_events();",
     )
-    // DEFERRED: `ducklink.events` — a query/load event log view — is a planned
-    // follow-up. It needs an in-runtime event log (loads, errors, dispatch
-    // counts) that does not exist yet, so it is intentionally NOT created here.
 }
 
 /// Load a component (by path or catalog name) into the GIVEN database handle and
@@ -1664,9 +1663,17 @@ pub unsafe fn load_wasm_into_db(
     };
     let path_str = path.to_string_lossy().into_owned();
 
+    crate::events::emit("load_start", Some(&name), path_str.clone());
     let loaded = {
         let mut e = rt.engine.lock().expect("engine mutex poisoned");
-        e.load(&name, &path).map_err(|e| e.to_string())?
+        match e.load(&name, &path) {
+            Ok(l) => l,
+            Err(err) => {
+                let msg = err.to_string();
+                crate::events::emit("load_error", Some(&name), msg.clone());
+                return Err(msg);
+            }
+        }
     };
 
     // Register on the PERSISTENT init connection (database-wide; valid for the
@@ -1707,6 +1714,11 @@ pub unsafe fn load_wasm_into_db(
         }
     }
 
+    crate::events::emit(
+        "load_ok",
+        Some(&name),
+        format!("{scalars} scalars, {tables} tables, {agg} aggregates"),
+    );
     Ok((name, scalars, tables, agg))
 }
 
@@ -1777,11 +1789,18 @@ impl VTab for WasmLoad {
             };
             let path_str = path.to_string_lossy().into_owned();
 
+            crate::events::emit("load_start", Some(&name), path_str.clone());
             // Load the component through the shared engine.
             let loaded = {
                 let mut e = rt.engine.lock().expect("engine mutex poisoned");
-                e.load(&name, &path)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
+                match e.load(&name, &path) {
+                    Ok(l) => l,
+                    Err(err) => {
+                        let msg = err.to_string();
+                        crate::events::emit("load_error", Some(&name), msg.clone());
+                        return Err(msg.into());
+                    }
+                }
             };
 
             // Register on the PERSISTENT connection captured at init (NOT a fresh
@@ -1839,6 +1858,11 @@ impl VTab for WasmLoad {
                 }
             }
 
+            crate::events::emit(
+                "load_ok",
+                Some(&name),
+                format!("{scalars} scalars, {tables} tables, {agg} aggregates"),
+            );
             Ok(WasmLoadBind {
                 name,
                 path: path_str,
@@ -2475,6 +2499,89 @@ impl VTab for WasmCache {
     }
 }
 
+// --- ducklink_events() ------------------------------------------------------
+
+struct WasmEventsBind {
+    rows: Vec<crate::events::Event>,
+}
+
+/// `ducklink_events()` — a snapshot of the process-wide runtime event log
+/// ([`crate::events`]), one row per recorded event, ordered by `seq`. Backs the
+/// `ducklink.events` system view: an in-process audit trail of catalog fetches,
+/// cache hits/misses, downloads, sha256 verification, provider selection, and
+/// the load lifecycle. The snapshot is taken at bind so a single scan sees a
+/// consistent view even if concurrent loads keep emitting.
+struct WasmEvents;
+
+impl VTab for WasmEvents {
+    type InitData = WasmTableInit;
+    type BindData = WasmEventsBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_events bind", || {
+            bind.add_result_column("seq", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+            bind.add_result_column("ts", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+            bind.add_result_column("kind", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("module", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("detail", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            // Snapshot is already oldest-first (ascending seq); the emit path
+            // assigns seq monotonically, so no re-sort is needed.
+            Ok(WasmEventsBind {
+                rows: crate::events::snapshot(),
+            })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_events scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(2).insert(r, row.kind.as_str());
+                match row.module.as_deref() {
+                    Some(m) => output.flat_vector(3).insert(r, m),
+                    // NULL module column when the event is not module-scoped
+                    // (e.g. catalog_fetch / catalog_fallback).
+                    None => output.flat_vector(3).set_null(r),
+                }
+                output.flat_vector(4).insert(r, row.detail.as_str());
+            }
+            unsafe {
+                let mut sv = output.flat_vector(0);
+                let s = sv.as_mut_slice::<i64>();
+                // TIMESTAMP stores i64 micros-since-epoch; write the raw micros
+                // straight into the physical column (same technique as
+                // `ducklink_cache().modified`).
+                let mut tv = output.flat_vector(1);
+                let t = tv.as_mut_slice::<i64>();
+                for r in 0..n {
+                    s[r] = bind.rows[start + r].seq as i64;
+                    t[r] = bind.rows[start + r].ts_micros;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
+}
+
 // --- ducklink_versions() ----------------------------------------------------
 
 /// One (module, generation) row for `ducklink_versions()`.
@@ -3013,6 +3120,30 @@ mod tests {
                 )
                 .expect("aba in ducklink.cache");
             assert!(cache_hit >= 1, "aba blob should appear in ducklink.cache");
+
+            // ducklink.events recorded the aba load lifecycle. The load above
+            // resolved a seeded/cached blob, so at minimum load_start + load_ok
+            // were emitted for module 'aba', ordered by monotonic seq, and the
+            // ts column is a real TIMESTAMP.
+            let (start_seq, ok_seq): (i64, i64) = con
+                .query_row(
+                    "SELECT \
+                       max(seq) FILTER (WHERE kind='load_start'), \
+                       max(seq) FILTER (WHERE kind='load_ok') \
+                     FROM ducklink.events WHERE module='aba'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("aba load_start/load_ok in ducklink.events");
+            assert!(ok_seq > start_seq, "load_ok must follow load_start by seq");
+            let ts_type: String = con
+                .query_row(
+                    "SELECT typeof(ts) FROM ducklink.events LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("events ts type");
+            assert_eq!(ts_type, "TIMESTAMP", "events.ts must be a TIMESTAMP");
 
             // ducklink.capabilities always has the common-tier rows.
             let n_caps: i64 = con

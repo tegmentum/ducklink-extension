@@ -266,10 +266,18 @@ pub fn resolve_catalog() -> &'static Catalog {
         let url =
             std::env::var("DUCKLINK_CATALOG_URL").unwrap_or_else(|_| DEFAULT_CATALOG_URL.to_string());
         match fetch_live_catalog(&url) {
-            Some(cat) => cat,
+            Some(cat) => {
+                crate::events::emit("catalog_fetch", None, url.clone());
+                cat
+            }
             None => {
                 eprintln!(
                     "[ducklink] live catalog at {url} unreachable; using bundled snapshot"
+                );
+                crate::events::emit(
+                    "catalog_fallback",
+                    None,
+                    format!("live catalog at {url} unreachable; using bundled snapshot"),
                 );
                 bundled_catalog()
             }
@@ -333,6 +341,7 @@ static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
 pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, String> {
     let catalog = resolve_catalog();
     let entry = catalog.find(name).ok_or_else(|| {
+        crate::events::emit("unknown_name", Some(name), format!("no catalog entry for '{name}'"));
         let names = catalog.names();
         let preview: Vec<&str> = names.iter().take(12).map(|s| s.as_str()).collect();
         format!(
@@ -349,10 +358,15 @@ pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, Stri
     let digest = match entry.select_provider(host_major) {
         Some(p) => {
             let digest = p.content_digest.clone().expect("selected provider has a digest");
+            let abi = p.abi.as_deref().unwrap_or("?");
+            let id = p.id.as_deref().unwrap_or("wasm");
             eprintln!(
-                "[ducklink] '{name}': selected provider {} (abi {}) for host generation {host_major}",
-                p.id.as_deref().unwrap_or("wasm"),
-                p.abi.as_deref().unwrap_or("?"),
+                "[ducklink] '{name}': selected provider {id} (abi {abi}) for host generation {host_major}",
+            );
+            crate::events::emit(
+                "select_provider",
+                Some(name),
+                format!("provider {id} (abi {abi}) for host generation {host_major}"),
             );
             digest
         }
@@ -369,6 +383,11 @@ pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, Stri
                      falling back to top-level digest"
                 );
             }
+            crate::events::emit(
+                "select_provider",
+                Some(name),
+                format!("top-level digest for host generation {host_major}"),
+            );
             digest
         }
     };
@@ -379,25 +398,37 @@ pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, Stri
     // Already cached: trust the digest-keyed path (the path itself encodes the
     // verified content hash), so re-loads are an immediate cache hit.
     if cache_path.is_file() {
+        crate::events::emit("cache_hit", Some(name), cache_path.to_string_lossy().into_owned());
         return Ok(cache_path);
     }
 
     let _guard = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Re-check after taking the lock (another thread may have just fetched it).
     if cache_path.is_file() {
+        crate::events::emit("cache_hit", Some(name), cache_path.to_string_lossy().into_owned());
         return Ok(cache_path);
     }
 
+    crate::events::emit("cache_miss", Some(name), format!("not cached (digest {digest})"));
+
+    let url = format!("{BLOB_BASE}/{digest}/{name}.wasm");
+    crate::events::emit("download", Some(name), url);
     let bytes = download_blob(&digest, name)?;
 
     // VERIFY: the downloaded bytes' sha256 must equal the catalog digest. A
     // mismatch means a corrupt or tampered blob — fail loudly, never cache it.
     let got = sha256_hex(&bytes);
     if got != digest {
+        crate::events::emit(
+            "verify_fail",
+            Some(name),
+            format!("expected {digest}, got {got}"),
+        );
         return Err(format!(
             "ducklink_load: sha256 mismatch for '{name}': catalog says {digest}, downloaded bytes hash to {got} (refusing to cache)"
         ));
     }
+    crate::events::emit("verify_ok", Some(name), digest.clone());
 
     write_cache(&cache_path, &bytes)?;
     Ok(cache_path)
