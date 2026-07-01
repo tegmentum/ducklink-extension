@@ -166,6 +166,15 @@ impl Engine2 {
         })
     }
 
+    /// The shared wasmtime [`Engine`] (component-model + exceptions enabled, with
+    /// the on-disk compile cache). Cheap to clone (`Engine` is `Arc`-backed).
+    /// Exposed so the Python source tier can build its own resident-provider
+    /// [`ProviderRegistry`] on the SAME engine — reusing the compile cache for
+    /// the ~21 MB pylon endpoint component.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
     /// Load a `duckdb:extension` component, run its `load()`, and return the
     /// functions it registered. The instance is retained for dispatch.
     pub fn load(&mut self, extension: &str, path: &Path) -> Result<LoadedComponent> {

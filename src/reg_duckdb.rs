@@ -1540,6 +1540,24 @@ unsafe impl Sync for DucklinkRuntime {}
 
 static RUNTIME: std::sync::OnceLock<DucklinkRuntime> = std::sync::OnceLock::new();
 
+/// The shared wasmtime [`Engine`](wasmtime::Engine) the Direction-2 `Engine2`
+/// runs on, cloned. `None` before `LOAD ducklink`. The Python source tier
+/// (`ducklink_run`) builds its resident-pylon provider registry on this same
+/// engine so the ~21 MB endpoint component reuses the compile cache.
+pub(crate) fn ducklink_engine() -> Option<wasmtime::Engine> {
+    let rt = RUNTIME.get()?;
+    let e = rt.engine.lock().expect("engine mutex poisoned");
+    Some(e.engine().clone())
+}
+
+/// The persistent init-time [`Connection`] (opened while `db` was valid). The
+/// Python source tier registers its authored scalars through THIS connection
+/// (database-wide, no reconnect through the dangling `db` handle). `None` before
+/// `LOAD ducklink`.
+pub(crate) fn ducklink_connection() -> Option<&'static Mutex<Connection>> {
+    RUNTIME.get().map(|rt| &rt.con)
+}
+
 /// Register the `ducklink_load(path)` table function and capture the
 /// process-wide runtime handle it needs. Idempotent: the handle is set once
 /// (the first `LOAD ducklink` in the process wins); the table function is
@@ -1573,6 +1591,12 @@ pub fn register_load_function(
         loaded: Mutex::new(Vec::new()),
     });
     con.register_table_function::<WasmLoad>("ducklink_load")?;
+    // The Python source tier: `ducklink_run('<script.py>')`. Non-fatal so a
+    // failure here never breaks `LOAD ducklink` (the pylon endpoint is an
+    // optional, out-of-tree artifact resolved lazily on first call).
+    if let Err(e) = crate::pytier::register_run_function(con) {
+        eprintln!("[ducklink] could not register ducklink_run: {e}");
+    }
     // The INTERNAL discovery table functions backing the public `ducklink.*`
     // views. Users query the views (`SELECT * FROM ducklink.modules`); these
     // `ducklink_*()` TFs are the implementation the views select from.

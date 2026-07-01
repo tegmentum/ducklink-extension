@@ -72,6 +72,10 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # Verify a downloaded component blob's bytes against the catalog entry's
 # content_digest (sha256) before caching/loading it.
 sha2 = "0.10"
+# MessagePack for the Python source tier (`ducklink_run`): the offload envelope
+# the resident pylon endpoint speaks over compose:dynlink/endpoint. Per-row
+# scalar args/results cross as msgpack (arrow-columnar is Phase 2).
+rmpv = "1"
 
 # DuckDB C Extension API (loadable-extension build). Pinned to the DuckDB version
 # the community-extensions CI builds against (v1.5.4); bumped per release.

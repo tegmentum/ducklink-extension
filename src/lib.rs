@@ -36,6 +36,13 @@ pub mod catalog;
 #[cfg(feature = "duckdb-api")]
 pub mod reg_duckdb;
 
+/// The Python source tier: `ducklink_run('<script.py>')` loads a Python-authored
+/// extension into a resident CPython-in-wasm interpreter (the pylon endpoint) and
+/// registers its `@ducklink`-decorated functions as real DuckDB functions. Gated
+/// on `duckdb-api` (it registers via duckdb-rs) like `reg_duckdb`.
+#[cfg(feature = "duckdb-api")]
+pub mod pytier;
+
 /// The advanced dispatch tier (PARSER / OPTIMIZER / table FILTER pushdown): the
 /// Rust side of the C++ shim that binds DuckDB's internal C++ ABI. Compiled in
 /// only when the `advanced` feature is built AND the C++ shim was compiled —
