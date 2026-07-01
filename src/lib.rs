@@ -55,7 +55,10 @@ mod loadable {
     use duckdb::Connection;
 
     use crate::engine::Engine2;
-    use crate::reg_duckdb::{component_specs_from_env, register_components, register_load_function};
+    use crate::reg_duckdb::{
+        component_specs_from_env, register_components, register_load_function, set_host_caps,
+        HostCaps,
+    };
 
     // The advanced-tier C++ shim, compiled against DuckDB's internal headers and
     // linked into this extension (see build.rs). Internal C++ symbols it
@@ -270,6 +273,18 @@ mod loadable {
                  (scalar/table/aggregate) is active."
             );
         }
+
+        // Record the host capability profile for the `ducklink.capabilities`
+        // discovery view (and the `ducklink.modules.compatible` column). Captures
+        // the tier gate decision just made, whether the advanced tier is compiled
+        // into this artifact at all, the host DuckDB version, and the wasm ABI.
+        set_host_caps(HostCaps {
+            advanced_enabled,
+            advanced_built: cfg!(advanced_tier),
+            host_version: host_version.clone(),
+            built_against: DUCKDB_ABI_VERSION.to_string(),
+            abi_version: ducklink_runtime::CONTRACT_VERSION.to_string(),
+        });
 
         // duckdb-rs Connection for the safe scalar / table registration paths.
         let con = Connection::open_from_raw(db.cast())?;

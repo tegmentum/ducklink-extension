@@ -170,6 +170,51 @@ fn logical_type(code: u8) -> LogicalTypeHandle {
     LogicalTypeHandle::from(id)
 }
 
+/// Render a neutral logical type as the DuckDB SQL type name the bridge declares
+/// it as (matching `logical_type` above). Used by the discovery views to show a
+/// function's argument/return types the way a user would write them in SQL
+/// (e.g. `VARCHAR`, `BIGINT`, `BOOLEAN`), rather than the internal `reg` names
+/// (`TEXT`, `INT64`) that `reg::LogicalType::describe` yields.
+pub(crate) fn sql_type_name(lt: &reg::LogicalType) -> String {
+    match lt {
+        reg::LogicalType::Int64 => "BIGINT".to_string(),
+        reg::LogicalType::Uint64 => "UBIGINT".to_string(),
+        reg::LogicalType::Float64 => "DOUBLE".to_string(),
+        reg::LogicalType::Boolean => "BOOLEAN".to_string(),
+        reg::LogicalType::Text => "VARCHAR".to_string(),
+        reg::LogicalType::Blob => "BLOB".to_string(),
+        reg::LogicalType::Int8 => "TINYINT".to_string(),
+        reg::LogicalType::Int16 => "SMALLINT".to_string(),
+        reg::LogicalType::Int32 => "INTEGER".to_string(),
+        reg::LogicalType::Uint8 => "UTINYINT".to_string(),
+        reg::LogicalType::Uint16 => "USMALLINT".to_string(),
+        reg::LogicalType::Uint32 => "UINTEGER".to_string(),
+        reg::LogicalType::Float32 => "FLOAT".to_string(),
+        reg::LogicalType::Timestamp => "TIMESTAMP".to_string(),
+        reg::LogicalType::Date => "DATE".to_string(),
+        reg::LogicalType::Time => "TIME".to_string(),
+        reg::LogicalType::Timestamptz => "TIMESTAMP WITH TIME ZONE".to_string(),
+        reg::LogicalType::Decimal => "DECIMAL(18, 3)".to_string(),
+        reg::LogicalType::Interval => "INTERVAL".to_string(),
+        reg::LogicalType::Uuid => "UUID".to_string(),
+        // The Complex escape-hatch carries the declared type-expression verbatim.
+        reg::LogicalType::Complex(expr) => expr.clone(),
+    }
+}
+
+/// Render a function's argument list as a comma-separated SQL signature, e.g.
+/// `VARCHAR` or `name VARCHAR, digits INTEGER`. Anonymous positional args show
+/// only their type.
+fn render_arg_signature(args: &[reg::FuncArg]) -> String {
+    args.iter()
+        .map(|a| match &a.name {
+            Some(n) if !n.is_empty() => format!("{n} {}", sql_type_name(&a.logical)),
+            _ => sql_type_name(&a.logical),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// True if row `r` is valid (non-NULL) under DuckDB's bitmask layout. A null
 /// `validity` pointer means the whole column is valid.
 ///
@@ -1335,21 +1380,146 @@ struct DucklinkRuntime {
     raw_con: RawConnHandle,
     engine: Arc<Mutex<Engine2>>,
     /// Components loaded in THIS session (by `ducklink_load`), tracked so
-    /// `ducklink_loaded()` can report them and so a re-load is idempotent.
+    /// `ducklink_modules().loaded` can report them and so a re-load is idempotent.
     loaded: Mutex<Vec<LoadedRecord>>,
 }
 
 /// A kept-alive raw `duckdb_connection` (opened at init, valid for the process).
 struct RawConnHandle(ffi::duckdb_connection);
 
-/// A summary of one component loaded this session, surfaced by `ducklink_loaded()`.
+/// A summary of one component loaded this session. Surfaced through the `loaded`
+/// / count columns of `ducklink_modules()` and the LIVE per-function signatures
+/// of `ducklink_functions()`.
 #[derive(Clone)]
 struct LoadedRecord {
     name: String,
     scalars: usize,
     tables: usize,
     aggregates: usize,
+    #[allow(dead_code)]
     path: String,
+    /// The component's live registered functions, kept so `ducklink_functions()`
+    /// can render exact engine signatures (name/kind/arguments/returns) for a
+    /// loaded module rather than falling back to catalog names.
+    funcs: Vec<LoadedFuncSig>,
+}
+
+/// A single live function signature captured from a loaded component, for the
+/// `ducklink_functions()` view.
+#[derive(Clone)]
+struct LoadedFuncSig {
+    name: String,
+    kind: &'static str,
+    arguments: String,
+    returns: String,
+}
+
+/// Capture the live signatures of every function a component registered, so the
+/// `ducklink_functions()` view can render exact argument/return types for loaded
+/// modules (as opposed to the catalog's name-only fallback for unloaded ones).
+fn capture_live_sigs(loaded: &crate::engine::LoadedComponent) -> Vec<LoadedFuncSig> {
+    let mut out = Vec::new();
+    for f in &loaded.scalars {
+        out.push(LoadedFuncSig {
+            name: f.name.clone(),
+            kind: "scalar",
+            arguments: render_arg_signature(&f.arguments),
+            returns: sql_type_name(&f.returns),
+        });
+    }
+    for f in &loaded.tables {
+        let cols = f
+            .columns
+            .iter()
+            .map(|c| format!("{} {}", c.name, sql_type_name(&c.logical)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(LoadedFuncSig {
+            name: f.name.clone(),
+            kind: "table",
+            arguments: render_arg_signature(&f.arguments),
+            returns: format!("TABLE({cols})"),
+        });
+    }
+    for f in &loaded.aggregates {
+        out.push(LoadedFuncSig {
+            name: f.name.clone(),
+            kind: "aggregate",
+            arguments: render_arg_signature(&f.arguments),
+            returns: sql_type_name(&f.returns),
+        });
+    }
+    out
+}
+
+/// The host capability profile captured at `LOAD ducklink` time: which tiers are
+/// active on THIS artifact + host, so `ducklink_capabilities()` can report them
+/// and `ducklink_modules().compatible` can be decided. Set once by the entry
+/// point via [`set_host_caps`]; read by the capability + module views.
+#[derive(Clone, Default)]
+pub struct HostCaps {
+    /// The advanced tier (parser / optimizer / internal-ABI) is active: the
+    /// artifact was built with `--features advanced` AND the host DuckDB version
+    /// matched the built-against gate.
+    pub advanced_enabled: bool,
+    /// The advanced tier was compiled into this artifact at all (`cfg(advanced_tier)`).
+    pub advanced_built: bool,
+    /// The host DuckDB library version string, if known.
+    pub host_version: Option<String>,
+    /// The DuckDB version this artifact's advanced tier was built against (the
+    /// exact-version gate). The advanced tier is active only when `host_version`
+    /// equals this.
+    pub built_against: String,
+    /// The wasm component ABI / WIT contract version this host speaks.
+    pub abi_version: String,
+}
+
+static HOST_CAPS: std::sync::OnceLock<HostCaps> = std::sync::OnceLock::new();
+
+/// Record the host capability profile (called once from the entry point after the
+/// tier gate is decided). Later calls are ignored (the first `LOAD` wins), mirror-
+/// ing `RUNTIME`.
+pub fn set_host_caps(caps: HostCaps) {
+    let _ = HOST_CAPS.set(caps);
+}
+
+fn host_caps() -> HostCaps {
+    HOST_CAPS.get().cloned().unwrap_or_default()
+}
+
+/// The capability kinds the COMMON tier (always present, stable C API) satisfies.
+/// A module whose `requires` are all in this set is compatible on any host; a
+/// module requiring anything else needs the advanced tier.
+const COMMON_TIER_KINDS: &[&str] = &[
+    "scalar",
+    "table",
+    "aggregate",
+    "macro",
+    "cast",
+    "network",
+    "compose-dynlink",
+];
+
+/// The capability kinds the ADVANCED tier adds (internal C++ ABI). Present only
+/// when the advanced tier is active on this host.
+const ADVANCED_TIER_KINDS: &[&str] =
+    &["parser", "optimizer", "storage", "index", "catalog", "query", "window"];
+
+/// True when THIS host can satisfy every capability `kind` in `requires`. The
+/// common tier is always available; advanced-only kinds need the advanced tier
+/// active. An unknown kind is treated as advanced-only (conservative: report it
+/// incompatible unless the advanced tier is up).
+fn module_compatible(requires: &[String], caps: &HostCaps) -> bool {
+    requires.iter().all(|r| {
+        if COMMON_TIER_KINDS.contains(&r.as_str()) {
+            true
+        } else if ADVANCED_TIER_KINDS.contains(&r.as_str()) {
+            caps.advanced_enabled
+        } else {
+            // Unknown / host-component requirement: satisfiable only if advanced.
+            caps.advanced_enabled
+        }
+    })
 }
 
 // SAFETY: `db` is a stable, process-lifetime handle DuckDB owns; we only read it
@@ -1392,9 +1562,49 @@ pub fn register_load_function(
         loaded: Mutex::new(Vec::new()),
     });
     con.register_table_function::<WasmLoad>("ducklink_load")?;
-    con.register_table_function::<WasmExtensions>("ducklink_extensions")?;
-    con.register_table_function::<WasmLoaded>("ducklink_loaded")?;
+    // The INTERNAL discovery table functions backing the public `ducklink.*`
+    // views. Users query the views (`SELECT * FROM ducklink.modules`); these
+    // `ducklink_*()` TFs are the implementation the views select from.
+    con.register_table_function::<WasmModules>("ducklink_modules")?;
+    con.register_table_function::<WasmFunctions>("ducklink_functions")?;
+    con.register_table_function::<WasmCapabilities>("ducklink_capabilities")?;
+    con.register_table_function::<WasmCache>("ducklink_cache")?;
+
+    // Create the public `ducklink` SCHEMA of system VIEWS over the internal TFs.
+    // This is the discovery API surface: `SELECT * FROM ducklink.modules`, etc.
+    // Done here on the init connection — which is still valid (only LATER
+    // reconnection through the dangling `db` handle is unsafe; creating objects
+    // on this live init connection at load time is fine). NON-FATAL: a failure to
+    // create the schema/views must never break `LOAD ducklink` (the raw
+    // `ducklink_*()` TFs remain callable directly as a fallback).
+    //
+    // NOTE on catalog placement: with no explicit catalog qualifier the schema
+    // lands in the currently-active catalog (the default in-memory/attached
+    // database for the session). `SELECT * FROM ducklink.modules` then resolves
+    // in a normal session. Under a foreign `ATTACH ... AS other; USE other;` the
+    // schema would be created in whichever catalog is active at LOAD time; the
+    // views are recreated (CREATE OR REPLACE) on each LOAD, so a later LOAD in a
+    // different active catalog re-materialises them there.
+    if let Err(e) = create_ducklink_schema(con) {
+        eprintln!("[ducklink] could not create ducklink schema/views: {e}");
+    }
     Ok(())
+}
+
+/// Create the `ducklink` schema and its system views over the internal discovery
+/// table functions. Idempotent (`CREATE SCHEMA IF NOT EXISTS` + `CREATE OR
+/// REPLACE VIEW`), so re-running on every `LOAD ducklink` is safe.
+fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
+    con.execute_batch(
+        "CREATE SCHEMA IF NOT EXISTS ducklink;
+         CREATE OR REPLACE VIEW ducklink.modules AS SELECT * FROM ducklink_modules();
+         CREATE OR REPLACE VIEW ducklink.functions AS SELECT * FROM ducklink_functions();
+         CREATE OR REPLACE VIEW ducklink.capabilities AS SELECT * FROM ducklink_capabilities();
+         CREATE OR REPLACE VIEW ducklink.cache AS SELECT * FROM ducklink_cache();",
+    )
+    // DEFERRED: `ducklink.events` — a query/load event log view — is a planned
+    // follow-up. It needs an in-runtime event log (loads, errors, dispatch
+    // counts) that does not exist yet, so it is intentionally NOT created here.
 }
 
 /// Load a component (by path or catalog name) into the GIVEN database handle and
@@ -1475,6 +1685,7 @@ pub unsafe fn load_wasm_into_db(
             tables,
             aggregates: agg,
             path: path_str,
+            funcs: capture_live_sigs(&loaded),
         };
         match loaded_list.iter_mut().find(|r| r.name == name) {
             Some(existing) => *existing = rec,
@@ -1596,7 +1807,7 @@ impl VTab for WasmLoad {
             bind.add_result_column("tables", LogicalTypeHandle::from(LogicalTypeId::Bigint));
             bind.add_result_column("aggregates", LogicalTypeHandle::from(LogicalTypeId::Bigint));
 
-            // Track this load for `ducklink_loaded()`. A re-load of the same name
+            // Track this load for `ducklink_modules().loaded`. A re-load of the same name
             // updates the existing record rather than appending a duplicate.
             {
                 let mut loaded_list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
@@ -1606,6 +1817,7 @@ impl VTab for WasmLoad {
                     tables,
                     aggregates: agg,
                     path: path_str.clone(),
+                    funcs: capture_live_sigs(&loaded),
                 };
                 match loaded_list.iter_mut().find(|r| r.name == name) {
                     Some(existing) => *existing = rec,
@@ -1668,69 +1880,124 @@ impl VTab for WasmLoad {
 }
 
 // ---------------------------------------------------------------------------
-// `ducklink_extensions()` — list the published catalog (discovery)
+// Discovery table functions backing the public `ducklink.*` views
 // ---------------------------------------------------------------------------
+//
+// These `ducklink_*()` table functions are the INTERNAL implementation of the
+// public discovery API. Users query the `ducklink` schema of system views
+// (`SELECT * FROM ducklink.modules`, `ducklink.functions`, `ducklink.capabilities`,
+// `ducklink.cache`), which are `CREATE OR REPLACE VIEW`s over these TFs (see
+// `create_ducklink_schema`). The TFs remain individually callable as a fallback.
 
-/// Render an entry's function list for the `functions` column: the rich
-/// signature names if the catalog carries them (the signature-enrichment field),
-/// else the `exports` list. Comma-separated.
-fn render_functions(entry: &crate::catalog::CatalogEntry) -> String {
-    if !entry.functions.is_empty() {
-        entry
-            .functions
+/// Snapshot the set of module names loaded THIS session (from the runtime), for
+/// the `loaded` column of `ducklink_modules()`.
+fn loaded_names() -> std::collections::HashSet<String> {
+    match RUNTIME.get() {
+        Some(rt) => rt
+            .loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter_map(|f| f.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        entry.exports.join(", ")
+            .map(|r| r.name.clone())
+            .collect(),
+        None => std::collections::HashSet::new(),
     }
 }
 
-/// One catalog row materialised for `ducklink_extensions()`.
-struct CatRow {
+/// Look up the live per-function-class counts for a loaded module (used to fill
+/// the `scalars`/`tables`/`aggregates` columns with EXACT counts when a module
+/// is loaded). Returns `None` for an unloaded module.
+fn loaded_counts(name: &str) -> Option<(usize, usize, usize)> {
+    let rt = RUNTIME.get()?;
+    let list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
+    list.iter()
+        .find(|r| r.name == name)
+        .map(|r| (r.scalars, r.tables, r.aggregates))
+}
+
+// --- ducklink_modules() -----------------------------------------------------
+
+/// One catalog module row materialised for `ducklink_modules()`.
+struct ModuleRow {
     name: String,
     version: String,
     description: String,
     categories: String,
-    functions: String,
+    language: String,
+    loaded: bool,
+    scalars: i32,
+    tables: i32,
+    aggregates: i32,
+    requires: String,
+    compatible: bool,
 }
 
-/// Bind data: every catalog row, ready to stream.
-struct WasmExtensionsBind {
-    rows: Vec<CatRow>,
+struct WasmModulesBind {
+    rows: Vec<ModuleRow>,
 }
 
-/// `ducklink_extensions()` — one row per published catalog entry. Reads the
-/// resolved catalog (live, or the bundled snapshot when offline).
-struct WasmExtensions;
+/// `ducklink_modules()` — one row per CATALOG module (the full published
+/// catalog), with `loaded` reflecting this session's runtime state and
+/// `compatible` reflecting whether THIS host's tiers satisfy the module's
+/// required capability kinds.
+struct WasmModules;
 
-impl VTab for WasmExtensions {
+impl VTab for WasmModules {
     type InitData = WasmTableInit;
-    type BindData = WasmExtensionsBind;
+    type BindData = WasmModulesBind;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        guard("ducklink_extensions bind", || {
+        guard("ducklink_modules bind", || {
             let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            let int = || LogicalTypeHandle::from(LogicalTypeId::Integer);
+            let boolean = || LogicalTypeHandle::from(LogicalTypeId::Boolean);
             bind.add_result_column("name", vc());
             bind.add_result_column("version", vc());
             bind.add_result_column("description", vc());
             bind.add_result_column("categories", vc());
-            bind.add_result_column("functions", vc());
+            bind.add_result_column("language", vc());
+            bind.add_result_column("loaded", boolean());
+            bind.add_result_column("scalars", int());
+            bind.add_result_column("tables", int());
+            bind.add_result_column("aggregates", int());
+            bind.add_result_column("requires", vc());
+            bind.add_result_column("compatible", boolean());
 
+            let caps = host_caps();
+            let loaded = loaded_names();
             let catalog = crate::catalog::resolve_catalog();
             let rows = catalog
                 .extensions
                 .iter()
-                .map(|e| CatRow {
-                    name: e.name.clone(),
-                    version: e.version.clone().unwrap_or_default(),
-                    description: e.description.clone().unwrap_or_default(),
-                    categories: e.categories.join(", "),
-                    functions: render_functions(e),
+                .map(|e| {
+                    let is_loaded = loaded.contains(&e.name);
+                    // Loaded modules report EXACT live counts; unloaded ones show
+                    // a coarse presence-flag (1/0) inferred from `requires`, since
+                    // the catalog carries no per-function counts.
+                    let (scalars, tables, aggregates) = match loaded_counts(&e.name) {
+                        Some((s, t, a)) => (s as i32, t as i32, a as i32),
+                        None => (
+                            e.requires_kind("scalar") as i32,
+                            e.requires_kind("table") as i32,
+                            e.requires_kind("aggregate") as i32,
+                        ),
+                    };
+                    ModuleRow {
+                        name: e.name.clone(),
+                        version: e.version.clone().unwrap_or_default(),
+                        description: e.description.clone().unwrap_or_default(),
+                        categories: e.categories.join(", "),
+                        language: e.language().to_string(),
+                        loaded: is_loaded,
+                        scalars,
+                        tables,
+                        aggregates,
+                        requires: e.requires.join(", "),
+                        compatible: module_compatible(&e.requires, &caps),
+                    }
                 })
                 .collect();
-            Ok(WasmExtensionsBind { rows })
+            Ok(WasmModulesBind { rows })
         })
     }
 
@@ -1744,7 +2011,7 @@ impl VTab for WasmExtensions {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        guard("ducklink_extensions scan", || {
+        guard("ducklink_modules scan", || {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
@@ -1759,7 +2026,29 @@ impl VTab for WasmExtensions {
                 output.flat_vector(1).insert(r, row.version.as_str());
                 output.flat_vector(2).insert(r, row.description.as_str());
                 output.flat_vector(3).insert(r, row.categories.as_str());
-                output.flat_vector(4).insert(r, row.functions.as_str());
+                output.flat_vector(4).insert(r, row.language.as_str());
+                output.flat_vector(9).insert(r, row.requires.as_str());
+            }
+            // Fixed-width columns: fill the typed slices after the string inserts.
+            unsafe {
+                let mut lv = output.flat_vector(5);
+                let l = lv.as_mut_slice::<bool>();
+                let mut sv = output.flat_vector(6);
+                let s = sv.as_mut_slice::<i32>();
+                let mut tv = output.flat_vector(7);
+                let t = tv.as_mut_slice::<i32>();
+                let mut av = output.flat_vector(8);
+                let a = av.as_mut_slice::<i32>();
+                let mut cv = output.flat_vector(10);
+                let c = cv.as_mut_slice::<bool>();
+                for r in 0..n {
+                    let row = &bind.rows[start + r];
+                    l[r] = row.loaded;
+                    s[r] = row.scalars;
+                    t[r] = row.tables;
+                    a[r] = row.aggregates;
+                    c[r] = row.compatible;
+                }
             }
             init.cursor.store(start + n, Ordering::Relaxed);
             output.set_len(n);
@@ -1768,43 +2057,115 @@ impl VTab for WasmExtensions {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `ducklink_loaded()` — list components loaded in THIS session (discovery)
-// ---------------------------------------------------------------------------
+// --- ducklink_functions() ---------------------------------------------------
 
-/// Bind data: a snapshot of the session's loaded-component records.
-struct WasmLoadedBind {
-    rows: Vec<LoadedRecord>,
+/// One function row for `ducklink_functions()`.
+struct FunctionRow {
+    module: String,
+    name: String,
+    kind: String,
+    arguments: String,
+    returns: String,
+    language: String,
+    loaded: bool,
 }
 
-/// `ducklink_loaded()` — one row per component loaded via `ducklink_load` in
-/// this session.
-struct WasmLoaded;
+struct WasmFunctionsBind {
+    rows: Vec<FunctionRow>,
+}
 
-impl VTab for WasmLoaded {
+/// `ducklink_functions()` — one row per function across ALL catalog modules. For
+/// LOADED modules the live engine signatures (exact argument/return types) are
+/// used; for unloaded modules the catalog `functions` enrichment is used when
+/// present, else the bare `exports` names (with empty argument/return columns).
+struct WasmFunctions;
+
+impl VTab for WasmFunctions {
     type InitData = WasmTableInit;
-    type BindData = WasmLoadedBind;
+    type BindData = WasmFunctionsBind;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        guard("ducklink_loaded bind", || {
-            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-            bind.add_result_column("scalars", LogicalTypeHandle::from(LogicalTypeId::Integer));
-            bind.add_result_column("tables", LogicalTypeHandle::from(LogicalTypeId::Integer));
-            bind.add_result_column(
-                "aggregates",
-                LogicalTypeHandle::from(LogicalTypeId::Integer),
-            );
-            bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        guard("ducklink_functions bind", || {
+            let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            let boolean = || LogicalTypeHandle::from(LogicalTypeId::Boolean);
+            bind.add_result_column("module", vc());
+            bind.add_result_column("name", vc());
+            bind.add_result_column("kind", vc());
+            bind.add_result_column("arguments", vc());
+            bind.add_result_column("returns", vc());
+            bind.add_result_column("language", vc());
+            bind.add_result_column("loaded", boolean());
 
-            let rows = match RUNTIME.get() {
+            // Live signatures for loaded modules, keyed by module name.
+            let live: std::collections::HashMap<String, Vec<LoadedFuncSig>> = match RUNTIME.get() {
                 Some(rt) => rt
                     .loaded
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                None => Vec::new(),
+                    .iter()
+                    .map(|r| (r.name.clone(), r.funcs.clone()))
+                    .collect(),
+                None => std::collections::HashMap::new(),
             };
-            Ok(WasmLoadedBind { rows })
+
+            let catalog = crate::catalog::resolve_catalog();
+            let mut rows: Vec<FunctionRow> = Vec::new();
+            for e in &catalog.extensions {
+                let language = e.language().to_string();
+                if let Some(funcs) = live.get(&e.name) {
+                    // LOADED: exact live engine signatures.
+                    for f in funcs {
+                        rows.push(FunctionRow {
+                            module: e.name.clone(),
+                            name: f.name.clone(),
+                            kind: f.kind.to_string(),
+                            arguments: f.arguments.clone(),
+                            returns: f.returns.clone(),
+                            language: language.clone(),
+                            loaded: true,
+                        });
+                    }
+                } else if !e.functions.is_empty() {
+                    // UNLOADED with catalog enrichment: render the catalog sigs.
+                    for f in &e.functions {
+                        let name = f.name.clone().unwrap_or_default();
+                        let args = f
+                            .arguments
+                            .iter()
+                            .map(|a| match (&a.name, &a.type_name) {
+                                (Some(n), Some(t)) if !n.is_empty() => format!("{n} {t}"),
+                                (_, Some(t)) => t.clone(),
+                                (Some(n), None) => n.clone(),
+                                (None, None) => String::new(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        rows.push(FunctionRow {
+                            module: e.name.clone(),
+                            name,
+                            kind: f.kind.clone().unwrap_or_default(),
+                            arguments: args,
+                            returns: f.returns.clone().unwrap_or_default(),
+                            language: language.clone(),
+                            loaded: false,
+                        });
+                    }
+                } else {
+                    // UNLOADED, no enrichment: the bare export names, no signatures.
+                    for name in &e.exports {
+                        rows.push(FunctionRow {
+                            module: e.name.clone(),
+                            name: name.clone(),
+                            kind: String::new(),
+                            arguments: String::new(),
+                            returns: String::new(),
+                            language: language.clone(),
+                            loaded: false,
+                        });
+                    }
+                }
+            }
+            Ok(WasmFunctionsBind { rows })
         })
     }
 
@@ -1818,7 +2179,127 @@ impl VTab for WasmLoaded {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        guard("ducklink_loaded scan", || {
+        guard("ducklink_functions scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(0).insert(r, row.module.as_str());
+                output.flat_vector(1).insert(r, row.name.as_str());
+                output.flat_vector(2).insert(r, row.kind.as_str());
+                output.flat_vector(3).insert(r, row.arguments.as_str());
+                output.flat_vector(4).insert(r, row.returns.as_str());
+                output.flat_vector(5).insert(r, row.language.as_str());
+            }
+            unsafe {
+                let mut lv = output.flat_vector(6);
+                let l = lv.as_mut_slice::<bool>();
+                for r in 0..n {
+                    l[r] = bind.rows[start + r].loaded;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
+}
+
+// --- ducklink_capabilities() ------------------------------------------------
+
+/// One capability row for `ducklink_capabilities()`.
+struct CapabilityRow {
+    name: String,
+    available: bool,
+    reason: String,
+}
+
+struct WasmCapabilitiesBind {
+    rows: Vec<CapabilityRow>,
+}
+
+/// `ducklink_capabilities()` — the HOST's capabilities: which function classes /
+/// tiers are available on this artifact + host, and why. Derived from the tier
+/// gate captured at load time (`HostCaps`).
+struct WasmCapabilities;
+
+impl VTab for WasmCapabilities {
+    type InitData = WasmTableInit;
+    type BindData = WasmCapabilitiesBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_capabilities bind", || {
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("available", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+            bind.add_result_column("reason", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+            let caps = host_caps();
+            let mut rows: Vec<CapabilityRow> = Vec::new();
+
+            // Common tier: always available on the stable C API.
+            for name in ["scalar", "table", "aggregate", "load_wasm"] {
+                rows.push(CapabilityRow {
+                    name: name.to_string(),
+                    available: true,
+                    reason: "common tier".to_string(),
+                });
+            }
+
+            // Advanced tier: parser + optimizer (and the other internal-ABI kinds).
+            let adv_reason = if caps.advanced_enabled {
+                format!(
+                    "advanced tier: active (host DuckDB {})",
+                    caps.host_version.as_deref().unwrap_or("unknown"),
+                )
+            } else if caps.advanced_built {
+                format!(
+                    "advanced tier: built but inactive (requires osx/linux + host DuckDB {}; host reports {})",
+                    caps.built_against,
+                    caps.host_version.as_deref().unwrap_or("unknown")
+                )
+            } else {
+                "not built in this artifact (build with --features advanced to enable)".to_string()
+            };
+            for name in ["parser", "optimizer"] {
+                rows.push(CapabilityRow {
+                    name: name.to_string(),
+                    available: caps.advanced_enabled,
+                    reason: adv_reason.clone(),
+                });
+            }
+
+            // The wasm component ABI / WIT contract version this host speaks.
+            rows.push(CapabilityRow {
+                name: "wasm_abi".to_string(),
+                available: true,
+                reason: if caps.abi_version.is_empty() {
+                    "wasm component ABI".to_string()
+                } else {
+                    format!("wasm component ABI {}", caps.abi_version)
+                },
+            });
+
+            Ok(WasmCapabilitiesBind { rows })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_capabilities scan", || {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
@@ -1830,26 +2311,147 @@ impl VTab for WasmLoaded {
             for r in 0..n {
                 let row = &bind.rows[start + r];
                 output.flat_vector(0).insert(r, row.name.as_str());
+                output.flat_vector(2).insert(r, row.reason.as_str());
+            }
+            unsafe {
+                let mut av = output.flat_vector(1);
+                let a = av.as_mut_slice::<bool>();
+                for r in 0..n {
+                    a[r] = bind.rows[start + r].available;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
+}
+
+// --- ducklink_cache() -------------------------------------------------------
+
+/// One cached-blob row for `ducklink_cache()`.
+struct CacheRow {
+    digest: String,
+    name: String,
+    bytes: i64,
+    /// Modification time as MICROSECONDS since the Unix epoch, matching DuckDB's
+    /// TIMESTAMP physical storage (i64 micros). 0 when the mtime is unavailable.
+    modified_micros: i64,
+    path: String,
+}
+
+/// Scan the on-disk cache root (`<cache>/wasm/sha256/<digest>/<name>.wasm`) and
+/// collect one row per cached blob. Best-effort: an unreadable dir yields no
+/// rows rather than an error.
+fn scan_cache() -> Vec<CacheRow> {
+    let mut rows = Vec::new();
+    let Some(root) = crate::catalog::cache_root() else {
+        return rows;
+    };
+    let sha_dir = root.join("wasm").join("sha256");
+    let Ok(digests) = std::fs::read_dir(&sha_dir) else {
+        return rows;
+    };
+    for dent in digests.flatten() {
+        if !dent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let digest = dent.file_name().to_string_lossy().into_owned();
+        let Ok(blobs) = std::fs::read_dir(dent.path()) else {
+            continue;
+        };
+        for blob in blobs.flatten() {
+            let path = blob.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let meta = match blob.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let bytes = meta.len() as i64;
+            // mtime -> micros since epoch (TIMESTAMP storage). Awkward via the C
+            // API to build a real TIMESTAMP value, so we write the raw i64 micros
+            // into a TIMESTAMP-typed column, which is exactly its physical form.
+            let modified_micros = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            rows.push(CacheRow {
+                digest: digest.clone(),
+                name,
+                bytes,
+                modified_micros,
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    rows
+}
+
+struct WasmCacheBind {
+    rows: Vec<CacheRow>,
+}
+
+/// `ducklink_cache()` — one row per cached component blob on disk.
+struct WasmCache;
+
+impl VTab for WasmCache {
+    type InitData = WasmTableInit;
+    type BindData = WasmCacheBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_cache bind", || {
+            bind.add_result_column("digest", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("bytes", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+            bind.add_result_column("modified", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+            bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            Ok(WasmCacheBind { rows: scan_cache() })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_cache scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(0).insert(r, row.digest.as_str());
+                output.flat_vector(1).insert(r, row.name.as_str());
                 output.flat_vector(4).insert(r, row.path.as_str());
             }
-            // INTEGER columns: fill the typed slices after the string inserts.
-            // Each `flat_vector` is bound to a `let` so the slice it owns
-            // outlives the fill loop (the temporary would otherwise drop).
             unsafe {
-                let mut sv = output.flat_vector(1);
-                let s = sv.as_mut_slice::<i32>();
+                let mut bv = output.flat_vector(2);
+                let b = bv.as_mut_slice::<i64>();
+                // TIMESTAMP stores i64 micros-since-epoch; write the raw micros.
+                let mut mv = output.flat_vector(3);
+                let m = mv.as_mut_slice::<i64>();
                 for r in 0..n {
-                    s[r] = bind.rows[start + r].scalars as i32;
-                }
-                let mut tv = output.flat_vector(2);
-                let t = tv.as_mut_slice::<i32>();
-                for r in 0..n {
-                    t[r] = bind.rows[start + r].tables as i32;
-                }
-                let mut av = output.flat_vector(3);
-                let a = av.as_mut_slice::<i32>();
-                for r in 0..n {
-                    a[r] = bind.rows[start + r].aggregates as i32;
+                    b[r] = bind.rows[start + r].bytes;
+                    m[r] = bind.rows[start + r].modified_micros;
                 }
             }
             init.cursor.store(start + n, Ordering::Relaxed);
@@ -2165,27 +2767,40 @@ mod tests {
                 return;
             }
 
-            // Discovery BEFORE load: the published catalog lists ~193 extensions.
+            // The public `ducklink` schema of views resolves in a normal session.
+            // Discovery BEFORE load: the published catalog lists ~193 modules.
             let n_ext: i64 = con
-                .query_row("SELECT count(*) FROM ducklink_extensions()", [], |r| r.get(0))
-                .expect("ducklink_extensions count");
+                .query_row("SELECT count(*) FROM ducklink.modules", [], |r| r.get(0))
+                .expect("ducklink.modules count");
             assert!(
                 n_ext > 150,
                 "expected ~193 catalog rows, got {n_ext}"
             );
-            // aba is one of them, and its functions column renders aba_validate.
-            let (_d, fns): (String, String) = con
+            // aba is one of them, its language is a plain provenance field, and it
+            // is NOT loaded yet.
+            let (lang, is_loaded): (String, bool) = con
                 .query_row(
-                    "SELECT description, functions FROM ducklink_extensions() WHERE name = 'aba'",
+                    "SELECT language, loaded FROM ducklink.modules WHERE name = 'aba'",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .expect("aba row in ducklink_extensions");
-            assert!(fns.contains("aba_validate"), "functions col should list aba_validate, got: {fns}");
+                .expect("aba row in ducklink.modules");
+            assert!(!lang.is_empty(), "language should be a non-empty provenance field");
+            assert!(!is_loaded, "aba must not be loaded before ducklink_load");
 
-            // ducklink_loaded() is empty before any load.
+            // ducklink.functions lists aba's exported function name pre-load.
+            let has_fn: i64 = con
+                .query_row(
+                    "SELECT count(*) FROM ducklink.functions WHERE module='aba' AND name='aba_validate'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("aba_validate in ducklink.functions");
+            assert!(has_fn >= 1, "aba_validate should appear in ducklink.functions");
+
+            // Nothing is loaded yet: no module has loaded=true.
             let n_loaded_before: i64 = con
-                .query_row("SELECT count(*) FROM ducklink_loaded()", [], |r| r.get(0))
+                .query_row("SELECT count(*) FROM ducklink.modules WHERE loaded", [], |r| r.get(0))
                 .expect("loaded count before");
             assert_eq!(n_loaded_before, 0, "nothing loaded yet");
 
@@ -2211,17 +2826,50 @@ mod tests {
                 .expect("call aba_validate (invalid)");
             assert!(!invalid, "021000020 fails the ABA checksum");
 
-            // ducklink_loaded() now shows aba with its counts + cache path.
-            let (lname, lscalars, lpath): (String, i32, String) = con
+            // ducklink.modules now shows aba as loaded with its live scalar count.
+            let (lname, lloaded, lscalars): (String, bool, i32) = con
                 .query_row(
-                    "SELECT name, scalars, path FROM ducklink_loaded() WHERE name = 'aba'",
+                    "SELECT name, loaded, scalars FROM ducklink.modules WHERE name = 'aba'",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
-                .expect("aba in ducklink_loaded");
+                .expect("aba in ducklink.modules");
             assert_eq!(lname, "aba");
+            assert!(lloaded, "aba should be loaded now");
             assert!(lscalars >= 1);
-            assert!(lpath.contains("sha256"), "loaded path should be the cached blob: {lpath}");
+
+            // ducklink.functions now renders aba's LIVE signature.
+            let (fkind, fargs, frets): (String, String, String) = con
+                .query_row(
+                    "SELECT kind, arguments, returns FROM ducklink.functions \
+                     WHERE module='aba' AND name='aba_validate'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("aba_validate live signature");
+            assert_eq!(fkind, "scalar");
+            assert!(fargs.contains("VARCHAR"), "args should be VARCHAR, got: {fargs}");
+            assert_eq!(frets, "BOOLEAN", "aba_validate returns BOOLEAN");
+
+            // ducklink.cache shows the seeded aba blob.
+            let cache_hit: i64 = con
+                .query_row(
+                    "SELECT count(*) FROM ducklink.cache WHERE name='aba'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("aba in ducklink.cache");
+            assert!(cache_hit >= 1, "aba blob should appear in ducklink.cache");
+
+            // ducklink.capabilities always has the common-tier rows.
+            let n_caps: i64 = con
+                .query_row(
+                    "SELECT count(*) FROM ducklink.capabilities WHERE name IN ('scalar','load_wasm')",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("capabilities rows");
+            assert_eq!(n_caps, 2, "scalar + load_wasm capability rows present");
 
             // IDEMPOTENCY: re-loading aba must NOT hard-error.
             let again = con.query_row(

@@ -29,6 +29,16 @@ const BLOB_BASE: &str = "https://datalink-ext.tegmentum.ai/wasm/sha256";
 /// live catalog is unreachable. A copy of `ducklink/registry/index.json`.
 const BUNDLED_SNAPSHOT: &[u8] = include_bytes!("../assets/catalog-snapshot.json");
 
+/// A named/typed argument an enriched function signature MAY carry. Tolerant:
+/// both fields optional so a bare `{"name": ...}` or a partial entry parses.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FunctionArg {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "type", default)]
+    pub type_name: Option<String>,
+}
+
 /// One function signature an entry MAY carry (the signature-enrichment field).
 /// Tolerant: every field is optional so an entry without it (the bundled
 /// snapshot) still parses.
@@ -40,6 +50,13 @@ pub struct FunctionSig {
     pub kind: Option<String>,
     #[serde(default)]
     pub returns: Option<String>,
+    /// Rendered argument signature, when the catalog carries typed arguments.
+    #[serde(default)]
+    pub arguments: Vec<FunctionArg>,
+    /// Table-function result columns, when present (mutually exclusive with
+    /// `returns` for scalars/aggregates).
+    #[serde(default)]
+    pub columns: Vec<FunctionArg>,
 }
 
 /// A single catalog entry. Only the fields the loader / discovery functions
@@ -57,12 +74,44 @@ pub struct CatalogEntry {
     /// Registered SQL function / type names (always present in the snapshot).
     #[serde(default)]
     pub exports: Vec<String>,
+    /// The capability KINDS this module requires (e.g. `["scalar"]`,
+    /// `["table", "aggregate"]`, `["parser"]`). Used to decide host
+    /// `compatible`-ness and to render the `requires` column.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Source crates the module was built from. A non-empty list is the
+    /// provenance signal that the module is a Rust build (the `language` column).
+    #[serde(default)]
+    pub crates: Vec<String>,
     /// The sha256 (hex) of the component blob; required to fetch + verify it.
     #[serde(default)]
     pub content_digest: Option<String>,
     /// The signature-enrichment field; absent in the current snapshot.
     #[serde(default)]
     pub functions: Vec<FunctionSig>,
+}
+
+impl CatalogEntry {
+    /// Provenance-based source language for the `language` column. A non-empty
+    /// `crates` list is the "built from Rust crates" signal; otherwise the
+    /// module ships as a bare wasm component of unknown source language. This is
+    /// a plain catalog-derived field — NOT a compile step.
+    pub fn language(&self) -> &'static str {
+        if !self.crates.is_empty() {
+            "rust"
+        } else {
+            "wasm"
+        }
+    }
+
+    /// Count of required capability kinds of each class, inferred from
+    /// `requires`, for the unloaded-module `scalars`/`tables`/`aggregates`
+    /// columns. Returns 0 when the class is not required. These are coarse
+    /// (presence, not per-function counts); LOADED modules report exact counts
+    /// from their live registration instead.
+    pub fn requires_kind(&self, kind: &str) -> bool {
+        self.requires.iter().any(|r| r == kind)
+    }
 }
 
 /// The parsed catalog: just the list of entries (the wrapper's metadata is not
@@ -181,7 +230,7 @@ pub fn resolve_name_to_blob(name: &str) -> Result<PathBuf, String> {
         let preview: Vec<&str> = names.iter().take(12).map(|s| s.as_str()).collect();
         format!(
             "ducklink_load: unknown extension '{name}'. Discover names with \
-             `SELECT name FROM ducklink_extensions()`. {} known, e.g.: {}{}",
+             `SELECT name FROM ducklink.modules`. {} known, e.g.: {}{}",
             names.len(),
             preview.join(", "),
             if names.len() > preview.len() { ", ..." } else { "" }
@@ -332,7 +381,7 @@ mod tests {
         assert!(r.is_err());
         let msg = r.unwrap_err();
         assert!(
-            msg.contains("ducklink_extensions()"),
+            msg.contains("ducklink.modules"),
             "error should point at discovery: {msg}"
         );
     }
