@@ -78,13 +78,20 @@ const PYLON_ID: &str = "pylon";
 /// Where to find the pylon endpoint component + CPython Lib dir. Overridable via
 /// env so a build/test can point at a locally-built artifact; the defaults match
 /// the python-wasm build tree.
+///
+/// The baked default is the LEAN-ARROW endpoint variant (lean CPython + `_struct`
+/// + `_arrow_core`, no numpy). `_struct` is what the pure-Python `struct` — and
+/// hence the ducklink-staged `pylib/_msgpack.py` — needs, so this variant is what
+/// makes the inline-deps in-guest `import` step and the arrow-columnar dispatch
+/// path work end-to-end. Override via `DUCKLINK_PYLON_ENDPOINT`.
 fn pylon_component_path() -> PathBuf {
     std::env::var_os("DUCKLINK_PYLON_ENDPOINT")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home)
-                .join("git/python-wasm/build/3.14-current/pylon-endpoint.component.wasm")
+            PathBuf::from(home).join(
+                "git/python-wasm/build/3.14-current/pylon-endpoint-lean-arrow.component.wasm",
+            )
         })
 }
 
