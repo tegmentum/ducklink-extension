@@ -41,7 +41,7 @@ fn live_fetch_downloads_and_verifies_aba() {
 }
 
 /// OFFLINE FALLBACK: with the catalog URL pointed at an unreachable host, the
-/// resolved catalog must still come from the bundled snapshot (~193 entries).
+/// resolved catalog must still come from the bundled snapshot (199 entries).
 /// Runs in its own process so the session catalog OnceLock starts empty.
 #[test]
 fn offline_falls_back_to_bundled_snapshot() {
@@ -49,7 +49,7 @@ fn offline_falls_back_to_bundled_snapshot() {
     let cat = catalog::resolve_catalog();
     assert!(
         cat.extensions.len() > 150,
-        "bundled snapshot should yield ~193 entries offline, got {}",
+        "bundled snapshot should yield 199 entries offline, got {}",
         cat.extensions.len()
     );
     assert!(cat.find("aba").is_some(), "snapshot has aba offline");

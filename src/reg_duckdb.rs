@@ -2709,7 +2709,7 @@ mod tests {
     /// path) must resolve the catalog, obtain the `aba.wasm` blob (cache hit after
     /// seeding), register `aba_validate`, and have it callable in a LATER
     /// statement. Also exercises the two discovery table functions
-    /// (`ducklink_extensions()` ~193 rows; `ducklink_loaded()` shows aba).
+    /// (`ducklink_extensions()` 199 rows; `ducklink_loaded()` shows aba).
     ///
     /// To stay deterministic regardless of the sandbox's network, the cache is
     /// pre-seeded from the local artifact at the catalog digest so the resolver
@@ -2726,22 +2726,21 @@ mod tests {
             std::env::set_var("XDG_CACHE_HOME", &cache_root);
         }
 
-        // Seed the cache from the local aba artifact at its catalog digest, so the
-        // name resolver returns it as a cache hit (no network needed).
-        let digest = "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15";
+        // Seed the cache from the committed aba fixture at its catalog digest, so
+        // the name resolver returns it as a cache hit (no network needed). The
+        // fixture is the @2.2.0 production blob, matching the bundled snapshot's
+        // aba content_digest, so the sha256 verify succeeds offline.
+        let digest = "21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b";
         let seed_target = cache_root
             .join("ducklink")
             .join("wasm")
             .join("sha256")
             .join(digest)
             .join("aba.wasm");
-        // The local artifact: monorepo layout, overridable with DUCKLINK_CORPUS_DIR.
-        let src = match std::env::var_os("DUCKLINK_CORPUS_DIR") {
-            Some(d) => PathBuf::from(d).join("aba.wasm"),
-            None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/extensions/aba.wasm"),
-        };
+        // The committed fixture (production @2.2.0 aba blob at the snapshot digest).
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/aba.wasm");
         if !src.is_file() {
-            eprintln!("[test] skipping name-based test: local aba.wasm not found at {}", src.display());
+            eprintln!("[test] skipping name-based test: aba fixture not found at {}", src.display());
             return;
         }
         std::fs::create_dir_all(seed_target.parent().unwrap()).expect("mk cache dir");
@@ -2768,13 +2767,13 @@ mod tests {
             }
 
             // The public `ducklink` schema of views resolves in a normal session.
-            // Discovery BEFORE load: the published catalog lists ~193 modules.
+            // Discovery BEFORE load: the published catalog lists 199 modules.
             let n_ext: i64 = con
                 .query_row("SELECT count(*) FROM ducklink.modules", [], |r| r.get(0))
                 .expect("ducklink.modules count");
             assert!(
                 n_ext > 150,
-                "expected ~193 catalog rows, got {n_ext}"
+                "expected 199 catalog rows, got {n_ext}"
             );
             // aba is one of them, its language is a plain provenance field, and it
             // is NOT loaded yet.

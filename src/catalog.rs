@@ -335,7 +335,7 @@ mod tests {
         let aba = cat.find("aba").expect("aba present");
         assert_eq!(
             aba.content_digest.as_deref(),
-            Some("068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15")
+            Some("21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b")
         );
         assert!(aba.exports.iter().any(|e| e == "aba_validate"));
     }
@@ -391,7 +391,7 @@ mod tests {
         // White-box: bytes that don't hash to the claimed digest must be
         // rejected. We exercise the same comparison resolve_name_to_blob uses.
         let bytes = b"not the real component";
-        let claimed = "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15";
+        let claimed = "21e20b3b8819e7baa83b1a3be31b37206d9691ba6cb084906b58357292cb523b";
         let got = sha256_hex(bytes);
         assert_ne!(got, claimed, "test bytes must not match the real digest");
     }
