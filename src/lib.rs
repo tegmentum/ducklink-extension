@@ -237,12 +237,10 @@ mod loadable {
         if advanced_enabled {
             // Internal C++ ABI call, resolved at load against the matching host:
             // dereference the database to its internal DBConfig as a load-time
-            // proof the shim is reachable and the ABI resolved.
-            let probe = ducklink_advanced_probe(db.cast());
-            eprintln!(
-                "[ducklink] advanced tier ENABLED (host DuckDB {DUCKDB_ABI_VERSION}); \
-                 C++ shim probe maximum_threads={probe}"
-            );
+            // proof the shim is reachable and the ABI resolved. Discarded — a
+            // segfault here would be the signal, not the value; the enabled
+            // state is queryable via `ducklink.capabilities`.
+            let _ = ducklink_advanced_probe(db.cast());
             // Install the component-driven ParserExtension now (idempotent), so
             // `LOAD WASM '<name>'` is recognized from the first statement — it
             // routes through the parser bridge to the `ducklink_load` loader,
@@ -303,28 +301,12 @@ mod loadable {
             ffi::duckdb_connect(db, &mut raw_con) == ffi::DuckDBSuccess && !raw_con.is_null();
 
         // Always-available built-in, so the extension is usable (and testable)
-        // even before any component is configured.
+        // even before any component is configured. No `COMMENT ON FUNCTION`
+        // description is set: DuckDB blocks it for entries in the system
+        // catalog (which is where loadable-extension functions land), and the
+        // stable C API has no scalar-function description setter.
         con.register_scalar_function::<DucklinkVersion>("ducklink_version")
             .map_err(stringify)?;
-        // Populate `duckdb_functions().comment` so introspection (and the
-        // community-extensions site's "Added Functions" table) shows a real
-        // description instead of NULL. ducklink is a transparent host:
-        // `ducklink_version` is the only statically-registered function; every
-        // other capability is provided by WebAssembly component extensions
-        // loaded at runtime. The `description` column is C++-only and not
-        // reachable through the stable C API, so `comment` carries this text.
-        // Non-fatal: a failed COMMENT must never break `LOAD ducklink`.
-        if let Err(e) = con.execute(
-            "COMMENT ON FUNCTION ducklink_version IS \
-             'Returns the ducklink extension version. ducklink is a transparent \
-              host for WebAssembly component extensions: this is the only \
-              built-in function — all other functionality is provided by \
-              WebAssembly modules loaded at runtime (via the DUCKLINK_COMPONENTS \
-              environment variable or LOAD).'",
-            [],
-        ) {
-            eprintln!("[ducklink] could not set ducklink_version comment: {e}");
-        }
         let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
 
         // Register `ducklink_load(path)`: the in-SQL analogue of DuckDB's `LOAD`,
@@ -353,15 +335,21 @@ mod loadable {
         if !raw_con.is_null() {
             ffi::duckdb_disconnect(&mut raw_con);
         }
-        eprintln!(
-            "[ducklink] loaded {} component(s); registered {registered} function(s){}",
-            specs.len(),
-            if have_raw {
-                ""
-            } else {
-                " (no raw connection; aggregates skipped)"
-            }
-        );
+        // Silent on the common no-preload path (empty DUCKLINK_COMPONENTS).
+        // Only announce when something was actually preloaded, or when the
+        // aggregate raw-connection could not be opened and aggregates in any
+        // preloaded component would have been skipped.
+        if !specs.is_empty() || !have_raw {
+            eprintln!(
+                "[ducklink] loaded {} component(s); registered {registered} function(s){}",
+                specs.len(),
+                if have_raw {
+                    ""
+                } else {
+                    " (no raw connection; aggregates skipped)"
+                }
+            );
+        }
         Ok(true)
     }
 

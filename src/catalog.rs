@@ -418,7 +418,7 @@ pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, Stri
             let digest = p.content_digest.clone().expect("selected provider has a digest");
             let abi = p.abi.as_deref().unwrap_or("?");
             let id = p.id.as_deref().unwrap_or("wasm");
-            eprintln!(
+            ducklink_runtime::verbose_log!(
                 "[ducklink] '{name}': selected provider {id} (abi {abi}) for host generation {host_major}",
             );
             crate::events::emit(

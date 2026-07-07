@@ -18,10 +18,38 @@
 //! through an [`extension::ExtensionServices`] sink — the one direction-specific
 //! seam.
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use wasmtime::component::Component;
 use wasmtime::Engine;
+
+/// Whether `DUCKLINK_LOG=verbose` (case-insensitive) is set at process start.
+/// Gates the per-registration `[extension-manager]` / `[extension-runtime:…]`
+/// diagnostic prints so `LOAD ducklink` + `ducklink_load('<name>')` is silent
+/// on the common path. Cached — the env var is read once and the value never
+/// changes for the life of the process. Error paths and the tier-degradation
+/// notices are NOT gated by this: they always print.
+pub fn verbose_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("DUCKLINK_LOG")
+            .and_then(|v| v.into_string().ok())
+            .map(|s| s.eq_ignore_ascii_case("verbose"))
+            .unwrap_or(false)
+    })
+}
+
+/// Emit an `eprintln!`-shaped diagnostic only when `DUCKLINK_LOG=verbose`. Use
+/// for per-registration and per-load traces that are useful when debugging
+/// component wiring but pure noise for users on the happy path.
+#[macro_export]
+macro_rules! verbose_log {
+    ($($arg:tt)*) => {
+        if $crate::verbose_log_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 /// The AUTHORITATIVE, content-addressed `duckdb:extension` contract identity: a
 /// **witcanon digest** — `sha256("witcanon:1" || canonical-WIT-bytes)` (hex),
@@ -1090,7 +1118,7 @@ impl CallbackRegistry {
                 kind,
             },
         );
-        eprintln!(
+        verbose_log!(
             "[extension-manager] registered {} callback handle {} for '{}' (dispatcher={dispatcher_handle})",
             kind.describe(),
             handle,
@@ -1101,7 +1129,7 @@ impl CallbackRegistry {
 
     pub fn remove(&mut self, handle: u32) {
         if let Some(entry) = self.entries.remove(&handle) {
-            eprintln!(
+            verbose_log!(
                 "[extension-manager] released {} callback handle {} for '{}'",
                 entry.kind.describe(),
                 handle,
@@ -1116,7 +1144,7 @@ impl CallbackRegistry {
             .retain(|_, entry| &*entry.extension != extension);
         let removed = initial.saturating_sub(self.entries.len());
         if removed > 0 {
-            eprintln!(
+            verbose_log!(
                 "[extension-manager] purged {removed} callback handles after unloading '{}'",
                 extension
             );

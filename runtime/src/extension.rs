@@ -700,7 +700,7 @@ impl ExtensionStoreState {
             summarize_registration_names(&pending.aggregates, |entry| entry.name.as_str());
         let macro_names =
             summarize_registration_names(&pending.macros, |entry| entry.name.as_str());
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] draining pending registrations: scalars={} ({scalar_names}), tables={} ({table_names}), aggregates={} ({aggregate_names}), macros={} ({macro_names})",
             self.extension_name,
             pending.scalars.len(),
@@ -1156,7 +1156,7 @@ impl extension_runtime::HostPragmaRegistry for ExtensionStoreState {
         let callback_handle = callback.rep();
         std::mem::forget(callback);
 
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered pragma '{name}' (callback={callback_handle})",
             self.extension_name
         );
@@ -1296,7 +1296,7 @@ impl extension_catalog::Host for ExtensionStoreState {
         ty: extension_catalog::LogicalType,
     ) -> Result<u32, String> {
         let handle = self.alloc_resource_id();
-        eprintln!(
+        verbose_log!(
             "[extension-manager] catalog register-logical-type '{}' (physical={}) for '{}' -> handle {handle}",
             ty.name, ty.physical, self.extension_name
         );
@@ -1315,7 +1315,7 @@ impl extension_catalog::Host for ExtensionStoreState {
     ) -> Result<(), String> {
         let callback_handle = callback.rep();
         std::mem::forget(callback);
-        eprintln!(
+        verbose_log!(
             "[extension-manager] catalog register-cast {}->{} ({:?}, callback={callback_handle}) for '{}'",
             spec.from, spec.to, spec.kind, self.extension_name
         );
@@ -1329,7 +1329,7 @@ impl extension_catalog::Host for ExtensionStoreState {
     }
 
     fn register_macro(&mut self, def: extension_catalog::MacroDef) -> Result<(), String> {
-        eprintln!(
+        verbose_log!(
             "[extension-manager] catalog register-macro '{}.{}' ({} params) for '{}'",
             def.schema,
             def.name,
@@ -1364,7 +1364,7 @@ impl extension_files::Host for ExtensionStoreState {
             })?;
         let id = self.alloc_resource_id();
         let extensions: Vec<String> = scan.extensions.into_iter().collect();
-        eprintln!(
+        verbose_log!(
             "[extension-manager] files register-replacement-scan exts={:?} ({:?}) -> '{}' for '{}' (id {id})",
             extensions, scan.mode, function_name, self.extension_name
         );
@@ -1385,7 +1385,7 @@ impl extension_files::Host for ExtensionStoreState {
         // `copy-dispatch` (see ExtensionInstance::copy_*). The `function` field is
         // the copy-function-handle the host threads back into every dispatch call.
         let id = self.alloc_resource_id();
-        eprintln!(
+        verbose_log!(
             "[extension-manager] files register-copy-handler ext='{}' (function={}) for '{}' -> id {id}",
             handler.extension, handler.function, self.extension_name
         );
@@ -1410,7 +1410,7 @@ impl extension_secret::Host for ExtensionStoreState {
         params: BindgenVec<extension_secret::SecretParam>,
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered secret type '{type_name}' ({} params, callback={callback_handle})",
             self.extension_name,
             params.len()
@@ -1431,7 +1431,7 @@ impl extension_secret::Host for ExtensionStoreState {
         provider: String,
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered secret provider '{type_name}'/'{provider}' (callback={callback_handle})",
             self.extension_name
         );
@@ -1470,7 +1470,7 @@ impl extension_settings::Host for ExtensionStoreState {
             extension_settings::SettingScope::Global => "global",
         }
         .to_string();
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered option '{name}' (type={ty}, scope={scope})",
             self.extension_name
         );
@@ -1497,7 +1497,7 @@ impl extension_parser::Host for ExtensionStoreState {
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
         let registry_id = self.alloc_resource_id();
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered parser extension '{name}' (registry={registry_id}, callback={callback_handle})",
             self.extension_name
         );
@@ -1521,7 +1521,7 @@ impl extension_optimizer::Host for ExtensionStoreState {
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
         let registry_id = self.alloc_resource_id();
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered optimizer rule '{rule_name}' (registry={registry_id}, callback={callback_handle})",
             self.extension_name
         );
@@ -1560,7 +1560,7 @@ impl extension_table_stream::Host for ExtensionStoreState {
         // dispatch call (open-filtered / next / close) back to the owning
         // component, exactly as the regular table-callback path routes call-table.
         let global = self.allocate_callback_handle(callback_handle, CallbackKind::Table);
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered filterable streaming table fn '{name}' (global={global}, dispatcher={callback_handle}, args={}, cols={})",
             self.extension_name,
             converted_arguments.len(),
@@ -1587,7 +1587,7 @@ impl extension_macro_ext::Host for ExtensionStoreState {
         parameters: BindgenVec<String>,
         body_sql: String,
     ) -> Result<(), extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered table macro '{schema}.{name}' ({} params)",
             self.extension_name,
             parameters.len()
@@ -1611,7 +1611,7 @@ impl extension_types_ext::Host for ExtensionStoreState {
         name: String,
         type_expr: String,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered modified logical type '{name}' = {type_expr}",
             self.extension_name
         );
@@ -1628,7 +1628,7 @@ impl extension_types_ext::Host for ExtensionStoreState {
         name: String,
         members: BindgenVec<String>,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered enum type '{name}' ({} members)",
             self.extension_name,
             members.len()
@@ -1664,7 +1664,7 @@ impl extension_runtime_ext::Host for ExtensionStoreState {
         let returns = convert_extension_logicaltype(returns);
         let options = options.map(convert_extension_funcopts);
         let registry_id = self.alloc_resource_id();
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered scalar-ex '{name}' (registry={registry_id}, callback={callback_handle}, varargs={}, special_null={special_null})",
             self.extension_name,
             varargs.is_some()
@@ -1694,7 +1694,7 @@ impl extension_lifecycle::Host for ExtensionStoreState {
     ) -> Result<u32, extension_types::Duckerror> {
         let on_opened = events.contains(extension_lifecycle::ConnEvents::OPENED);
         let on_closed = events.contains(extension_lifecycle::ConnEvents::CLOSED);
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered connection callback (opened={on_opened}, closed={on_closed}, callback={callback_handle})",
             self.extension_name
         );
@@ -1717,7 +1717,7 @@ impl extension_coordinate_system::Host for ExtensionStoreState {
         &mut self,
         crs: extension_coordinate_system::CrsDef,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered coordinate system {}:{}",
             self.extension_name, crs.auth_name, crs.code
         );
@@ -1742,7 +1742,7 @@ impl extension_arrow_ext::Host for ExtensionStoreState {
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
         let columns = convert_extension_columndefs(schema.into_iter().collect());
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered arrow table '{name}' ({} columns, callback={callback_handle})",
             self.extension_name,
             columns.len()
@@ -1768,7 +1768,7 @@ impl extension_encoding::Host for ExtensionStoreState {
         aliases: BindgenVec<String>,
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered text encoding '{name}' ({} aliases, callback={callback_handle})",
             self.extension_name,
             aliases.len()
@@ -1794,7 +1794,7 @@ impl extension_compression::Host for ExtensionStoreState {
         file_extension: String,
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered compression codec '{name}' (.{file_extension}, callback={callback_handle})",
             self.extension_name
         );
@@ -1821,7 +1821,7 @@ impl extension_storage::Host for ExtensionStoreState {
         options: Option<extension_storage::Extopts>,
     ) -> Result<u32, extension_types::Duckerror> {
         let converted_options = options.map(convert_storage_extopts);
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered storage backend '{type_name}' (callback={callback_handle})",
             self.extension_name
         );
@@ -1845,7 +1845,7 @@ impl extension_index::Host for ExtensionStoreState {
         &mut self,
         type_name: String,
     ) -> Result<(), extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered custom index type '{type_name}'",
             self.extension_name
         );
@@ -1867,7 +1867,7 @@ impl extension_files_reg::Host for ExtensionStoreState {
         &mut self,
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered files backend (callback={callback_handle})",
             self.extension_name
         );
@@ -1892,7 +1892,7 @@ impl extension_collation::Host for ExtensionStoreState {
         transform_scalar: String,
         combinable: bool,
     ) -> Result<(), extension_types::Duckerror> {
-        eprintln!(
+        verbose_log!(
             "[extension-runtime:{}] registered collation '{name}' (transform scalar='{transform_scalar}', combinable={combinable})",
             self.extension_name
         );
@@ -2018,7 +2018,7 @@ fn log_scalar_registration(
     let arg_summary = summarize_runtime_funcargs(args);
     let return_ty = describe_runtime_logicaltype(returns);
     let option_summary = summarize_funcopts(options);
-    eprintln!(
+    verbose_log!(
         "[extension-runtime:{extension}] queued scalar '{name}' (registry={registry_id}, callback={callback_handle}) args={arg_summary} returns={return_ty} opts={option_summary}"
     );
 }
@@ -2035,7 +2035,7 @@ fn log_table_registration(
     let arg_summary = summarize_runtime_funcargs(args);
     let column_summary = summarize_runtime_columns(columns);
     let option_summary = summarize_extopts(options);
-    eprintln!(
+    verbose_log!(
         "[extension-runtime:{extension}] queued table '{name}' (registry={registry_id}, callback={callback_handle}) args={arg_summary} columns={column_summary} opts={option_summary}"
     );
 }
@@ -2052,7 +2052,7 @@ fn log_aggregate_registration(
     let arg_summary = summarize_runtime_funcargs(args);
     let return_ty = describe_runtime_logicaltype(returns);
     let option_summary = summarize_funcopts(options);
-    eprintln!(
+    verbose_log!(
         "[extension-runtime:{extension}] queued aggregate '{name}' (registry={registry_id}, callback={callback_handle}) args={arg_summary} returns={return_ty} opts={option_summary}"
     );
 }
@@ -4570,7 +4570,7 @@ pub fn load_component_with_dynlink(
     // the framework's `imports_linker`).
     let dynlink = match dynlink_registry {
         Some(registry) if crate::compose_dynlink::imports_linker(engine, component) => {
-            eprintln!(
+            verbose_log!(
                 "[extension-runtime:{extension_name}] imports compose:dynlink/linker; wiring the shared-provider bridge"
             );
             crate::compose_dynlink::add_to_linker::<ExtensionStoreState>(&mut linker)
