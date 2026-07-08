@@ -2449,6 +2449,24 @@ impl ExtensionInstance {
             .map_err(map_extension_trap)?
     }
 
+    /// Column-native aggregate dispatch. Hands the caller-built `Colvec`s
+    /// straight to `call-aggregate-col`, skipping the row-major
+    /// `rows_to_colvecs` pivot [`dispatch_aggregate`] does. The extension-side
+    /// bridge builds these Colvecs directly from its typed accumulator when
+    /// the group is finalized, so the whole aggregate path avoids the
+    /// row-major intermediate on both sides of the crossing.
+    pub fn dispatch_aggregate_col(
+        &mut self,
+        dispatcher_handle: u32,
+        args: &[extension_column_types::Colvec],
+    ) -> Result<extension_types::Duckvalue, extension_types::Duckerror> {
+        let guest = self.bindings.duckdb_extension_callback_dispatch();
+        let mut store = self.store.as_context_mut();
+        guest
+            .call_call_aggregate_col(&mut store, dispatcher_handle, args)
+            .map_err(map_extension_trap)?
+    }
+
     pub fn dispatch_pragma(
         &mut self,
         dispatcher_handle: u32,

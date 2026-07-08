@@ -514,6 +514,31 @@ impl Engine2 {
             .map_err(|e| anyhow!("aggregate dispatch failed: {e:?}"))?;
         Ok(wit_to_neutral(result))
     }
+
+    /// Column-native aggregate dispatch. The DuckDB bridge builds one
+    /// `Colvec` per input column from its per-group typed accumulator and
+    /// hands them straight to `call-aggregate-col`, skipping both the
+    /// extension-side neutral→WIT walk (per cell) and the runtime-side
+    /// `rows_to_colvecs` pivot (per column, allocates a Vec of pointers).
+    pub fn dispatch_aggregate_col(
+        &self,
+        callback_handle: u32,
+        args: &[extension_column_types::Colvec],
+    ) -> Result<reg::DuckValue> {
+        let (extension, dispatcher_handle) = {
+            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+        };
+        let instance_arc = self.instance_arc(&extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        let result = instance
+            .dispatch_aggregate_col(dispatcher_handle, args)
+            .map_err(|e| anyhow!("aggregate (col) dispatch failed: {e:?}"))?;
+        Ok(wit_to_neutral(result))
+    }
 }
 
 /// Map a C-ABI ts-op code (DUCKLINK_TS_OP_*, mirroring `filter-op`) to the WIT

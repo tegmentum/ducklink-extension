@@ -1260,6 +1260,156 @@ use duckdb::ffi;
 /// tuple of the function's argument values.
 type AggState = Vec<Vec<reg::DuckValue>>;
 
+/// Pivot a per-group `AggState` (row-major `Vec<Vec<DuckValue>>`) into one
+/// `Colvec` per input column, ready to hand straight to
+/// `Engine2::dispatch_aggregate_col`. Skips both the per-cell
+/// `neutral_to_wit` walk the row-major `dispatch_aggregate` path did and the
+/// runtime's internal `rows_to_colvecs` scratch, so the whole aggregate
+/// finalize path is one column-major walk on native storage.
+fn agg_state_to_colvecs(state: AggState, arg_codes: &[u8]) -> Result<Vec<Colvec>, String> {
+    let n = state.len();
+    let ncols = arg_codes.len();
+    // Empty group: emit empty columns of the declared arg types so the guest
+    // sees a well-formed all-empty argument set.
+    if n == 0 {
+        return Ok(arg_codes
+            .iter()
+            .map(|&code| empty_colvec_for(code))
+            .collect());
+    }
+    // Per column, walk every row's cell at column c and push into a typed
+    // `Vec<T>`. `validity` stays empty (the "all-valid" fast path) until an
+    // actual `DuckValue::Null` is seen, then it gets lazily materialized as an
+    // all-1 bit-mask that mark_null() flips per NULL row.
+    let mut columns: Vec<Colvec> = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        let code = arg_codes[c];
+        let mut validity: Vec<u8> = Vec::new();
+        macro_rules! mark_null {
+            ($row:expr) => {{
+                if validity.is_empty() {
+                    validity = vec![0xFFu8; (n + 7) / 8];
+                }
+                validity[$row >> 3] &= !(1u8 << ($row & 7));
+            }};
+        }
+        macro_rules! prim {
+            ($ty:ty, $variant:ident, $default:expr) => {{
+                let mut out: Vec<$ty> = Vec::with_capacity(n);
+                for (r, row) in state.iter().enumerate() {
+                    match &row[c] {
+                        reg::DuckValue::$variant(x) => out.push(*x),
+                        reg::DuckValue::Null => {
+                            mark_null!(r);
+                            out.push($default);
+                        }
+                        other => {
+                            return Err(format!(
+                                "aggregate arg {c} expected {} but got {other:?}",
+                                stringify!($variant)
+                            ))
+                        }
+                    }
+                }
+                ColvecColumn::$variant(out)
+            }};
+        }
+        let data = match code {
+            T_I64 => prim!(i64, Int64, 0),
+            T_U64 => prim!(u64, Uint64, 0),
+            T_F64 => prim!(f64, Float64, 0.0),
+            T_BOOL => prim!(bool, Boolean, false),
+            T_I8 => prim!(i8, Int8, 0),
+            T_I16 => prim!(i16, Int16, 0),
+            T_I32 => prim!(i32, Int32, 0),
+            T_U8 => prim!(u8, Uint8, 0),
+            T_U16 => prim!(u16, Uint16, 0),
+            T_U32 => prim!(u32, Uint32, 0),
+            T_F32 => prim!(f32, Float32, 0.0),
+            T_TIMESTAMP => prim!(i64, Timestamp, 0),
+            T_DATE => prim!(i32, Date, 0),
+            T_TIME => prim!(i64, Time, 0),
+            T_TIMESTAMPTZ => prim!(i64, Timestamptz, 0),
+            T_TEXT => {
+                let mut out: Vec<String> = Vec::with_capacity(n);
+                for (r, row) in state.iter().enumerate() {
+                    match &row[c] {
+                        reg::DuckValue::Text(s) => out.push(s.clone()),
+                        reg::DuckValue::Null => {
+                            mark_null!(r);
+                            out.push(String::new());
+                        }
+                        other => {
+                            return Err(format!(
+                                "aggregate arg {c} expected Text but got {other:?}"
+                            ))
+                        }
+                    }
+                }
+                ColvecColumn::Text(out)
+            }
+            T_BLOB => {
+                let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
+                for (r, row) in state.iter().enumerate() {
+                    match &row[c] {
+                        reg::DuckValue::Blob(b) => out.push(b.clone()),
+                        reg::DuckValue::Null => {
+                            mark_null!(r);
+                            out.push(Vec::new());
+                        }
+                        other => {
+                            return Err(format!(
+                                "aggregate arg {c} expected Blob but got {other:?}"
+                            ))
+                        }
+                    }
+                }
+                ColvecColumn::Blob(out)
+            }
+            _ => {
+                // DECIMAL / INTERVAL / UUID / COMPLEX: rare on the aggregate path;
+                // the existing DuckValue -> WitVal -> Colvec route via
+                // dispatch_aggregate is preserved for these by returning an
+                // error the caller can distinguish and fall back on.
+                return Err(format!(
+                    "aggregate arg {c}: type code {code} not supported by col-native aggregate; falling back"
+                ));
+            }
+        };
+        columns.push(Colvec {
+            data,
+            validity,
+            rows: n as u32,
+        });
+    }
+    Ok(columns)
+}
+
+/// Build an empty `Colvec` shaped for `code`. Used for the zero-row group case.
+fn empty_colvec_for(code: u8) -> Colvec {
+    let data = match code {
+        T_I64 | T_TIMESTAMP | T_TIME | T_TIMESTAMPTZ => ColvecColumn::Int64(Vec::new()),
+        T_U64 => ColvecColumn::Uint64(Vec::new()),
+        T_F64 => ColvecColumn::Float64(Vec::new()),
+        T_BOOL => ColvecColumn::Boolean(Vec::new()),
+        T_I8 => ColvecColumn::Int8(Vec::new()),
+        T_I16 => ColvecColumn::Int16(Vec::new()),
+        T_I32 | T_DATE => ColvecColumn::Int32(Vec::new()),
+        T_U8 => ColvecColumn::Uint8(Vec::new()),
+        T_U16 => ColvecColumn::Uint16(Vec::new()),
+        T_U32 => ColvecColumn::Uint32(Vec::new()),
+        T_F32 => ColvecColumn::Float32(Vec::new()),
+        T_TEXT => ColvecColumn::Text(Vec::new()),
+        T_BLOB => ColvecColumn::Blob(Vec::new()),
+        _ => ColvecColumn::Int64(Vec::new()),
+    };
+    Colvec {
+        data,
+        validity: Vec::new(),
+        rows: 0,
+    }
+}
+
 /// Run an aggregate FFI-callback body, converting a panic into a DuckDB
 /// aggregate error rather than letting it unwind across the `extern "C"`
 /// boundary (which would abort the host process). Mirrors [`guard`] for the
@@ -1711,11 +1861,27 @@ unsafe extern "C" fn agg_finalize(
 ) {
     agg_guard(info, "aggregate finalize", || {
         let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const AggExtra);
+        // One decision per aggregate registration: are all its arg types
+        // handled by the col-native fast path? Common primitives, temporal,
+        // TEXT, and BLOB are; DECIMAL / INTERVAL / UUID / COMPLEX fall back
+        // to the row-major path via engine.dispatch_aggregate. This is a
+        // cheap all() over ~1-3 codes so we do it inline per finalize.
+        let col_native_ok = supports_col_native_agg(&extra.arg_codes);
         for i in 0..count as usize {
             let group = &mut **(*source.add(i) as *mut *mut AggState);
             let rows = std::mem::take(group);
-            let dispatched = {
-                let engine = &extra.engine;
+            let engine = &extra.engine;
+            let dispatched = if col_native_ok {
+                // Col-native fast path: pivot the group's DuckValues straight
+                // into Colvecs. Skips both the extension-side per-cell
+                // neutral_to_wit walk in engine.dispatch_aggregate AND the
+                // runtime's rows_to_colvecs scratch (per-column
+                // Vec<&Duckvalue>).
+                match agg_state_to_colvecs(rows, &extra.arg_codes) {
+                    Ok(cols) => engine.dispatch_aggregate_col(extra.callback_handle, &cols),
+                    Err(msg) => Err(anyhow::anyhow!(msg)),
+                }
+            } else {
                 engine.dispatch_aggregate(extra.callback_handle, rows)
             };
             let out = offset as usize + i;
@@ -1730,6 +1896,33 @@ unsafe extern "C" fn agg_finalize(
             }
         }
     });
+}
+
+/// True when every arg code is one of the arms `agg_state_to_colvecs` handles
+/// directly. Anything else stays on the row-major `dispatch_aggregate` path.
+fn supports_col_native_agg(arg_codes: &[u8]) -> bool {
+    arg_codes.iter().all(|&code| {
+        matches!(
+            code,
+            T_I64
+                | T_U64
+                | T_F64
+                | T_BOOL
+                | T_I8
+                | T_I16
+                | T_I32
+                | T_U8
+                | T_U16
+                | T_U32
+                | T_F32
+                | T_TIMESTAMP
+                | T_DATE
+                | T_TIME
+                | T_TIMESTAMPTZ
+                | T_TEXT
+                | T_BLOB
+        )
+    })
 }
 
 unsafe extern "C" fn agg_destroy(states: *mut ffi::duckdb_aggregate_state, count: ffi::idx_t) {
