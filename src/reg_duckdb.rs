@@ -1657,7 +1657,7 @@ fn capture_live_sigs(loaded: &crate::engine::LoadedComponent) -> Vec<LoadedFuncS
 }
 
 /// The host capability profile captured at `LOAD ducklink` time: which tiers are
-/// active on THIS artifact + host, so `ducklink_capabilities()` can report them
+/// active on THIS artifact + host, so `ducklink_host_capabilities()` can report them
 /// and `ducklink_modules().compatible` can be decided. Set once by the entry
 /// point via [`set_host_caps`]; read by the capability + module views.
 #[derive(Clone, Default)]
@@ -1782,10 +1782,11 @@ pub fn register_load_function(
     // `ducklink_*()` TFs are the implementation the views select from.
     con.register_table_function::<WasmModules>("ducklink_modules")?;
     con.register_table_function::<WasmFunctions>("ducklink_functions")?;
-    con.register_table_function::<WasmCapabilities>("ducklink_capabilities")?;
+    con.register_table_function::<WasmHostCapabilities>("ducklink_host_capabilities")?;
     con.register_table_function::<WasmCache>("ducklink_cache")?;
     con.register_table_function::<WasmModuleCompatibility>("ducklink_module_compatibility")?;
     con.register_table_function::<WasmEvents>("ducklink_events")?;
+    con.register_table_function::<WasmHost>("ducklink_host")?;
 
     // Create the public `ducklink` SCHEMA of system VIEWS over the internal TFs.
     // This is the discovery API surface: `SELECT * FROM ducklink.modules`, etc.
@@ -1816,10 +1817,11 @@ fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
         "CREATE SCHEMA IF NOT EXISTS ducklink;
          CREATE OR REPLACE VIEW ducklink.modules AS SELECT * FROM ducklink_modules();
          CREATE OR REPLACE VIEW ducklink.functions AS SELECT * FROM ducklink_functions();
-         CREATE OR REPLACE VIEW ducklink.capabilities AS SELECT * FROM ducklink_capabilities();
+         CREATE OR REPLACE VIEW ducklink.host_capabilities AS SELECT * FROM ducklink_host_capabilities();
          CREATE OR REPLACE VIEW ducklink.cache AS SELECT * FROM ducklink_cache();
          CREATE OR REPLACE VIEW ducklink.module_compatibility AS SELECT * FROM ducklink_module_compatibility();
-         CREATE OR REPLACE VIEW ducklink.events AS SELECT * FROM ducklink_events();",
+         CREATE OR REPLACE VIEW ducklink.events AS SELECT * FROM ducklink_events();
+         CREATE OR REPLACE VIEW ducklink.host AS SELECT * FROM ducklink_host();",
     )
 }
 
@@ -2127,7 +2129,7 @@ impl VTab for WasmLoad {
 //
 // These `ducklink_*()` table functions are the INTERNAL implementation of the
 // public discovery API. Users query the `ducklink` schema of system views
-// (`SELECT * FROM ducklink.modules`, `ducklink.functions`, `ducklink.capabilities`,
+// (`SELECT * FROM ducklink.modules`, `ducklink.functions`, `ducklink.host_capabilities`,
 // `ducklink.cache`), which are `CREATE OR REPLACE VIEW`s over these TFs (see
 // `create_ducklink_schema`). The TFs remain individually callable as a fallback.
 
@@ -2169,7 +2171,7 @@ struct ModuleRow {
     scalars: i32,
     tables: i32,
     aggregates: i32,
-    kinds: String,
+    capabilities: String,
     compatible: bool,
 }
 
@@ -2200,7 +2202,7 @@ impl VTab for WasmModules {
             bind.add_result_column("scalars", int());
             bind.add_result_column("tables", int());
             bind.add_result_column("aggregates", int());
-            bind.add_result_column("kinds", vc());
+            bind.add_result_column("capabilities", vc());
             bind.add_result_column("compatible", boolean());
 
             let caps = host_caps();
@@ -2231,7 +2233,7 @@ impl VTab for WasmModules {
                         scalars,
                         tables,
                         aggregates,
-                        kinds: e.requires.join(", "),
+                        capabilities: e.requires.join(", "),
                         compatible: module_compatible(&e.requires, &caps),
                     }
                 })
@@ -2265,7 +2267,7 @@ impl VTab for WasmModules {
                 output.flat_vector(1).insert(r, row.version.as_str());
                 output.flat_vector(2).insert(r, row.description.as_str());
                 output.flat_vector(3).insert(r, row.categories.as_str());
-                output.flat_vector(8).insert(r, row.kinds.as_str());
+                output.flat_vector(8).insert(r, row.capabilities.as_str());
             }
             // Fixed-width columns: fill the typed slices after the string inserts.
             unsafe {
@@ -2442,48 +2444,38 @@ impl VTab for WasmFunctions {
     }
 }
 
-// --- ducklink_capabilities() ------------------------------------------------
+// --- ducklink_host_capabilities() ------------------------------------------------
 
-/// One capability row for `ducklink_capabilities()`.
-struct CapabilityRow {
+/// One capability row for `ducklink_host_capabilities()`.
+struct HostCapabilityRow {
     name: String,
     available: bool,
-    reason: String,
+    detail: String,
 }
 
-struct WasmCapabilitiesBind {
-    rows: Vec<CapabilityRow>,
+struct WasmHostCapabilitiesBind {
+    rows: Vec<HostCapabilityRow>,
 }
 
-/// `ducklink_capabilities()` — the HOST's capabilities: which function classes /
-/// tiers are available on this artifact + host, and why. Derived from the tier
-/// gate captured at load time (`HostCaps`).
-struct WasmCapabilities;
+/// `ducklink_host_capabilities()` — the HOST's capabilities: which capability kinds
+/// this artifact + host can satisfy. The row-set is the DEDUPED union of
+/// `COMMON_TIER_KINDS` and `ADVANCED_TIER_KINDS` — the exact vocabulary
+/// `module_compatible()` checks against — so anything that appears in a
+/// module's `kinds` column is guaranteed to have a row here.
+struct WasmHostCapabilities;
 
-impl VTab for WasmCapabilities {
+impl VTab for WasmHostCapabilities {
     type InitData = WasmTableInit;
-    type BindData = WasmCapabilitiesBind;
+    type BindData = WasmHostCapabilitiesBind;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        guard("ducklink_capabilities bind", || {
+        guard("ducklink_host_capabilities bind", || {
             bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
             bind.add_result_column("available", LogicalTypeHandle::from(LogicalTypeId::Boolean));
-            bind.add_result_column("reason", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("detail", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
             let caps = host_caps();
-            let mut rows: Vec<CapabilityRow> = Vec::new();
-
-            // Common tier: always available on the stable C API.
-            for name in ["scalar", "table", "aggregate", "load_wasm"] {
-                rows.push(CapabilityRow {
-                    name: name.to_string(),
-                    available: true,
-                    reason: "common tier".to_string(),
-                });
-            }
-
-            // Advanced tier: parser + optimizer (and the other internal-ABI kinds).
-            let adv_reason = if caps.advanced_enabled {
+            let adv_detail = if caps.advanced_enabled {
                 format!(
                     "advanced tier: active (host DuckDB {})",
                     caps.host_version.as_deref().unwrap_or("unknown"),
@@ -2495,28 +2487,47 @@ impl VTab for WasmCapabilities {
                     caps.host_version.as_deref().unwrap_or("unknown")
                 )
             } else {
-                "not built in this artifact (build with --features advanced to enable)".to_string()
+                "advanced tier: not built in this artifact (build with --features advanced to enable)".to_string()
             };
-            for name in ["parser", "optimizer"] {
-                rows.push(CapabilityRow {
-                    name: name.to_string(),
-                    available: caps.advanced_enabled,
-                    reason: adv_reason.clone(),
-                });
+
+            // One row per DEDUPED tier kind. Common-tier kinds are always
+            // available; advanced-tier kinds gate on the tier state captured
+            // at load. `catalog` is intentionally listed in both tier
+            // constants (any host provides it), so it emits a single
+            // common-tier row here.
+            let mut rows: Vec<HostCapabilityRow> = Vec::new();
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for name in COMMON_TIER_KINDS {
+                if seen.insert(*name) {
+                    rows.push(HostCapabilityRow {
+                        name: (*name).to_string(),
+                        available: true,
+                        detail: "common tier".to_string(),
+                    });
+                }
             }
-
-            // The wasm component ABI / WIT contract version this host speaks.
-            rows.push(CapabilityRow {
-                name: "wasm_abi".to_string(),
-                available: true,
-                reason: if caps.abi_version.is_empty() {
-                    "wasm component ABI".to_string()
-                } else {
-                    format!("wasm component ABI {}", caps.abi_version)
-                },
+            for name in ADVANCED_TIER_KINDS {
+                if seen.insert(*name) {
+                    rows.push(HostCapabilityRow {
+                        name: (*name).to_string(),
+                        available: caps.advanced_enabled,
+                        detail: adv_detail.clone(),
+                    });
+                }
+            }
+            // `LOAD WASM 'name'` — the SQL statement — is gated on the parser
+            // hook installed only when the advanced tier is active. Not in
+            // the tier-kind constants (it's a host feature, not something a
+            // module declares), but useful to advertise here alongside the
+            // kinds that gate on the same thing.
+            rows.push(HostCapabilityRow {
+                name: "load_wasm".to_string(),
+                available: caps.advanced_enabled,
+                detail: adv_detail,
             });
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
 
-            Ok(WasmCapabilitiesBind { rows })
+            Ok(WasmHostCapabilitiesBind { rows })
         })
     }
 
@@ -2530,7 +2541,7 @@ impl VTab for WasmCapabilities {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        guard("ducklink_capabilities scan", || {
+        guard("ducklink_host_capabilities scan", || {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
@@ -2542,7 +2553,7 @@ impl VTab for WasmCapabilities {
             for r in 0..n {
                 let row = &bind.rows[start + r];
                 output.flat_vector(0).insert(r, row.name.as_str());
-                output.flat_vector(2).insert(r, row.reason.as_str());
+                output.flat_vector(2).insert(r, row.detail.as_str());
             }
             unsafe {
                 let mut av = output.flat_vector(1);
@@ -2553,6 +2564,95 @@ impl VTab for WasmCapabilities {
             }
             init.cursor.store(start + n, Ordering::Relaxed);
             output.set_len(n);
+            Ok(())
+        })
+    }
+}
+
+// --- ducklink_host() --------------------------------------------------------
+
+/// One-row view carrying pure HOST metadata: things that describe this
+/// ducklink process/artifact rather than any module. Split from
+/// `ducklink.host_capabilities` because these are single-value facts, not yes/no
+/// availability flags.
+struct HostRow {
+    wasm_abi: String,
+    duckdb_version: String,
+    duckdb_built_against: String,
+    advanced_tier: String,
+}
+
+struct WasmHostBind {
+    row: HostRow,
+}
+
+/// `ducklink_host()` — a single-row view of host metadata: the WIT contract
+/// version this host speaks (`wasm_abi`, in `duckdb:extension@X.Y.Z` form),
+/// the host DuckDB version, the DuckDB version the advanced tier was compiled
+/// against, and the advanced tier's current state.
+struct WasmHost;
+
+impl VTab for WasmHost {
+    type InitData = WasmTableInit;
+    type BindData = WasmHostBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_host bind", || {
+            let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            bind.add_result_column("wasm_abi", vc());
+            bind.add_result_column("duckdb_version", vc());
+            bind.add_result_column("duckdb_built_against", vc());
+            bind.add_result_column("advanced_tier", vc());
+
+            let caps = host_caps();
+            let wasm_abi = normalize_generation(Some(caps.abi_version.clone()));
+            let duckdb_version = caps.host_version.clone().unwrap_or_default();
+            let advanced_tier = if caps.advanced_enabled {
+                "active"
+            } else if caps.advanced_built {
+                "inactive"
+            } else {
+                "not_built"
+            }
+            .to_string();
+
+            Ok(WasmHostBind {
+                row: HostRow {
+                    wasm_abi,
+                    duckdb_version,
+                    duckdb_built_against: caps.built_against.clone(),
+                    advanced_tier,
+                },
+            })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_host scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            // Exactly one row, emitted on the first scan.
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = 1usize.saturating_sub(start);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            output.flat_vector(0).insert(0, bind.row.wasm_abi.as_str());
+            output.flat_vector(1).insert(0, bind.row.duckdb_version.as_str());
+            output.flat_vector(2).insert(0, bind.row.duckdb_built_against.as_str());
+            output.flat_vector(3).insert(0, bind.row.advanced_tier.as_str());
+            init.cursor.store(1, Ordering::Relaxed);
+            output.set_len(1);
             Ok(())
         })
     }
@@ -3381,10 +3481,10 @@ mod tests {
                 .expect("events ts type");
             assert_eq!(ts_type, "TIMESTAMP", "events.ts must be a TIMESTAMP");
 
-            // ducklink.capabilities always has the common-tier rows.
+            // ducklink.host_capabilities always has the common-tier rows.
             let n_caps: i64 = con
                 .query_row(
-                    "SELECT count(*) FROM ducklink.capabilities WHERE name IN ('scalar','load_wasm')",
+                    "SELECT count(*) FROM ducklink.host_capabilities WHERE name IN ('scalar','load_wasm')",
                     [],
                     |r| r.get(0),
                 )
