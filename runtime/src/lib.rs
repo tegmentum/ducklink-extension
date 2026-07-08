@@ -1093,31 +1093,46 @@ pub struct CallbackEntry {
 /// Allocates stable host-side handles and maps them to `CallbackEntry`s. The
 /// host hands a handle to DuckDB at registration; DuckDB passes it back on every
 /// invocation, and the engine routes it to the owning component.
+///
+/// Handles are dense small ints starting at 1, monotonically increasing. The
+/// backing store is a `Vec<Option<CallbackEntry>>` indexed by handle — a
+/// direct pointer offset instead of a HashMap hash + bucket walk on every
+/// dispatch. Slot 0 is unused (handles start at 1) so the index math is a
+/// straight cast. Removed callbacks leave `None` in place; the Vec never
+/// shrinks, matching the "handles never rebind" contract loadable extensions
+/// rely on.
 #[derive(Default)]
 pub struct CallbackRegistry {
     next_handle: u32,
-    entries: HashMap<u32, CallbackEntry>,
+    entries: Vec<Option<CallbackEntry>>,
 }
 
 impl CallbackRegistry {
     pub fn new() -> Self {
         Self {
             next_handle: 1,
-            entries: HashMap::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Ensure `entries` covers `handle`, filling any gap with `None`.
+    #[inline]
+    fn ensure_slot(&mut self, handle: u32) {
+        let idx = handle as usize;
+        if self.entries.len() <= idx {
+            self.entries.resize(idx + 1, None);
         }
     }
 
     pub fn allocate(&mut self, extension: &str, kind: CallbackKind, dispatcher_handle: u32) -> u32 {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1).max(1);
-        self.entries.insert(
-            handle,
-            CallbackEntry {
-                extension: Arc::from(extension),
-                dispatcher_handle,
-                kind,
-            },
-        );
+        self.ensure_slot(handle);
+        self.entries[handle as usize] = Some(CallbackEntry {
+            extension: Arc::from(extension),
+            dispatcher_handle,
+            kind,
+        });
         verbose_log!(
             "[extension-manager] registered {} callback handle {} for '{}' (dispatcher={dispatcher_handle})",
             kind.describe(),
@@ -1128,21 +1143,30 @@ impl CallbackRegistry {
     }
 
     pub fn remove(&mut self, handle: u32) {
-        if let Some(entry) = self.entries.remove(&handle) {
-            verbose_log!(
-                "[extension-manager] released {} callback handle {} for '{}'",
-                entry.kind.describe(),
-                handle,
-                entry.extension
-            );
+        let idx = handle as usize;
+        if let Some(slot) = self.entries.get_mut(idx) {
+            if let Some(entry) = slot.take() {
+                verbose_log!(
+                    "[extension-manager] released {} callback handle {} for '{}'",
+                    entry.kind.describe(),
+                    handle,
+                    entry.extension
+                );
+            }
         }
     }
 
     pub fn remove_extension(&mut self, extension: &str) {
-        let initial = self.entries.len();
-        self.entries
-            .retain(|_, entry| &*entry.extension != extension);
-        let removed = initial.saturating_sub(self.entries.len());
+        let mut removed = 0usize;
+        for slot in self.entries.iter_mut() {
+            let matches = slot
+                .as_ref()
+                .is_some_and(|entry| &*entry.extension == extension);
+            if matches {
+                *slot = None;
+                removed += 1;
+            }
+        }
         if removed > 0 {
             verbose_log!(
                 "[extension-manager] purged {removed} callback handles after unloading '{}'",
@@ -1152,7 +1176,9 @@ impl CallbackRegistry {
     }
 
     pub fn get(&self, handle: u32) -> Option<CallbackEntry> {
-        self.entries.get(&handle).cloned()
+        self.entries
+            .get(handle as usize)
+            .and_then(|slot| slot.clone())
     }
 
     /// Borrowing handle resolution for the dispatch hot path. Unlike [`get`],
@@ -1163,7 +1189,9 @@ impl CallbackRegistry {
     /// the borrow, which on the dispatch path is already the case.
     #[inline]
     pub fn resolve(&self, handle: u32) -> Option<&CallbackEntry> {
-        self.entries.get(&handle)
+        self.entries
+            .get(handle as usize)
+            .and_then(|slot| slot.as_ref())
     }
 
     /// Like [`allocate`] but without the per-registration `eprintln!`. Used by
@@ -1177,14 +1205,12 @@ impl CallbackRegistry {
     ) -> u32 {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1).max(1);
-        self.entries.insert(
-            handle,
-            CallbackEntry {
-                extension: Arc::from(extension),
-                dispatcher_handle,
-                kind,
-            },
-        );
+        self.ensure_slot(handle);
+        self.entries[handle as usize] = Some(CallbackEntry {
+            extension: Arc::from(extension),
+            dispatcher_handle,
+            kind,
+        });
         handle
     }
 }
