@@ -17,7 +17,7 @@ use wasmtime::{Config, Engine};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::{
-    runtime as extension_runtime, types as extension_types,
+    column_types as extension_column_types, runtime as extension_runtime, types as extension_types,
 };
 use ducklink_runtime::reg;
 use ducklink_runtime::{
@@ -427,6 +427,37 @@ impl Engine2 {
         instance
             .dispatch_scalar_batch(dispatcher_handle, wit_rows, ctx)
             .map_err(|e| anyhow!("scalar batch dispatch failed: {e:?}"))
+    }
+
+    /// Column-native scalar batch dispatch. The DuckDB bridge builds one
+    /// `Colvec` per input column (per-column memcpy for the primitive arms)
+    /// and hands them straight to `call-scalar-batch-col`; the returned
+    /// `Colvec` is written directly into the DuckDB output vector without
+    /// a row-major intermediate on either side of the crossing.
+    pub fn dispatch_scalar_batch_col(
+        &mut self,
+        callback_handle: u32,
+        base_row_index: u64,
+        args: &[extension_column_types::Colvec],
+    ) -> Result<extension_column_types::Colvec> {
+        let (extension, dispatcher_handle) = {
+            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+        };
+        let instance = self
+            .instances
+            .get_mut(&*extension)
+            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
+        let ctx = extension_runtime::Invokeinfo {
+            rowindex: Some(base_row_index),
+            iswindow: false,
+        };
+        instance
+            .dispatch_scalar_batch_col(dispatcher_handle, args, ctx)
+            .map_err(|e| anyhow!("scalar batch (col) dispatch failed: {e:?}"))
     }
 
     /// Invoke a component table function with the given call arguments, returning

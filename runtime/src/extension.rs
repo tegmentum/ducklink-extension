@@ -2402,6 +2402,27 @@ impl ExtensionInstance {
         out.map(colvec_to_values)
     }
 
+    /// Column-native scalar batch dispatch. Hands the caller-built `Colvec`s
+    /// straight to `call-scalar-batch-col` and returns the guest's `Colvec`
+    /// unchanged, so no row-major pivot happens on either side. The native
+    /// DuckDB bridge builds `Colvec`s directly from DuckDB flat vectors
+    /// (per-column memcpy for the primitive arms) and writes the result
+    /// `Colvec` back into DuckDB output vectors the same way — both directions
+    /// of the boundary crossing skip the row-major intermediate that
+    /// [`dispatch_scalar_batch`] still allocates.
+    pub fn dispatch_scalar_batch_col(
+        &mut self,
+        dispatcher_handle: u32,
+        args: &[extension_column_types::Colvec],
+        ctx: extension_runtime::Invokeinfo,
+    ) -> Result<extension_column_types::Colvec, extension_types::Duckerror> {
+        let guest = self.bindings.duckdb_extension_callback_dispatch();
+        let mut store = self.store.as_context_mut();
+        guest
+            .call_call_scalar_batch_col(&mut store, dispatcher_handle, args, ctx)
+            .map_err(map_extension_trap)?
+    }
+
     pub fn dispatch_table(
         &mut self,
         dispatcher_handle: u32,
