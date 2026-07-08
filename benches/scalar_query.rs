@@ -14,7 +14,7 @@
 mod bundled {
     use std::hint::black_box;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use criterion::{Criterion, Throughput};
     use duckdb::Connection;
@@ -55,12 +55,15 @@ mod bundled {
             duckdb::ffi::DuckDBSuccess,
             "duckdb_connect"
         );
-        let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+        let engine = Arc::new(Engine2::new().expect("engine"));
         let specs = vec![ComponentSpec {
             name: "sample_extension".to_string(),
             path,
         }];
-        register_components(&con, Some(raw_con), engine, &specs).expect("register components");
+        // The advanced-tier `db` handle is unused by this bench (bundled DuckDB,
+        // common-tier only).
+        register_components(&con, Some(raw_con), None, engine, &specs)
+            .expect("register components");
 
         const N: u64 = 1_000_000; // ~488 chunks of STANDARD_VECTOR_SIZE
         let sql = format!("SELECT sum(sample_plus_one(i)) FROM range({N}) t(i)");
