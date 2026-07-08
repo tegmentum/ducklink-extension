@@ -12,7 +12,7 @@
 //! `callback-dispatch` export for each DuckDB-side invocation.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime::{AsContextMut, Engine, Store};
@@ -464,7 +464,7 @@ pub struct ExtensionStoreState {
     /// Maps the handle returned from `table-registry.register` to the table
     /// function name, so `files.register-replacement-scan` can resolve it.
     table_handle_names: HashMap<u32, String>,
-    callback_registry: Arc<Mutex<CallbackRegistry>>,
+    callback_registry: Arc<RwLock<CallbackRegistry>>,
     extension_name: String,
     /// `Some(..)` only for a component that imports `compose:dynlink/linker`
     /// (the gate is in `load_component`); every other extension is unaffected
@@ -477,7 +477,7 @@ impl ExtensionStoreState {
     pub fn new(
         wasi: WasiCtx,
         services: Box<dyn ExtensionServices>,
-        callback_registry: Arc<Mutex<CallbackRegistry>>,
+        callback_registry: Arc<RwLock<CallbackRegistry>>,
         extension_name: String,
     ) -> Self {
         Self::with_dynlink(wasi, services, callback_registry, extension_name, None)
@@ -488,7 +488,7 @@ impl ExtensionStoreState {
     pub fn with_dynlink(
         wasi: WasiCtx,
         services: Box<dyn ExtensionServices>,
-        callback_registry: Arc<Mutex<CallbackRegistry>>,
+        callback_registry: Arc<RwLock<CallbackRegistry>>,
         extension_name: String,
         dynlink: Option<crate::compose_dynlink::DynLinkBridge>,
     ) -> Self {
@@ -552,7 +552,7 @@ impl ExtensionStoreState {
     fn allocate_callback_handle(&self, dispatcher_handle: u32, kind: CallbackKind) -> u32 {
         let mut registry = self
             .callback_registry
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner());
         registry.allocate(&self.extension_name, kind, dispatcher_handle)
     }
@@ -560,7 +560,7 @@ impl ExtensionStoreState {
     fn release_callback_handle(&self, handle: u32) {
         let mut registry = self
             .callback_registry
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner());
         registry.remove(handle);
     }
@@ -907,7 +907,7 @@ impl extension_runtime::HostScalarRegistry for ExtensionStoreState {
         {
             let registry = self
                 .callback_registry
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             match registry.get(callback.rep()) {
                 Some(entry) if entry.kind == CallbackKind::Scalar => {}
@@ -978,7 +978,7 @@ impl extension_runtime::HostTableRegistry for ExtensionStoreState {
         {
             let registry = self
                 .callback_registry
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             match registry.get(callback.rep()) {
                 Some(entry) if entry.kind == CallbackKind::Table => {}
@@ -1055,7 +1055,7 @@ impl extension_runtime::HostAggregateRegistry for ExtensionStoreState {
         {
             let registry = self
                 .callback_registry
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             match registry.get(callback.rep()) {
                 Some(entry) if entry.kind == CallbackKind::Aggregate => {}
@@ -1136,7 +1136,7 @@ impl extension_runtime::HostPragmaRegistry for ExtensionStoreState {
         {
             let registry = self
                 .callback_registry
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             match registry.get(callback.rep()) {
                 Some(entry) if entry.kind == CallbackKind::Pragma => {}
@@ -3807,7 +3807,7 @@ mod tests {
         ExtensionStoreState::new(
             wasi,
             Box::new(NoopServices),
-            Arc::new(Mutex::new(CallbackRegistry::default())),
+            Arc::new(RwLock::new(CallbackRegistry::default())),
             "testext".to_string(),
         )
     }
@@ -3861,7 +3861,7 @@ mod tests {
             &component,
             wasi,
             Box::new(NoopServices),
-            Arc::new(Mutex::new(CallbackRegistry::default())),
+            Arc::new(RwLock::new(CallbackRegistry::default())),
             name.to_string(),
         )
     }
@@ -4565,7 +4565,7 @@ pub fn load_component(
     component: &Component,
     wasi: WasiCtx,
     services: Box<dyn ExtensionServices>,
-    callback_registry: Arc<Mutex<CallbackRegistry>>,
+    callback_registry: Arc<RwLock<CallbackRegistry>>,
     extension_name: String,
 ) -> wasmtime::Result<ExtensionInstance> {
     load_component_with_dynlink(
@@ -4591,7 +4591,7 @@ pub fn load_component_with_dynlink(
     component: &Component,
     wasi: WasiCtx,
     services: Box<dyn ExtensionServices>,
-    callback_registry: Arc<Mutex<CallbackRegistry>>,
+    callback_registry: Arc<RwLock<CallbackRegistry>>,
     extension_name: String,
     dynlink_registry: Option<crate::compose_dynlink::ProviderRegistry>,
 ) -> wasmtime::Result<ExtensionInstance> {

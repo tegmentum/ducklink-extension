@@ -164,7 +164,7 @@ pub struct LoadedComponent {
 /// instance's wasmtime store, which the store's `!Sync` guarantee mandates.
 pub struct Engine2 {
     engine: Engine,
-    callbacks: Arc<Mutex<CallbackRegistry>>,
+    callbacks: Arc<RwLock<CallbackRegistry>>,
     instances: RwLock<HashMap<String, Arc<Mutex<ExtensionInstance>>>>,
 }
 
@@ -172,7 +172,7 @@ impl Engine2 {
     pub fn new() -> Result<Self> {
         Ok(Self {
             engine: build_engine()?,
-            callbacks: Arc::new(Mutex::new(CallbackRegistry::new())),
+            callbacks: Arc::new(RwLock::new(CallbackRegistry::new())),
             instances: RwLock::new(HashMap::new()),
         })
     }
@@ -392,7 +392,7 @@ impl Engine2 {
         args: Vec<reg::DuckValue>,
     ) -> Result<reg::DuckValue> {
         let (extension, dispatcher_handle) = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
@@ -424,7 +424,7 @@ impl Engine2 {
         wit_rows: &Vec<Vec<extension_types::Duckvalue>>,
     ) -> Result<Vec<extension_types::Duckvalue>> {
         let (extension, dispatcher_handle) = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
@@ -453,7 +453,7 @@ impl Engine2 {
         args: &[extension_column_types::Colvec],
     ) -> Result<extension_column_types::Colvec> {
         let (extension, dispatcher_handle) = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
@@ -479,7 +479,7 @@ impl Engine2 {
         args: Vec<reg::DuckValue>,
     ) -> Result<Vec<Vec<extension_types::Duckvalue>>> {
         let (extension, dispatcher_handle) = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
@@ -508,7 +508,7 @@ impl Engine2 {
         rows: Vec<Vec<reg::DuckValue>>,
     ) -> Result<reg::DuckValue> {
         let (extension, dispatcher_handle) = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
@@ -537,7 +537,7 @@ impl Engine2 {
         args: &[extension_column_types::Colvec],
     ) -> Result<reg::DuckValue> {
         let (extension, dispatcher_handle) = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
