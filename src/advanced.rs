@@ -29,7 +29,7 @@ use crate::reg_duckdb::{type_code, write_ret_raw};
 /// from DuckDB's parser / optimizer / scan) reach the embedded engine and the
 /// set of declared rule handles through this.
 struct Advanced {
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     /// Every component-declared PARSER extension as (owning component, the
     /// component's guest dispatcher handle).
     parsers: Mutex<Vec<(String, u32)>>,
@@ -67,7 +67,7 @@ static ADVANCED: OnceLock<Advanced> = OnceLock::new();
 /// Bridge-local cursor id generator (0 is reserved for "open failed").
 static CURSOR_SEQ: AtomicU32 = AtomicU32::new(1);
 
-fn advanced_or_init(engine: &Arc<Mutex<Engine2>>) -> &'static Advanced {
+fn advanced_or_init(engine: &Arc<Engine2>) -> &'static Advanced {
     ADVANCED.get_or_init(|| Advanced {
         engine: engine.clone(),
         parsers: Mutex::new(Vec::new()),
@@ -129,7 +129,7 @@ extern "C" {
 ///
 /// `db` is the `duckdb_database` the loader handed the extension; the C++ shim
 /// casts it to the internal `DatabaseInstance` to reach `DBConfig`.
-pub fn register(db: ffi::duckdb_database, engine: &Arc<Mutex<Engine2>>, loaded: &LoadedComponent) {
+pub fn register(db: ffi::duckdb_database, engine: &Arc<Engine2>, loaded: &LoadedComponent) {
     let adv = advanced_or_init(engine);
 
     if !loaded.parsers.is_empty() {
@@ -340,8 +340,7 @@ unsafe fn ducklink_ts_open_impl(
             .collect()
     };
 
-    let mut engine = adv.engine.lock().expect("engine mutex poisoned");
-    let component_cursor = match engine.dispatch_table_open_filtered(
+    let component_cursor = match adv.engine.dispatch_table_open_filtered(
         &extension,
         handle,
         arg_values,
@@ -350,12 +349,10 @@ unsafe fn ducklink_ts_open_impl(
     ) {
         Ok(c) => c,
         Err(err) => {
-            drop(engine);
             ts_set_last_error(format!("{err}"));
             return 0;
         }
     };
-    drop(engine);
 
     let cursor_id = CURSOR_SEQ.fetch_add(1, Ordering::Relaxed);
     adv.cursors.lock().expect("cursors mutex poisoned").insert(
@@ -406,15 +403,14 @@ unsafe fn ducklink_ts_fill_impl(_handle: u32, cursor: u32, chunk: *mut c_void) -
         }
     };
 
-    let rows = {
-        let mut engine = adv.engine.lock().expect("engine mutex poisoned");
-        match engine.dispatch_table_next(&extension, handle, component_cursor, 2048) {
-            Ok(rows) => rows,
-            Err(err) => {
-                drop(engine);
-                ts_set_last_error(format!("{err}"));
-                return false;
-            }
+    let rows = match adv
+        .engine
+        .dispatch_table_next(&extension, handle, component_cursor, 2048)
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            ts_set_last_error(format!("{err}"));
+            return false;
         }
     };
 
@@ -483,7 +479,7 @@ fn ducklink_ts_close_impl(_handle: u32, cursor: u32) {
         .expect("cursors mutex poisoned")
         .remove(&cursor);
     if let Some(state) = state {
-        let mut engine = adv.engine.lock().expect("engine mutex poisoned");
+        let engine = &adv.engine;
         let _ = engine.dispatch_table_close(&state.extension, state.handle, state.component_cursor);
     }
 }
@@ -598,7 +594,7 @@ unsafe fn ducklink_optimizer_try_rewrite_impl(
         guard.clone()
     };
     let nodes = flatten_plan_json(plan);
-    let mut engine = adv.engine.lock().expect("engine mutex poisoned");
+    let engine = &adv.engine;
     for (extension, handle) in handles {
         match engine.dispatch_optimize(&extension, handle, nodes.clone(), query) {
             Ok(Some(rewrite)) => {
@@ -665,7 +661,7 @@ unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
         }
         guard.clone()
     };
-    let mut engine = adv.engine.lock().expect("engine mutex poisoned");
+    let engine = &adv.engine;
     for (extension, handle) in handles {
         match engine.dispatch_parse(&extension, handle, &query) {
             Ok(Some(rewrite)) => {

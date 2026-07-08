@@ -84,7 +84,7 @@ fn guard<T>(
 #[derive(Clone)]
 struct WasmScalarState {
     callback_handle: u32,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     arg_codes: Vec<u8>,
     ret_code: u8,
 }
@@ -882,7 +882,7 @@ impl VScalar for WasmScalar {
                 }
             }
             let result = {
-                let mut engine = state.engine.lock().expect("engine mutex poisoned");
+                let engine = &state.engine;
                 engine
                     .dispatch_scalar_batch_col(state.callback_handle, 0, &args)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
@@ -912,7 +912,7 @@ impl VScalar for WasmScalar {
 /// `reg` logical types are supported across any arity.
 pub fn register_scalars(
     con: &Connection,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     scalars: &[ScalarFunc],
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
@@ -971,7 +971,7 @@ fn param_to_neutral(code: u8, v: &Value) -> reg::DuckValue {
 #[derive(Clone)]
 struct WasmTableExtra {
     callback_handle: u32,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     arg_codes: Vec<u8>,
     col_codes: Vec<u8>,
     col_names: Vec<String>,
@@ -1021,7 +1021,7 @@ impl VTab for WasmTable {
                 .map(|(j, &code)| param_to_neutral(code, &bind.get_parameter(j as u64)))
                 .collect();
             let rows = {
-                let mut engine = extra.engine.lock().expect("engine mutex poisoned");
+                let engine = &extra.engine;
                 engine
                     .dispatch_table(extra.callback_handle, args)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
@@ -1096,7 +1096,7 @@ impl VTab for WasmTable {
 /// scalars.
 pub fn register_tables(
     con: &Connection,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     tables: &[TableFunc],
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
@@ -1164,7 +1164,7 @@ unsafe fn agg_guard(info: ffi::duckdb_function_info, what: &str, f: impl FnOnce(
 /// Per-function data DuckDB hands to the aggregate callbacks via extra-info.
 struct AggExtra {
     callback_handle: u32,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     arg_codes: Vec<u8>,
     ret_code: u8,
 }
@@ -1390,7 +1390,7 @@ unsafe extern "C" fn agg_finalize(
             let group = &mut **(*source.add(i) as *mut *mut AggState);
             let rows = std::mem::take(group);
             let dispatched = {
-                let mut engine = extra.engine.lock().expect("engine mutex poisoned");
+                let engine = &extra.engine;
                 engine.dispatch_aggregate(extra.callback_handle, rows)
             };
             let out = offset as usize + i;
@@ -1431,7 +1431,7 @@ unsafe extern "C" fn agg_extra_destroy(ptr: *mut c_void) {
 /// `raw_con` must be a valid `duckdb_connection`.
 pub unsafe fn register_aggregates(
     raw_con: ffi::duckdb_connection,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     aggregates: &[AggregateFunc],
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
@@ -1582,7 +1582,7 @@ struct DucklinkRuntime {
     /// the init-time connect failed. Disconnected at process exit (we never free
     /// it explicitly — it lives as long as the runtime).
     raw_con: RawConnHandle,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     /// Components loaded in THIS session (by `ducklink_load`), tracked so
     /// `ducklink_modules().loaded` can report them and so a re-load is idempotent.
     loaded: Mutex<Vec<LoadedRecord>>,
@@ -1750,7 +1750,7 @@ static RUNTIME: std::sync::OnceLock<DucklinkRuntime> = std::sync::OnceLock::new(
 /// engine so the ~21 MB endpoint component reuses the compile cache.
 pub(crate) fn ducklink_engine() -> Option<wasmtime::Engine> {
     let rt = RUNTIME.get()?;
-    let e = rt.engine.lock().expect("engine mutex poisoned");
+    let e = &rt.engine;
     Some(e.engine().clone())
 }
 
@@ -1769,7 +1769,7 @@ pub(crate) fn ducklink_connection() -> Option<&'static Mutex<Connection>> {
 pub fn register_load_function(
     con: &Connection,
     db: ffi::duckdb_database,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
 ) -> duckdb::Result<()> {
     // Open a PERSISTENT connection NOW, while `db` is still valid (we are inside
     // `init`). `try_clone` performs the `duckdb_connect` here; the resulting
@@ -1907,7 +1907,7 @@ pub unsafe fn load_wasm_into_db(
 
     crate::events::emit("load_start", Some(&name), path_str.clone());
     let loaded = {
-        let mut e = rt.engine.lock().expect("engine mutex poisoned");
+        let e = &rt.engine;
         match e.load(&name, &path) {
             Ok(l) => l,
             Err(err) => {
@@ -2058,7 +2058,7 @@ impl VTab for WasmLoad {
             crate::events::emit("load_start", Some(&name), path_str.clone());
             // Load the component through the shared engine.
             let loaded = {
-                let mut e = rt.engine.lock().expect("engine mutex poisoned");
+                let e = &rt.engine;
                 match e.load(&name, &path) {
                     Ok(l) => l,
                     Err(err) => {
@@ -3013,7 +3013,7 @@ pub fn register_components(
     con: &Connection,
     raw_con: Option<ffi::duckdb_connection>,
     db: Option<ffi::duckdb_database>,
-    engine: Arc<Mutex<Engine2>>,
+    engine: Arc<Engine2>,
     specs: &[ComponentSpec],
 ) -> anyhow::Result<usize> {
     // The advanced-tier `db` handle is unused when the advanced module is not
@@ -3024,7 +3024,7 @@ pub fn register_components(
     let mut total = 0usize;
     for spec in specs {
         let loaded = {
-            let mut e = engine.lock().expect("engine mutex poisoned");
+            let e = &engine;
             e.load(&spec.name, &spec.path)?
         };
         total += register_scalars(con, engine.clone(), &loaded.scalars)?;
@@ -3081,7 +3081,7 @@ mod tests {
         let loaded = engine
             .load("sample_extension", &sample_component())
             .expect("load component");
-        let engine = Arc::new(Mutex::new(engine));
+        let engine = Arc::new(engine);
 
         let con = Connection::open_in_memory().expect("open duckdb");
         let n = register_scalars(&con, engine.clone(), &loaded.scalars).expect("register");
@@ -3110,7 +3110,7 @@ mod tests {
     /// component by spec and registers its scalars.
     #[test]
     fn register_components_exposes_scalar() {
-        let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+        let engine = Arc::new(Engine2::new().expect("engine"));
         let specs = vec![ComponentSpec {
             name: "sample_extension".to_string(),
             path: sample_component(),
@@ -3131,7 +3131,7 @@ mod tests {
     /// bridge.
     #[test]
     fn sample_emit_sequence_streams_from_wasm() {
-        let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+        let engine = Arc::new(Engine2::new().expect("engine"));
         let specs = vec![ComponentSpec {
             name: "sample_extension".to_string(),
             path: sample_component(),
@@ -3188,7 +3188,7 @@ mod tests {
             assert_eq!(r, ffi::DuckDBSuccess, "duckdb_open failed");
 
             let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+            let engine = Arc::new(Engine2::new().expect("engine"));
 
             // What the entry point does: register ducklink_load + seed RUNTIME.
             register_load_function(&con, db, engine).expect("register ducklink_load");
@@ -3288,7 +3288,7 @@ mod tests {
             let mut db: ffi::duckdb_database = std::ptr::null_mut();
             assert_eq!(ffi::duckdb_open(c":memory:".as_ptr(), &mut db), ffi::DuckDBSuccess);
             let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+            let engine = Arc::new(Engine2::new().expect("engine"));
             register_load_function(&con, db, engine).expect("register ducklink_load + discovery");
 
             // `RUNTIME` is process-wide first-write-wins; if another raw-open test
@@ -3497,7 +3497,7 @@ mod tests {
         let loaded = engine
             .load("sample_extension", &sample_component())
             .expect("load");
-        let engine = Arc::new(Mutex::new(engine));
+        let engine = Arc::new(engine);
         let con = Connection::open_in_memory().expect("open");
         register_scalars(&con, engine, &loaded.scalars).expect("register");
 

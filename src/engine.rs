@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use wasmtime::component::Component;
@@ -151,10 +151,17 @@ pub struct LoadedComponent {
 
 /// Process-wide Direction-2 engine: loads components and dispatches DuckDB
 /// invocations into them. A DuckDB extension holds one of these.
+///
+/// Interior-mutable so callers hold `Arc<Engine2>` (not `Arc<Engine2>`)
+/// and every scalar/table/aggregate dispatch takes only the OWNING instance's
+/// mutex — not one process-wide lock across the whole extension. Two DuckDB
+/// worker threads invoking scalar functions on DIFFERENT components run in
+/// parallel; two threads invoking the SAME component still serialize on the
+/// instance's wasmtime store, which the store's `!Sync` guarantee mandates.
 pub struct Engine2 {
     engine: Engine,
     callbacks: Arc<Mutex<CallbackRegistry>>,
-    instances: HashMap<String, ExtensionInstance>,
+    instances: RwLock<HashMap<String, Arc<Mutex<ExtensionInstance>>>>,
 }
 
 impl Engine2 {
@@ -162,8 +169,19 @@ impl Engine2 {
         Ok(Self {
             engine: build_engine()?,
             callbacks: Arc::new(Mutex::new(CallbackRegistry::new())),
-            instances: HashMap::new(),
+            instances: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Resolve `extension` to its shared `Arc<Mutex<Instance>>`. Takes a brief
+    /// read on the instances map, clones the Arc, drops the read — so the
+    /// dispatcher can then lock ONLY that instance's mutex, in isolation from
+    /// every other loaded extension. `Err` if the extension isn't loaded.
+    fn instance_arc(&self, extension: &str) -> Result<Arc<Mutex<ExtensionInstance>>> {
+        let map = self.instances.read().expect("instances lock poisoned");
+        map.get(extension)
+            .cloned()
+            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))
     }
 
     /// The shared wasmtime [`Engine`] (component-model + exceptions enabled, with
@@ -177,7 +195,7 @@ impl Engine2 {
 
     /// Load a `duckdb:extension` component, run its `load()`, and return the
     /// functions it registered. The instance is retained for dispatch.
-    pub fn load(&mut self, extension: &str, path: &Path) -> Result<LoadedComponent> {
+    pub fn load(&self, extension: &str, path: &Path) -> Result<LoadedComponent> {
         let component = Component::from_file(&self.engine, path)
             .map_err(anyhow::Error::from)
             .with_context(|| format!("loading component at {}", path.display()))?;
@@ -241,7 +259,10 @@ impl Engine2 {
         let parsers = instance.take_pending_parsers();
         let optimizers = instance.take_pending_optimizers();
         let filterable_tables = instance.take_pending_filterable_tables();
-        self.instances.insert(extension.to_string(), instance);
+        {
+            let mut map = self.instances.write().expect("instances lock poisoned");
+            map.insert(extension.to_string(), Arc::new(Mutex::new(instance)));
+        }
         Ok(LoadedComponent {
             scalars,
             tables,
@@ -260,15 +281,13 @@ impl Engine2 {
     /// owning component is known directly from the registration, as in the wasm
     /// core's `parser_host` routing.
     pub fn dispatch_parse(
-        &mut self,
+        &self,
         extension: &str,
         handle: u32,
         sql: &str,
     ) -> Result<Option<String>> {
-        let instance = self
-            .instances
-            .get_mut(extension)
-            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        let instance_arc = self.instance_arc(extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         instance
             .call_parse(handle, sql)
             .map_err(|e| anyhow!("parser dispatch failed: {e:?}"))
@@ -279,16 +298,14 @@ impl Engine2 {
     /// `extension`. Returns `Some(rewrite_sql)` for a `rewrite-query` directive,
     /// else `None`.
     pub fn dispatch_optimize(
-        &mut self,
+        &self,
         extension: &str,
         handle: u32,
         nodes: Vec<(u32, String, Option<u32>, String)>,
         query: &str,
     ) -> Result<Option<String>> {
-        let instance = self
-            .instances
-            .get_mut(extension)
-            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        let instance_arc = self.instance_arc(extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         instance
             .call_optimize(handle, nodes, query)
             .map_err(|e| anyhow!("optimizer dispatch failed: {e:?}"))
@@ -300,7 +317,7 @@ impl Engine2 {
     /// (column index, op code 0..8 mirroring `filter-op`, operand values). Returns
     /// the component cursor handle. Drives `call-table-open-filtered`.
     pub fn dispatch_table_open_filtered(
-        &mut self,
+        &self,
         extension: &str,
         handle: u32,
         args: Vec<reg::DuckValue>,
@@ -308,10 +325,8 @@ impl Engine2 {
         filters: Vec<(u32, u8, Vec<reg::DuckValue>)>,
     ) -> Result<u32> {
         use ducklink_runtime::extension::TableFilter;
-        let instance = self
-            .instances
-            .get_mut(extension)
-            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        let instance_arc = self.instance_arc(extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
         let wit_filters: Vec<TableFilter> = filters
@@ -333,16 +348,14 @@ impl Engine2 {
     /// Advanced tier — pull up to `max_rows` from a streaming cursor as neutral
     /// rows. An empty result signals EOF. Drives `call-table-next`.
     pub fn dispatch_table_next(
-        &mut self,
+        &self,
         extension: &str,
         handle: u32,
         cursor: u32,
         max_rows: u32,
     ) -> Result<Vec<Vec<reg::DuckValue>>> {
-        let instance = self
-            .instances
-            .get_mut(extension)
-            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        let instance_arc = self.instance_arc(extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let rows = instance
             .table_next(handle, cursor, max_rows)
             .map_err(|e| anyhow!("table-stream next failed: {e:?}"))?;
@@ -354,15 +367,13 @@ impl Engine2 {
 
     /// Advanced tier — close a streaming cursor. Drives `call-table-close`.
     pub fn dispatch_table_close(
-        &mut self,
+        &self,
         extension: &str,
         handle: u32,
         cursor: u32,
     ) -> Result<()> {
-        let instance = self
-            .instances
-            .get_mut(extension)
-            .ok_or_else(|| anyhow!("extension '{extension}' is not loaded"))?;
+        let instance_arc = self.instance_arc(extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         instance
             .table_close(handle, cursor)
             .map_err(|e| anyhow!("table-stream close failed: {e:?}"))?;
@@ -373,7 +384,7 @@ impl Engine2 {
     /// handed to DuckDB at registration; it resolves through the shared callback
     /// registry to the owning component instance and its guest dispatcher.
     pub fn dispatch_scalar(
-        &mut self,
+        &self,
         callback_handle: u32,
         row_index: u64,
         args: Vec<reg::DuckValue>,
@@ -385,10 +396,8 @@ impl Engine2 {
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
             (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
-        let instance = self
-            .instances
-            .get_mut(&*extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
+        let instance_arc = self.instance_arc(&extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
         let ctx = extension_runtime::Invokeinfo {
@@ -407,17 +416,11 @@ impl Engine2 {
     /// collapses the N per-row `dispatch_scalar` boundary crossings of a DuckDB
     /// data chunk into one, which is the dominant cost when N is large.
     pub fn dispatch_scalar_batch(
-        &mut self,
+        &self,
         callback_handle: u32,
         base_row_index: u64,
         wit_rows: &Vec<Vec<extension_types::Duckvalue>>,
     ) -> Result<Vec<extension_types::Duckvalue>> {
-        // Hot path: the chunk arrives already in the WIT value type (the bridge's
-        // read_arg produces it directly) and is borrowed, not consumed, so the
-        // caller reuses one scratch buffer across chunks -- no per-chunk
-        // Vec<Vec<>> allocation. The canonical-ABI lowering reads `wit_rows`
-        // straight into the guest; the result comes back in the WIT type too, so
-        // nothing on this path rebuilds or converts the value vectors.
         let (extension, dispatcher_handle) = {
             let registry = self.callbacks.lock().expect("callback registry poisoned");
             let entry = registry
@@ -425,10 +428,8 @@ impl Engine2 {
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
             (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
-        let instance = self
-            .instances
-            .get_mut(&*extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
+        let instance_arc = self.instance_arc(&extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
             iswindow: false,
@@ -444,7 +445,7 @@ impl Engine2 {
     /// `Colvec` is written directly into the DuckDB output vector without
     /// a row-major intermediate on either side of the crossing.
     pub fn dispatch_scalar_batch_col(
-        &mut self,
+        &self,
         callback_handle: u32,
         base_row_index: u64,
         args: &[extension_column_types::Colvec],
@@ -456,10 +457,8 @@ impl Engine2 {
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
             (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
-        let instance = self
-            .instances
-            .get_mut(&*extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
+        let instance_arc = self.instance_arc(&extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
             iswindow: false,
@@ -473,7 +472,7 @@ impl Engine2 {
     /// all result rows. `callback_handle` resolves through the callback registry
     /// to the owning component instance.
     pub fn dispatch_table(
-        &mut self,
+        &self,
         callback_handle: u32,
         args: Vec<reg::DuckValue>,
     ) -> Result<Vec<Vec<extension_types::Duckvalue>>> {
@@ -484,10 +483,8 @@ impl Engine2 {
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
             (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
-        let instance = self
-            .instances
-            .get_mut(&*extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
+        let instance_arc = self.instance_arc(&extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
         // Return WIT-shaped rows directly: the WasmTable bind pivots them into
@@ -504,7 +501,7 @@ impl Engine2 {
     /// component computes the whole aggregate at once. `callback_handle` resolves
     /// through the callback registry to the owning component instance.
     pub fn dispatch_aggregate(
-        &mut self,
+        &self,
         callback_handle: u32,
         rows: Vec<Vec<reg::DuckValue>>,
     ) -> Result<reg::DuckValue> {
@@ -515,10 +512,8 @@ impl Engine2 {
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
             (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
-        let instance = self
-            .instances
-            .get_mut(&*extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
+        let instance_arc = self.instance_arc(&extension)?;
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
             .into_iter()
             .map(|row| row.into_iter().map(neutral_to_wit).collect())
