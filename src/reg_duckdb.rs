@@ -425,6 +425,118 @@ unsafe fn read_col_to_colvec(
     }
 }
 
+/// In-place refill of a scratch `Colvec` from column `j` of the DataChunk.
+/// Reuses the existing inner `Vec<T>` allocation when the scratch's variant
+/// already matches `code` — the common case, because per-scalar-function
+/// `arg_codes` are fixed at registration, so once the per-thread scratch has
+/// warmed up for a specific function every subsequent chunk hits the
+/// clear+extend fast path (~zero allocation). On a variant mismatch (e.g. two
+/// different scalars alternating on the same thread), falls back to
+/// [`read_col_to_colvec`] which allocates fresh.
+///
+/// # Safety
+/// Same contract as [`read_col_to_colvec`]: `validity` (if non-null) covers
+/// at least `len` rows, and `vec` stores `code`-typed values.
+unsafe fn refill_colvec(
+    dst: &mut Colvec,
+    code: u8,
+    vec: &FlatVector,
+    validity: *const u64,
+    len: usize,
+) {
+    // Reset validity + rows for every chunk. `dst.validity` reuses its
+    // capacity via clear/extend_from_slice — no reallocation on the steady-
+    // state hot path.
+    dst.validity.clear();
+    if !validity.is_null() {
+        let nbytes = (len + 7) / 8;
+        let src = std::slice::from_raw_parts(validity as *const u8, nbytes);
+        dst.validity.extend_from_slice(src);
+    }
+    dst.rows = len as u32;
+
+    // Try to reuse the existing typed vector.
+    macro_rules! reuse_prim {
+        ($v:expr, $ty:ty) => {{
+            let src = vec.as_slice_with_len::<$ty>(len);
+            $v.clear();
+            $v.extend_from_slice(src);
+        }};
+    }
+    let reused = match (&mut dst.data, code) {
+        (ColvecColumn::Int64(v), T_I64) => {
+            reuse_prim!(v, i64);
+            true
+        }
+        (ColvecColumn::Uint64(v), T_U64) => {
+            reuse_prim!(v, u64);
+            true
+        }
+        (ColvecColumn::Float64(v), T_F64) => {
+            reuse_prim!(v, f64);
+            true
+        }
+        (ColvecColumn::Boolean(v), T_BOOL) => {
+            reuse_prim!(v, bool);
+            true
+        }
+        (ColvecColumn::Int8(v), T_I8) => {
+            reuse_prim!(v, i8);
+            true
+        }
+        (ColvecColumn::Int16(v), T_I16) => {
+            reuse_prim!(v, i16);
+            true
+        }
+        (ColvecColumn::Int32(v), T_I32) => {
+            reuse_prim!(v, i32);
+            true
+        }
+        (ColvecColumn::Uint8(v), T_U8) => {
+            reuse_prim!(v, u8);
+            true
+        }
+        (ColvecColumn::Uint16(v), T_U16) => {
+            reuse_prim!(v, u16);
+            true
+        }
+        (ColvecColumn::Uint32(v), T_U32) => {
+            reuse_prim!(v, u32);
+            true
+        }
+        (ColvecColumn::Float32(v), T_F32) => {
+            reuse_prim!(v, f32);
+            true
+        }
+        (ColvecColumn::Timestamp(v), T_TIMESTAMP) => {
+            reuse_prim!(v, i64);
+            true
+        }
+        (ColvecColumn::Date(v), T_DATE) => {
+            reuse_prim!(v, i32);
+            true
+        }
+        (ColvecColumn::Time(v), T_TIME) => {
+            reuse_prim!(v, i64);
+            true
+        }
+        (ColvecColumn::Timestamptz(v), T_TIMESTAMPTZ) => {
+            reuse_prim!(v, i64);
+            true
+        }
+        // TEXT / BLOB / COMPLEX / DECIMAL / INTERVAL / UUID and any
+        // variant-mismatch (different function on the same thread) fall
+        // through to allocate fresh via read_col_to_colvec.
+        _ => false,
+    };
+    if !reused {
+        let fresh = read_col_to_colvec(code, vec, validity, len);
+        dst.data = fresh.data;
+        dst.validity = fresh.validity;
+        dst.rows = fresh.rows;
+    }
+}
+
 /// Lower a result `Colvec` from the guest back into a DuckDB flat output
 /// vector. Fixed-width arms use `slice::copy_from_slice` — a single memcpy per
 /// column when the result has no NULLs and no input row masked as NULL — so
@@ -929,6 +1041,15 @@ fn write_col_from(
 // set immediately before the (synchronous) registration call.
 thread_local! {
     static PENDING_SIGNATURE: RefCell<Option<(Vec<u8>, u8)>> = const { RefCell::new(None) };
+
+    /// Per-thread `Vec<Colvec>` scratch for scalar arg columns. Reused across
+    /// chunks so the ~16 KB `Vec<T>::to_vec()` per primitive column per chunk
+    /// becomes ~16 KB per column on the FIRST chunk (allocator arena grows)
+    /// and roughly zero on every subsequent chunk (clear+extend into the same
+    /// allocation). Per-function `arg_codes` are fixed at registration, so
+    /// once a specific function has warmed up the scratch every following
+    /// chunk hits `refill_colvec`'s reuse fast path.
+    static SCALAR_ARGS_SCRATCH: RefCell<Vec<Colvec>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One `VScalar` impl serving every component scalar. The argument / return
@@ -959,7 +1080,8 @@ impl VScalar for WasmScalar {
             // Marshal the whole chunk column-natively, then cross into the
             // component once. Each input column becomes ONE `Colvec` — for the
             // primitive arms (I64/F64/BOOL/temporal/...) that's a single
-            // `.to_vec()` (memcpy) off the DuckDB slice. No row-major
+            // clear+extend into the per-thread SCALAR_ARGS_SCRATCH slot,
+            // reusing the previous chunk's allocation. No row-major
             // `Vec<Vec<WitVal>>` scratch is materialised, and the runtime
             // hands the colvecs straight to `call-scalar-batch-col` without
             // its own `rows_to_colvecs` pivot.
@@ -971,37 +1093,56 @@ impl VScalar for WasmScalar {
             // placeholder it was fed. `None` until a NULL-bearing column is seen, so
             // the all-valid common case allocates nothing and skips the scan.
             let mut null_mask: Option<Vec<bool>> = None;
-            let mut args: Vec<Colvec> = Vec::with_capacity(arity);
-            for (j, &code) in state.arg_codes.iter().enumerate() {
-                // Fetch the column's validity mask once (null when no NULLs).
-                let validity = unsafe {
-                    let v = ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
-                    ffi::duckdb_vector_get_validity(v) as *const u64
-                };
-                args.push(unsafe { read_col_to_colvec(code, &cols[j], validity, len) });
-                if !validity.is_null()
-                    && unsafe { validity_has_any_null(validity, len) }
-                {
-                    // Only pay for the Vec<bool> allocation + per-bit scan when
-                    // the column ACTUALLY contains a NULL. A common pattern is a
-                    // column that COULD hold NULLs (so DuckDB gives it a
-                    // validity mask) but the rows in the chunk are all-valid;
-                    // the bulk word scan above catches that in a handful of
-                    // u64 reads.
-                    let nm = null_mask.get_or_insert_with(|| vec![false; len]);
-                    for (i, slot) in nm.iter_mut().enumerate() {
-                        if unsafe { !row_valid(validity, i) } {
-                            *slot = true;
+            let result = SCALAR_ARGS_SCRATCH.with(
+                |cell| -> Result<Colvec, Box<dyn std::error::Error>> {
+                    let mut args = cell.borrow_mut();
+                    // Ensure the scratch has exactly `arity` slots. Grow with
+                    // placeholder Int64 Colvecs on first use; shrink to arity
+                    // if a wider scalar previously ran on this thread.
+                    if args.len() < arity {
+                        args.resize_with(arity, || Colvec {
+                            data: ColvecColumn::Int64(Vec::new()),
+                            validity: Vec::new(),
+                            rows: 0,
+                        });
+                    } else if args.len() > arity {
+                        args.truncate(arity);
+                    }
+                    for (j, &code) in state.arg_codes.iter().enumerate() {
+                        // Fetch the column's validity mask once (null when no NULLs).
+                        let validity = unsafe {
+                            let v =
+                                ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
+                            ffi::duckdb_vector_get_validity(v) as *const u64
+                        };
+                        unsafe {
+                            refill_colvec(&mut args[j], code, &cols[j], validity, len);
+                        }
+                        if !validity.is_null()
+                            && unsafe { validity_has_any_null(validity, len) }
+                        {
+                            // Only pay for the Vec<bool> allocation + per-bit scan when
+                            // the column ACTUALLY contains a NULL. A common pattern is
+                            // a column that COULD hold NULLs (so DuckDB gives it a
+                            // validity mask) but the rows in the chunk are all-valid;
+                            // the bulk word scan above catches that in a handful of
+                            // u64 reads.
+                            let nm = null_mask.get_or_insert_with(|| vec![false; len]);
+                            for (i, slot) in nm.iter_mut().enumerate() {
+                                if unsafe { !row_valid(validity, i) } {
+                                    *slot = true;
+                                }
+                            }
                         }
                     }
-                }
-            }
-            let result = {
-                let engine = &state.engine;
-                engine
-                    .dispatch_scalar_batch_col(state.callback_handle, 0, &args)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
-            };
+                    let engine = &state.engine;
+                    engine
+                        .dispatch_scalar_batch_col(state.callback_handle, 0, &args)
+                        .map_err(|e| -> Box<dyn std::error::Error> {
+                            e.to_string().into()
+                        })
+                },
+            )?;
 
             // Write the whole result column at once. The primitive arms of
             // `write_colvec` take a `slice::copy_from_slice` fast-path (one
