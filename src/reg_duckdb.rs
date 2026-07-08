@@ -1808,7 +1808,7 @@ pub fn register_load_function(
     con.register_table_function::<WasmFunctions>("ducklink_functions")?;
     con.register_table_function::<WasmCapabilities>("ducklink_capabilities")?;
     con.register_table_function::<WasmCache>("ducklink_cache")?;
-    con.register_table_function::<WasmVersions>("ducklink_versions")?;
+    con.register_table_function::<WasmExtensionCompatibility>("ducklink_extension_compatibility")?;
     con.register_table_function::<WasmEvents>("ducklink_events")?;
 
     // Create the public `ducklink` SCHEMA of system VIEWS over the internal TFs.
@@ -1842,7 +1842,7 @@ fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
          CREATE OR REPLACE VIEW ducklink.functions AS SELECT * FROM ducklink_functions();
          CREATE OR REPLACE VIEW ducklink.capabilities AS SELECT * FROM ducklink_capabilities();
          CREATE OR REPLACE VIEW ducklink.cache AS SELECT * FROM ducklink_cache();
-         CREATE OR REPLACE VIEW ducklink.versions AS SELECT * FROM ducklink_versions();
+         CREATE OR REPLACE VIEW ducklink.extension_compatibility AS SELECT * FROM ducklink_extension_compatibility();
          CREATE OR REPLACE VIEW ducklink.events AS SELECT * FROM ducklink_events();",
     )
 }
@@ -2856,33 +2856,43 @@ impl VTab for WasmEvents {
     }
 }
 
-// --- ducklink_versions() ----------------------------------------------------
+// --- ducklink_extension_compatibility() -------------------------------------
 
-/// One (module, generation) row for `ducklink_versions()`.
-struct VersionRow {
+/// One (module, generation) row for `ducklink_extension_compatibility()`.
+struct ExtensionCompatibilityRow {
     module: String,
-    /// The provider abi/version string (e.g. `duckdb:extension@2.2.0`, or the
-    /// entry `wit_contract_version` for a provider-less entry).
+    /// The module's WIT contract version, always as `duckdb:extension@X.Y.Z`.
     generation: String,
-    /// Lifecycle status from `providers[].status`, else `unknown`.
-    status: String,
-    /// Whether THIS host can run this module. Per the STRICT same-major model, a
-    /// host runs ONLY modules whose own generation (`wit_contract_version`)
-    /// equals the host generation.
+    /// The HOST's WIT contract version in the same format, so the direct visual
+    /// comparison with `generation` shows why `runnable` is what it is.
+    /// Constant per row (the host doesn't change mid-session); repeated so a
+    /// user glancing at any row sees the pair without a separate lookup.
+    host_generation: String,
+    /// Catalog author's lifecycle claim from `providers[].status` (`supported`,
+    /// `deprecated`, …), else `unknown`. This is metadata, NOT a health/
+    /// runnability signal — `runnable` is the runtime answer.
+    lifecycle: String,
+    /// Whether THIS host can load this module. Per the STRICT same-major model,
+    /// a host loads ONLY modules whose OWN generation major equals the host
+    /// generation major.
     runnable: bool,
     /// Whether this provider is the one the host would select (== the entry's
     /// selected/top-level digest).
     is_default: bool,
 }
 
-/// Build the `ducklink_versions()` rows from the resolved catalog: one row per
-/// (module, generation). Entries that carry a `providers[]` array emit one row
-/// per WASM provider (generation from `providers[].abi`); entries without
-/// providers emit a single synthetic row for their top-level default artifact
-/// (generation from `wit_contract_version`). `runnable` and `is_default` are
-/// decided against the host generation `host_major`.
-fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
+/// Build the `ducklink_extension_compatibility()` rows from the resolved
+/// catalog: one row per (module, generation). Entries that carry a
+/// `providers[]` array emit one row per WASM provider (generation from
+/// `providers[].abi`); entries without providers emit a single synthetic row
+/// for their top-level default artifact (generation from `wit_contract_version`).
+/// `runnable` and `is_default` are decided against the host generation
+/// `host_major`; the `host_generation` label is derived from
+/// `ducklink_runtime::CONTRACT_VERSION`.
+fn build_extension_compatibility_rows(host_major: u64) -> Vec<ExtensionCompatibilityRow> {
     let catalog = crate::catalog::resolve_catalog();
+    let host_generation =
+        normalize_generation(Some(ducklink_runtime::CONTRACT_VERSION.to_string()));
     let mut rows = Vec::new();
     for e in &catalog.extensions {
         let selected_digest = e
@@ -2899,10 +2909,11 @@ fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
             // No per-generation providers: one synthetic row for the default
             // artifact, labelled with the entry's contract version if known.
             let generation = normalize_generation(e.wit_contract_version.clone());
-            rows.push(VersionRow {
+            rows.push(ExtensionCompatibilityRow {
                 module: e.name.clone(),
                 generation,
-                status: "unknown".to_string(),
+                host_generation: host_generation.clone(),
+                lifecycle: "unknown".to_string(),
                 runnable: entry_runnable,
                 is_default: true,
             });
@@ -2911,10 +2922,11 @@ fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
                 let generation = normalize_generation(p.abi.clone());
                 let is_default = p.content_digest.is_some()
                     && p.content_digest == selected_digest;
-                rows.push(VersionRow {
+                rows.push(ExtensionCompatibilityRow {
                     module: e.name.clone(),
                     generation,
-                    status: p.status.clone().unwrap_or_else(|| "unknown".to_string()),
+                    host_generation: host_generation.clone(),
+                    lifecycle: p.status.clone().unwrap_or_else(|| "unknown".to_string()),
                     runnable: entry_runnable,
                     is_default,
                 });
@@ -2951,30 +2963,32 @@ fn normalize_generation(raw: Option<String>) -> String {
     }
 }
 
-struct WasmVersionsBind {
-    rows: Vec<VersionRow>,
+struct WasmExtensionCompatibilityBind {
+    rows: Vec<ExtensionCompatibilityRow>,
 }
 
-/// `ducklink_versions()` — one row per (module, generation), reflecting the
-/// per-generation providers in the resolved catalog and whether THIS host can
-/// run each generation.
-struct WasmVersions;
+/// `ducklink_extension_compatibility()` — one row per (module, generation),
+/// reflecting the per-generation providers in the resolved catalog and whether
+/// THIS host (whose own WIT generation is repeated in the `host_generation`
+/// column) can load each one.
+struct WasmExtensionCompatibility;
 
-impl VTab for WasmVersions {
+impl VTab for WasmExtensionCompatibility {
     type InitData = WasmTableInit;
-    type BindData = WasmVersionsBind;
+    type BindData = WasmExtensionCompatibilityBind;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        guard("ducklink_versions bind", || {
+        guard("ducklink_extension_compatibility bind", || {
             let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
             let boolean = || LogicalTypeHandle::from(LogicalTypeId::Boolean);
             bind.add_result_column("module", vc());
             bind.add_result_column("generation", vc());
-            bind.add_result_column("status", vc());
+            bind.add_result_column("host_generation", vc());
+            bind.add_result_column("lifecycle", vc());
             bind.add_result_column("runnable", boolean());
             bind.add_result_column("is_default", boolean());
-            Ok(WasmVersionsBind {
-                rows: build_version_rows(host_generation_major()),
+            Ok(WasmExtensionCompatibilityBind {
+                rows: build_extension_compatibility_rows(host_generation_major()),
             })
         })
     }
@@ -2989,7 +3003,7 @@ impl VTab for WasmVersions {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        guard("ducklink_versions scan", || {
+        guard("ducklink_extension_compatibility scan", || {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
@@ -3002,12 +3016,13 @@ impl VTab for WasmVersions {
                 let row = &bind.rows[start + r];
                 output.flat_vector(0).insert(r, row.module.as_str());
                 output.flat_vector(1).insert(r, row.generation.as_str());
-                output.flat_vector(2).insert(r, row.status.as_str());
+                output.flat_vector(2).insert(r, row.host_generation.as_str());
+                output.flat_vector(3).insert(r, row.lifecycle.as_str());
             }
             unsafe {
-                let mut rv = output.flat_vector(3);
+                let mut rv = output.flat_vector(4);
                 let run = rv.as_mut_slice::<bool>();
-                let mut dv = output.flat_vector(4);
+                let mut dv = output.flat_vector(5);
                 let def = dv.as_mut_slice::<bool>();
                 for r in 0..n {
                     let row = &bind.rows[start + r];
@@ -3456,19 +3471,24 @@ mod tests {
                 .expect("capabilities rows");
             assert_eq!(n_caps, 2, "scalar + load_wasm capability rows present");
 
-            // ducklink.versions lists aba's provider row (its provider carries a
-            // stale @2.2.0 abi label). aba is a gen-4 ENTRY, so on this gen-4 host
-            // it is runnable under strict same-major, and it is the default (its
-            // gen-4 top-level digest is the resolved blob).
-            let (vgen, vrun, vdef): (String, bool, bool) = con
+            // ducklink.extension_compatibility lists aba's provider row (its
+            // provider carries a stale @2.2.0 abi label). aba is a gen-4 ENTRY,
+            // so on this gen-4 host it is runnable under strict same-major, and
+            // it is the default (its gen-4 top-level digest is the resolved blob).
+            let (vgen, vhost, vrun, vdef): (String, String, bool, bool) = con
                 .query_row(
-                    "SELECT generation, runnable, is_default FROM ducklink.versions \
+                    "SELECT generation, host_generation, runnable, is_default \
+                     FROM ducklink.extension_compatibility \
                      WHERE module='aba' AND generation LIKE '%@2.2.0'",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
-                .expect("aba provider row in ducklink.versions");
+                .expect("aba provider row in ducklink.extension_compatibility");
             assert_eq!(vgen, "duckdb:extension@2.2.0");
+            assert!(
+                vhost.starts_with("duckdb:extension@"),
+                "host_generation is normalized to duckdb:extension@X.Y.Z, got {vhost}"
+            );
             assert!(vrun, "gen-4 aba runs on a gen-4 host (strict same-major)");
             assert!(vdef, "aba's gen-4 digest is the selected default");
 
