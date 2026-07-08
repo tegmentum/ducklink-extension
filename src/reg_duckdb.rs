@@ -31,6 +31,14 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
     Complexvalue as WitComplex, Decimalvalue as WitDecimal, Duckvalue as WitVal,
     Intervalvalue as WitInterval, Uuidvalue as WitUuid,
 };
+// Columnar dispatch types for the scalar hot path. `read_col_to_colvec` builds
+// these directly from DuckDB flat vectors (per-column memcpy for primitives),
+// hands them to `dispatch_scalar_batch_col`, and `write_colvec` lowers the
+// result column back to a DuckDB flat vector — no row-major pivot anywhere.
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::column_types::{
+    Colvec, Column as ColvecColumn, Complexvalue as ColvecComplex,
+    Decimalvalue as ColvecDecimal, Intervalvalue as ColvecInterval, Uuidvalue as ColvecUuid,
+};
 
 use crate::engine::{AggregateFunc, Engine2, ScalarFunc, TableFunc};
 
@@ -226,141 +234,395 @@ unsafe fn row_valid(validity: *const u64, r: usize) -> bool {
     *validity.add(r / 64) & (1u64 << (r % 64)) != 0
 }
 
-/// Marshal an entire input column (type `code`) into argument slot `j` of every
-/// row, ready to hand straight to the component dispatcher with no further
-/// conversion. Column-major: the typed slice is derived and the type code is
-/// matched once per column (not once per cell), leaving only an index and an
-/// enum wrap per row in the hot loop.
+/// Copy a DuckDB validity bit-mask into the byte-packed form the WIT `Colvec`
+/// expects. DuckDB packs one bit per row into u64 words; `Colvec::validity` is
+/// `Vec<u8>` packed 8 rows to a byte, using the same bit ordering (bit `i & 7`
+/// of byte `i >> 3`). On little-endian hosts (x86_64 / aarch64 — the only
+/// platforms ducklink supports) the u64 word bytes ALREADY carry the bits in
+/// that order, so this is a straight `memcpy` of `(len + 7) / 8` bytes. A null
+/// `validity` pointer returns an empty `Vec<u8>` (the "no NULLs" fast-path the
+/// guest recognises).
 ///
-/// DuckDB uses default NULL handling for these scalars: it still invokes the
-/// function on rows whose inputs are NULL, then overwrites those result rows
-/// with NULL. So the component must receive a *type-valid* value for every row,
-/// including NULL ones (handing it `WitVal::Null` makes a type-checking
-/// component reject the whole batch). For numeric types the raw slot value is
-/// already type-valid (and discarded), so they read unconditionally — the
-/// fast path. For TEXT/BLOB a NULL row's `duckdb_string_t` holds no valid
-/// pointer, so reading it would dereference garbage; those rows are instead
-/// given an empty (but valid) string/blob. `validity` is the column's mask
-/// (null when the column has no NULLs) and is consulted only for TEXT/BLOB.
-fn read_col_into(
+/// # Safety
+/// `validity`, when non-null, must point to a DuckDB validity mask covering
+/// at least `len` rows.
+unsafe fn duckdb_validity_to_colvec_bytes(validity: *const u64, len: usize) -> Vec<u8> {
+    if validity.is_null() {
+        return Vec::new();
+    }
+    let nbytes = (len + 7) / 8;
+    let src = std::slice::from_raw_parts(validity as *const u8, nbytes);
+    src.to_vec()
+}
+
+/// Read column `j` of the DataChunk directly into a WIT `Colvec` — the columnar
+/// arg the guest's `call-scalar-batch-col` consumes. Fixed-width arms are one
+/// `.to_vec()` off the DuckDB slice (a single per-column memcpy, no per-cell
+/// enum wrap); TEXT/BLOB/COMPLEX walk row-by-row because they own their
+/// storage. Contrast with [`read_col_into`], which materialises a row-major
+/// `Vec<Vec<WitVal>>` scratch and forces the runtime to re-pivot at the
+/// wasmtime boundary.
+///
+/// # Safety
+/// `validity`, when non-null, must point to a DuckDB validity mask covering
+/// at least `len` rows. `vec` must be a DuckDB flat vector storing `code` type
+/// values.
+unsafe fn read_col_to_colvec(
     code: u8,
     vec: &FlatVector,
     validity: *const u64,
     len: usize,
-    rows: &mut [Vec<WitVal>],
-    j: usize,
-) {
-    macro_rules! fill {
+) -> Colvec {
+    let validity_bytes = duckdb_validity_to_colvec_bytes(validity, len);
+    let is_null = |i: usize| !validity.is_null() && !row_valid(validity, i);
+    macro_rules! prim {
         ($ty:ty, $variant:ident) => {{
-            let s = unsafe { vec.as_slice_with_len::<$ty>(len) };
-            for (i, row) in rows.iter_mut().enumerate() {
-                row[j] = WitVal::$variant(s[i]);
+            let s = vec.as_slice_with_len::<$ty>(len);
+            ColvecColumn::$variant(s.to_vec())
+        }};
+    }
+    let data = match code {
+        T_I64 => prim!(i64, Int64),
+        T_U64 => prim!(u64, Uint64),
+        T_F64 => prim!(f64, Float64),
+        T_BOOL => prim!(bool, Boolean),
+        T_I8 => prim!(i8, Int8),
+        T_I16 => prim!(i16, Int16),
+        T_I32 => prim!(i32, Int32),
+        T_U8 => prim!(u8, Uint8),
+        T_U16 => prim!(u16, Uint16),
+        T_U32 => prim!(u32, Uint32),
+        T_F32 => prim!(f32, Float32),
+        T_TIMESTAMP => prim!(i64, Timestamp),
+        T_DATE => prim!(i32, Date),
+        T_TIME => prim!(i64, Time),
+        T_TIMESTAMPTZ => prim!(i64, Timestamptz),
+        T_INTERVAL => {
+            let s = vec.as_slice_with_len::<ffi::duckdb_interval>(len);
+            let out: Vec<ColvecInterval> = s
+                .iter()
+                .map(|iv| ColvecInterval {
+                    months: iv.months,
+                    days: iv.days,
+                    micros: iv.micros,
+                })
+                .collect();
+            ColvecColumn::Interval(out)
+        }
+        T_DECIMAL => {
+            let s = vec.as_slice_with_len::<i128>(len);
+            let out: Vec<ColvecDecimal> = s
+                .iter()
+                .map(|&raw| {
+                    let u = raw as u128;
+                    ColvecDecimal {
+                        lower: u as u64,
+                        upper: (u >> 64) as u64,
+                        // The value's width/scale is not available from the flat
+                        // vector here; the registration declared DECIMAL(18, 3).
+                        width: 18,
+                        scale: 3,
+                    }
+                })
+                .collect();
+            ColvecColumn::Decimal(out)
+        }
+        T_UUID => {
+            let s = vec.as_slice_with_len::<i128>(len);
+            let out: Vec<ColvecUuid> = s
+                .iter()
+                .map(|&raw| {
+                    let logical = uuid_storage_to_logical(raw);
+                    ColvecUuid {
+                        hi: (logical >> 64) as u64,
+                        lo: logical as u64,
+                    }
+                })
+                .collect();
+            ColvecColumn::Uuid(out)
+        }
+        T_COMPLEX => {
+            let s = vec.as_slice_with_len::<duckdb_string_t>(len);
+            let out: Vec<ColvecComplex> = (0..len)
+                .map(|i| {
+                    if is_null(i) {
+                        ColvecComplex {
+                            type_expr: String::new(),
+                            json: String::new(),
+                        }
+                    } else {
+                        let mut t = s[i];
+                        ColvecComplex {
+                            type_expr: String::new(),
+                            json: DuckString::new(&mut t).as_str().into_owned(),
+                        }
+                    }
+                })
+                .collect();
+            ColvecColumn::Complex(out)
+        }
+        T_TEXT => {
+            let s = vec.as_slice_with_len::<duckdb_string_t>(len);
+            let out: Vec<String> = (0..len)
+                .map(|i| {
+                    if is_null(i) {
+                        String::new()
+                    } else {
+                        let mut t = s[i];
+                        DuckString::new(&mut t).as_str().into_owned()
+                    }
+                })
+                .collect();
+            ColvecColumn::Text(out)
+        }
+        T_BLOB => {
+            let s = vec.as_slice_with_len::<duckdb_string_t>(len);
+            let out: Vec<Vec<u8>> = (0..len)
+                .map(|i| {
+                    if is_null(i) {
+                        Vec::new()
+                    } else {
+                        let mut t = s[i];
+                        DuckString::new(&mut t).as_bytes().to_vec()
+                    }
+                })
+                .collect();
+            ColvecColumn::Blob(out)
+        }
+        _ => unreachable!("type code out of range"),
+    };
+    Colvec {
+        data,
+        validity: validity_bytes,
+        rows: len as u32,
+    }
+}
+
+/// Lower a result `Colvec` from the guest back into a DuckDB flat output
+/// vector. Fixed-width arms use `slice::copy_from_slice` — a single memcpy per
+/// column when the result has no NULLs and no input row masked as NULL — so
+/// the whole write side of the scalar dispatch is one column-major copy.
+/// TEXT/BLOB/COMPLEX still walk row-by-row (variable-length data cannot be
+/// bulk-copied into the DuckDB string arena). Any row masked by `null_mask`
+/// (an INPUT null) or by the `Colvec`'s validity mask is written as NULL.
+fn write_colvec(
+    code: u8,
+    out: &mut FlatVector,
+    colvec: Colvec,
+    null_mask: Option<&[bool]>,
+    len: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if colvec.rows as usize != len {
+        return Err(format!(
+            "component returned {} rows, expected {len}",
+            colvec.rows
+        )
+        .into());
+    }
+    let colvec_validity = colvec.validity;
+    let result_null = |i: usize| -> bool {
+        // Empty validity = all-valid (the same shortcut colvec_to_values uses).
+        !colvec_validity.is_empty()
+            && (i >> 3) < colvec_validity.len()
+            && (colvec_validity[i >> 3] >> (i & 7)) & 1 == 0
+    };
+    let input_null = |i: usize| null_mask.is_some_and(|nm| nm[i]);
+    let is_null = |i: usize| input_null(i) || result_null(i);
+    // Whether ANY row is masked NULL — lets the primitive arms take the pure
+    // memcpy path when the result and the inputs are all-valid.
+    let any_input_null = null_mask.map_or(false, |nm| nm.iter().any(|&b| b));
+    let has_null = !colvec_validity.is_empty() || any_input_null;
+    macro_rules! prim {
+        ($ty:ty, $variant:ident) => {{
+            match colvec.data {
+                ColvecColumn::$variant(src) => {
+                    if src.len() != len {
+                        return Err(format!(
+                            "component returned column of {} values, expected {len}",
+                            src.len()
+                        )
+                        .into());
+                    }
+                    let s = unsafe { out.as_mut_slice_with_len::<$ty>(len) };
+                    if !has_null {
+                        // Column-major memcpy — one call per column, per chunk.
+                        s.copy_from_slice(&src);
+                    } else {
+                        let mut nulls: Vec<usize> = Vec::new();
+                        for (i, x) in src.into_iter().enumerate() {
+                            if is_null(i) {
+                                nulls.push(i);
+                            } else {
+                                s[i] = x;
+                            }
+                        }
+                        for i in nulls {
+                            out.set_null(i);
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(format!(
+                    "component returned column {} incompatible with declared return type",
+                    describe_column(&other)
+                )
+                .into()),
             }
         }};
     }
-    // For TEXT/BLOB: true when row `i` is NULL and its string slot must not be
-    // read. Numeric columns never call this.
-    let is_null = |i: usize| !validity.is_null() && unsafe { !row_valid(validity, i) };
     match code {
-        T_I64 => fill!(i64, Int64),
-        T_U64 => fill!(u64, Uint64),
-        T_F64 => fill!(f64, Float64),
-        T_BOOL => fill!(bool, Boolean),
-        T_I8 => fill!(i8, Int8),
-        T_I16 => fill!(i16, Int16),
-        T_I32 => fill!(i32, Int32),
-        T_U8 => fill!(u8, Uint8),
-        T_U16 => fill!(u16, Uint16),
-        T_U32 => fill!(u32, Uint32),
-        T_F32 => fill!(f32, Float32),
-        // Temporal types are stored as plain integers (Date = i32 days, the rest
-        // = i64 micros), so they marshal exactly like the numeric arms above.
-        T_TIMESTAMP => fill!(i64, Timestamp),
-        T_DATE => fill!(i32, Date),
-        T_TIME => fill!(i64, Time),
-        T_TIMESTAMPTZ => fill!(i64, Timestamptz),
-        // INTERVAL is a {months: i32, days: i32, micros: i64} struct in storage
-        // (duckdb_interval). Read the three components per row.
-        T_INTERVAL => {
-            let s = unsafe { vec.as_slice_with_len::<ffi::duckdb_interval>(len) };
-            for (i, row) in rows.iter_mut().enumerate() {
-                row[j] = WitVal::Interval(WitInterval {
-                    months: s[i].months,
-                    days: s[i].days,
-                    micros: s[i].micros,
-                });
-            }
-        }
-        // DECIMAL and UUID are both HUGEINT-backed (i128) in storage. UUID's
-        // physical storage is the sign-flipped hugeint; convert to the logical
-        // big-endian hi/lo halves the WIT contract expects.
-        T_DECIMAL => {
-            let s = unsafe { vec.as_slice_with_len::<i128>(len) };
-            for (i, row) in rows.iter_mut().enumerate() {
-                let raw = s[i] as u128;
-                row[j] = WitVal::Decimal(WitDecimal {
-                    lower: raw as u64,
-                    upper: (raw >> 64) as u64,
-                    // The value's width/scale is not available from the flat
-                    // vector here; the registration declared DECIMAL(18, 3).
-                    width: 18,
-                    scale: 3,
-                });
-            }
-        }
-        T_UUID => {
-            let s = unsafe { vec.as_slice_with_len::<i128>(len) };
-            for (i, row) in rows.iter_mut().enumerate() {
-                let logical = uuid_storage_to_logical(s[i]);
-                row[j] = WitVal::Uuid(WitUuid {
-                    hi: (logical >> 64) as u64,
-                    lo: logical as u64,
-                });
-            }
-        }
-        T_COMPLEX => {
-            // No nested-vector reader: surface the VARCHAR/JSON form as a Complex
-            // value with an empty (unknown) type-expression.
-            let s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) };
-            for (i, row) in rows.iter_mut().enumerate() {
-                row[j] = if is_null(i) {
-                    WitVal::Complex(WitComplex {
-                        type_expr: String::new(),
-                        json: String::new(),
-                    })
+        T_I64 => prim!(i64, Int64),
+        T_U64 => prim!(u64, Uint64),
+        T_F64 => prim!(f64, Float64),
+        T_BOOL => prim!(bool, Boolean),
+        T_I8 => prim!(i8, Int8),
+        T_I16 => prim!(i16, Int16),
+        T_I32 => prim!(i32, Int32),
+        T_U8 => prim!(u8, Uint8),
+        T_U16 => prim!(u16, Uint16),
+        T_U32 => prim!(u32, Uint32),
+        T_F32 => prim!(f32, Float32),
+        T_TIMESTAMP => prim!(i64, Timestamp),
+        T_DATE => prim!(i32, Date),
+        T_TIME => prim!(i64, Time),
+        T_TIMESTAMPTZ => prim!(i64, Timestamptz),
+        // Variable-width and HUGEINT-backed types (TEXT/BLOB/COMPLEX/DECIMAL/
+        // INTERVAL/UUID) can't take the primitive memcpy path; lower the Colvec
+        // to Vec<WitVal> and reuse the existing per-row writer. Colder path.
+        _ => {
+            let vals = colvec_to_witvals(Colvec {
+                data: colvec.data,
+                validity: colvec_validity,
+                rows: len as u32,
+            });
+            for (i, r) in vals.iter().enumerate() {
+                if input_null(i) {
+                    out.set_null(i);
                 } else {
-                    let mut t = s[i];
-                    WitVal::Complex(WitComplex {
-                        type_expr: String::new(),
-                        json: DuckString::new(&mut t).as_str().into_owned(),
-                    })
-                };
+                    write_ret(code, out, i, len, r)?;
+                }
             }
+            Ok(())
         }
-        T_TEXT => {
-            let s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) };
-            for (i, row) in rows.iter_mut().enumerate() {
-                row[j] = if is_null(i) {
-                    WitVal::Text(String::new())
-                } else {
-                    let mut t = s[i];
-                    WitVal::Text(DuckString::new(&mut t).as_str().into_owned())
-                };
-            }
-        }
-        T_BLOB => {
-            let s = unsafe { vec.as_slice_with_len::<duckdb_string_t>(len) };
-            for (i, row) in rows.iter_mut().enumerate() {
-                row[j] = if is_null(i) {
-                    WitVal::Blob(Vec::new())
-                } else {
-                    let mut t = s[i];
-                    WitVal::Blob(DuckString::new(&mut t).as_bytes().to_vec())
-                };
-            }
-        }
-        _ => unreachable!("type code out of range"),
     }
+}
+
+/// Human-readable Column variant name, for error messages when the guest
+/// returned a column type incompatible with the declared return type.
+fn describe_column(c: &ColvecColumn) -> &'static str {
+    match c {
+        ColvecColumn::Boolean(_) => "Boolean",
+        ColvecColumn::Int64(_) => "Int64",
+        ColvecColumn::Uint64(_) => "Uint64",
+        ColvecColumn::Float64(_) => "Float64",
+        ColvecColumn::Int32(_) => "Int32",
+        ColvecColumn::Int16(_) => "Int16",
+        ColvecColumn::Int8(_) => "Int8",
+        ColvecColumn::Uint32(_) => "Uint32",
+        ColvecColumn::Uint16(_) => "Uint16",
+        ColvecColumn::Uint8(_) => "Uint8",
+        ColvecColumn::Float32(_) => "Float32",
+        ColvecColumn::Timestamp(_) => "Timestamp",
+        ColvecColumn::Time(_) => "Time",
+        ColvecColumn::Timestamptz(_) => "Timestamptz",
+        ColvecColumn::Date(_) => "Date",
+        ColvecColumn::Text(_) => "Text",
+        ColvecColumn::Blob(_) => "Blob",
+        ColvecColumn::Decimal(_) => "Decimal",
+        ColvecColumn::Interval(_) => "Interval",
+        ColvecColumn::Uuid(_) => "Uuid",
+        ColvecColumn::Complex(_) => "Complex",
+    }
+}
+
+/// Lower a Colvec whose contents are variable-width or HUGEINT-backed
+/// (TEXT/BLOB/COMPLEX/DECIMAL/INTERVAL/UUID) back to a row-major `Vec<WitVal>`.
+/// The primitive arms take the memcpy path in [`write_colvec`] and never call
+/// this — this only runs for the cold fallback where per-row lowering is
+/// unavoidable anyway.
+fn colvec_to_witvals(c: Colvec) -> Vec<WitVal> {
+    let n = c.rows as usize;
+    let is_valid = |i: usize| -> bool {
+        c.validity.is_empty()
+            || (i >> 3 >= c.validity.len())
+            || (c.validity[i >> 3] >> (i & 7)) & 1 != 0
+    };
+    let mut out = Vec::with_capacity(n);
+    macro_rules! emit {
+        ($v:expr, $ctor:expr) => {{
+            for (i, x) in $v.into_iter().enumerate() {
+                out.push(if is_valid(i) { $ctor(x) } else { WitVal::Null });
+            }
+        }};
+    }
+    match c.data {
+        ColvecColumn::Boolean(v) => emit!(v, WitVal::Boolean),
+        ColvecColumn::Int64(v) => emit!(v, WitVal::Int64),
+        ColvecColumn::Uint64(v) => emit!(v, WitVal::Uint64),
+        ColvecColumn::Float64(v) => emit!(v, WitVal::Float64),
+        ColvecColumn::Int32(v) => emit!(v, WitVal::Int32),
+        ColvecColumn::Int16(v) => emit!(v, WitVal::Int16),
+        ColvecColumn::Int8(v) => emit!(v, WitVal::Int8),
+        ColvecColumn::Uint32(v) => emit!(v, WitVal::Uint32),
+        ColvecColumn::Uint16(v) => emit!(v, WitVal::Uint16),
+        ColvecColumn::Uint8(v) => emit!(v, WitVal::Uint8),
+        ColvecColumn::Float32(v) => emit!(v, WitVal::Float32),
+        ColvecColumn::Timestamp(v) => emit!(v, WitVal::Timestamp),
+        ColvecColumn::Time(v) => emit!(v, WitVal::Time),
+        ColvecColumn::Timestamptz(v) => emit!(v, WitVal::Timestamptz),
+        ColvecColumn::Date(v) => emit!(v, WitVal::Date),
+        ColvecColumn::Text(v) => emit!(v, WitVal::Text),
+        ColvecColumn::Blob(v) => emit!(v, WitVal::Blob),
+        ColvecColumn::Decimal(v) => {
+            for (i, d) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    WitVal::Decimal(WitDecimal {
+                        lower: d.lower,
+                        upper: d.upper,
+                        width: d.width,
+                        scale: d.scale,
+                    })
+                } else {
+                    WitVal::Null
+                });
+            }
+        }
+        ColvecColumn::Interval(v) => {
+            for (i, d) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    WitVal::Interval(WitInterval {
+                        months: d.months,
+                        days: d.days,
+                        micros: d.micros,
+                    })
+                } else {
+                    WitVal::Null
+                });
+            }
+        }
+        ColvecColumn::Uuid(v) => {
+            for (i, d) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    WitVal::Uuid(WitUuid { hi: d.hi, lo: d.lo })
+                } else {
+                    WitVal::Null
+                });
+            }
+        }
+        ColvecColumn::Complex(v) => {
+            for (i, d) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    WitVal::Complex(WitComplex {
+                        type_expr: d.type_expr,
+                        json: d.json,
+                    })
+                } else {
+                    WitVal::Null
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Write a component-returned WIT value into row `i` of a flat output column.
@@ -560,13 +822,6 @@ fn write_col_from(
 // set immediately before the (synchronous) registration call.
 thread_local! {
     static PENDING_SIGNATURE: RefCell<Option<(Vec<u8>, u8)>> = const { RefCell::new(None) };
-
-    /// Per-thread reusable marshalling buffer for scalar dispatch. DuckDB calls
-    /// `invoke` once per data chunk, possibly from several threads; each thread
-    /// keeps its own `Vec<Vec<WitVal>>` whose inner row Vecs retain capacity
-    /// between chunks, so steady-state scalar evaluation allocates no per-row
-    /// marshalling memory. Borrowed only for the duration of one `invoke`.
-    static SCALAR_SCRATCH: RefCell<Vec<Vec<WitVal>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One `VScalar` impl serving every component scalar. The argument / return
@@ -594,14 +849,13 @@ impl VScalar for WasmScalar {
             // mask every cell). NULL-free columns -> null mask -> branch-free reads.
             let raw_chunk = input.get_ptr();
 
-            // Marshal the whole chunk into a reused per-thread scratch, then cross
-            // into the component once. DuckDB hands us a chunk of up to
-            // STANDARD_VECTOR_SIZE rows; dispatching each row individually pays a WIT
-            // boundary crossing per row, which dominates for cheap scalars, so we
-            // build every row's argument tuple up front and call the batched
-            // dispatcher a single time. The scratch's inner row Vecs keep their
-            // capacity across chunks, so steady-state evaluation allocates no per-row
-            // marshalling memory.
+            // Marshal the whole chunk column-natively, then cross into the
+            // component once. Each input column becomes ONE `Colvec` — for the
+            // primitive arms (I64/F64/BOOL/temporal/...) that's a single
+            // `.to_vec()` (memcpy) off the DuckDB slice. No row-major
+            // `Vec<Vec<WitVal>>` scratch is materialised, and the runtime
+            // hands the colvecs straight to `call-scalar-batch-col` without
+            // its own `rows_to_colvecs` pivot.
             let arity = state.arg_codes.len();
             // DuckDB does not propagate input NULLs to the output for these scalars
             // (it invokes the function on NULL rows and keeps the result), so the
@@ -610,59 +864,35 @@ impl VScalar for WasmScalar {
             // placeholder it was fed. `None` until a NULL-bearing column is seen, so
             // the all-valid common case allocates nothing and skips the scan.
             let mut null_mask: Option<Vec<bool>> = None;
-            let results = SCALAR_SCRATCH.with(|cell| {
-                let mut rows = cell.borrow_mut();
-                // Shape the scratch to exactly `len` rows of `arity` slots, reusing
-                // the existing inner Vecs' capacity. The slots are overwritten in
-                // full by the column fills below, so the placeholder value is never
-                // observed.
-                if rows.len() < len {
-                    rows.resize_with(len, Vec::new);
-                } else {
-                    rows.truncate(len);
-                }
-                for row in rows.iter_mut() {
-                    // Shape to `arity` slots, reusing capacity. Each slot is
-                    // overwritten in full by the column fills below (which drop the
-                    // prior value), so surviving entries need not be cleared first.
-                    row.resize(arity, WitVal::Null);
-                }
-                for (j, &code) in state.arg_codes.iter().enumerate() {
-                    // Fetch the column's validity mask once (null when no NULLs).
-                    let validity = unsafe {
-                        let v = ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
-                        ffi::duckdb_vector_get_validity(v) as *const u64
-                    };
-                    read_col_into(code, &cols[j], validity, len, &mut rows, j);
-                    if !validity.is_null() {
-                        let nm = null_mask.get_or_insert_with(|| vec![false; len]);
-                        for (i, slot) in nm.iter_mut().enumerate() {
-                            if unsafe { !row_valid(validity, i) } {
-                                *slot = true;
-                            }
+            let mut args: Vec<Colvec> = Vec::with_capacity(arity);
+            for (j, &code) in state.arg_codes.iter().enumerate() {
+                // Fetch the column's validity mask once (null when no NULLs).
+                let validity = unsafe {
+                    let v = ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
+                    ffi::duckdb_vector_get_validity(v) as *const u64
+                };
+                args.push(unsafe { read_col_to_colvec(code, &cols[j], validity, len) });
+                if !validity.is_null() {
+                    let nm = null_mask.get_or_insert_with(|| vec![false; len]);
+                    for (i, slot) in nm.iter_mut().enumerate() {
+                        if unsafe { !row_valid(validity, i) } {
+                            *slot = true;
                         }
                     }
                 }
+            }
+            let result = {
                 let mut engine = state.engine.lock().expect("engine mutex poisoned");
                 engine
-                    .dispatch_scalar_batch(state.callback_handle, 0, &rows)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
-                // `&rows` (RefMut) deref-coerces to `&Vec<Vec<WitVal>>`.
-            })?;
+                    .dispatch_scalar_batch_col(state.callback_handle, 0, &args)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
+            };
 
-            if results.len() != len {
-                return Err(format!(
-                    "scalar (callback {}) returned {} results for {} input rows",
-                    state.callback_handle,
-                    results.len(),
-                    len
-                )
-                .into());
-            }
-            // Write the whole result column at once: the fixed-width hot types
-            // derive the typed output slice and match the return type a single
-            // time per chunk (column-major), mirroring the read side.
-            write_col_from(state.ret_code, &mut out, &results, null_mask.as_deref(), len)?;
+            // Write the whole result column at once. The primitive arms of
+            // `write_colvec` take a `slice::copy_from_slice` fast-path (one
+            // memcpy per chunk) when neither the input null_mask nor the
+            // Colvec's validity mask is set.
+            write_colvec(state.ret_code, &mut out, result, null_mask.as_deref(), len)?;
             Ok(())
         })
     }
