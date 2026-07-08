@@ -486,9 +486,89 @@ fn write_colvec(
         T_DATE => prim!(i32, Date),
         T_TIME => prim!(i64, Time),
         T_TIMESTAMPTZ => prim!(i64, Timestamptz),
-        // Variable-width and HUGEINT-backed types (TEXT/BLOB/COMPLEX/DECIMAL/
-        // INTERVAL/UUID) can't take the primitive memcpy path; lower the Colvec
-        // to Vec<WitVal> and reuse the existing per-row writer. Colder path.
+        // The three variable-width return types (TEXT / BLOB / COMPLEX) walk
+        // their concrete `ColvecColumn::*` vector in place. No Colvec ->
+        // Vec<WitVal> allocation, no per-row generic `write_ret` dispatch —
+        // one match on `code`, then a straight loop of
+        // `duckdb_vector_assign_string_element_len` calls (that's what
+        // `FlatVector::insert` compiles to for &str / &[u8]).
+        T_TEXT => match colvec.data {
+            ColvecColumn::Text(src) => {
+                if src.len() != len {
+                    return Err(format!(
+                        "component returned column of {} values, expected {len}",
+                        src.len()
+                    )
+                    .into());
+                }
+                for (i, s) in src.into_iter().enumerate() {
+                    if is_null(i) {
+                        out.set_null(i);
+                    } else {
+                        out.insert(i, s.as_str());
+                    }
+                }
+                Ok(())
+            }
+            other => Err(format!(
+                "component returned column {} incompatible with declared TEXT return type",
+                describe_column(&other)
+            )
+            .into()),
+        },
+        T_BLOB => match colvec.data {
+            ColvecColumn::Blob(src) => {
+                if src.len() != len {
+                    return Err(format!(
+                        "component returned column of {} values, expected {len}",
+                        src.len()
+                    )
+                    .into());
+                }
+                for (i, b) in src.into_iter().enumerate() {
+                    if is_null(i) {
+                        out.set_null(i);
+                    } else {
+                        out.insert(i, b.as_slice());
+                    }
+                }
+                Ok(())
+            }
+            other => Err(format!(
+                "component returned column {} incompatible with declared BLOB return type",
+                describe_column(&other)
+            )
+            .into()),
+        },
+        T_COMPLEX => match colvec.data {
+            ColvecColumn::Complex(src) => {
+                if src.len() != len {
+                    return Err(format!(
+                        "component returned column of {} values, expected {len}",
+                        src.len()
+                    )
+                    .into());
+                }
+                for (i, c) in src.into_iter().enumerate() {
+                    if is_null(i) {
+                        out.set_null(i);
+                    } else {
+                        out.insert(i, c.json.as_str());
+                    }
+                }
+                Ok(())
+            }
+            other => Err(format!(
+                "component returned column {} incompatible with declared COMPLEX return type",
+                describe_column(&other)
+            )
+            .into()),
+        },
+        // The remaining HUGEINT-backed fixed-width types (DECIMAL / INTERVAL /
+        // UUID) still take the fallback: they need per-value math (u128 split,
+        // struct rebuild, or the UUID sign flip), so the write is per-row
+        // anyway and a direct arm wouldn't buy the memcpy hoist. Lower the
+        // Colvec to Vec<WitVal> and let the existing per-row writer handle it.
         _ => {
             let vals = colvec_to_witvals(Colvec {
                 data: colvec.data,
