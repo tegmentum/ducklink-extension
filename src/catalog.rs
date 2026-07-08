@@ -141,7 +141,7 @@ pub struct CatalogEntry {
     pub content_digest: Option<String>,
     /// The contract-generation version string of the entry's default artifact
     /// (e.g. `"4.0.0"`), when the catalog carries it. Used to label the
-    /// synthetic `ducklink.extension_compatibility` row for entries that carry no `providers[]`.
+    /// synthetic `ducklink.module_compatibility` row for entries that carry no `providers[]`.
     #[serde(default)]
     pub wit_contract_version: Option<String>,
     /// The per-generation artifact providers. Each enriched entry MAY carry a
