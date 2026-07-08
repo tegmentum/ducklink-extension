@@ -2124,6 +2124,11 @@ struct LoadedRecord {
     /// can render exact engine signatures (name/kind/arguments/returns) for a
     /// loaded module rather than falling back to catalog names.
     funcs: Vec<LoadedFuncSig>,
+    /// Optional per-function documentation overrides the component shipped in
+    /// its `duckdb.docs` wasm custom section. Merged into `ducklink.docs` at
+    /// query time — summary / description / example REPLACE catalog values,
+    /// tags are UNIONed. `None` for components without the section.
+    docs: Option<crate::docs_section::ComponentDocs>,
 }
 
 /// A single live function signature captured from a loaded component, for the
@@ -2434,6 +2439,7 @@ pub unsafe fn load_wasm_into_db(
             aggregates: agg,
             path: path_str,
             funcs: capture_live_sigs(&loaded),
+            docs: loaded.docs.clone(),
         };
         match loaded_list.iter_mut().find(|r| r.name == name) {
             Some(existing) => *existing = rec,
@@ -2578,6 +2584,7 @@ impl VTab for WasmLoad {
                     aggregates: agg,
                     path: path_str.clone(),
                     funcs: capture_live_sigs(&loaded),
+                    docs: loaded.docs.clone(),
                 };
                 match loaded_list.iter_mut().find(|r| r.name == name) {
                     Some(existing) => *existing = rec,
@@ -3237,16 +3244,56 @@ fn render_signature(name: &str, sig: &crate::catalog::FunctionSig) -> String {
     }
 }
 
+/// Snapshot the per-module `ComponentDocs` for every loaded module carrying a
+/// `duckdb.docs` custom section. Cloned out under the runtime lock (small
+/// per-module blobs) so `build_doc_rows` can look up an override without
+/// re-taking the lock per row. Empty when no loaded module ships docs, or
+/// when the runtime isn't up.
+fn snapshot_component_docs()
+    -> std::collections::HashMap<String, crate::docs_section::ComponentDocs>
+{
+    match RUNTIME.get() {
+        Some(rt) => {
+            let list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
+            list.iter()
+                .filter_map(|r| r.docs.as_ref().map(|d| (r.name.clone(), d.clone())))
+                .collect()
+        }
+        None => std::collections::HashMap::new(),
+    }
+}
+
+/// UNION `override_tags` into `catalog_tags`, preserving order (catalog first,
+/// then component-only tags in declaration order). Case-sensitive comparison,
+/// matching how `ducklink_search` scores them.
+fn merge_tags(catalog_tags: &[String], override_tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = catalog_tags.to_vec();
+    for t in override_tags {
+        if !out.iter().any(|existing| existing == t) {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+
 /// Scan the resolved catalog and materialize one `DocRow` per (module ×
 /// function). Only functions carrying catalog enrichment produce rows —
 /// bare exports (name only, no signature/summary) are skipped so a user
 /// scanning `ducklink.docs` doesn't see a wall of placeholder rows.
+///
+/// COMPONENT-PROVIDED OVERRIDES: when the module is loaded and shipped a
+/// `duckdb.docs` custom section, its per-function summary / description /
+/// example REPLACE the catalog values field-by-field (a missing override
+/// field falls through to catalog); tags UNION with the catalog's. Non-loaded
+/// modules and loaded modules without a section render pure catalog data.
 fn build_doc_rows() -> Vec<DocRow> {
     let catalog = crate::catalog::resolve_catalog();
     let loaded = loaded_names();
+    let component_docs = snapshot_component_docs();
     let mut rows = Vec::new();
     for e in &catalog.extensions {
         let is_loaded = loaded.contains(&e.name);
+        let module_docs = component_docs.get(&e.name);
         for f in &e.functions {
             let Some(name) = f.name.as_deref() else {
                 continue;
@@ -3254,15 +3301,32 @@ fn build_doc_rows() -> Vec<DocRow> {
             if name.is_empty() {
                 continue;
             }
+            let override_entry = module_docs.and_then(|d| d.get(name));
+            let summary = override_entry
+                .and_then(|o| o.summary.clone())
+                .or_else(|| f.summary.clone())
+                .unwrap_or_default();
+            let description = override_entry
+                .and_then(|o| o.description.clone())
+                .or_else(|| f.description.clone())
+                .unwrap_or_default();
+            let example = override_entry
+                .and_then(|o| o.example.clone())
+                .or_else(|| f.example.clone())
+                .unwrap_or_default();
+            let tags = match override_entry {
+                Some(o) => merge_tags(&f.tags, &o.tags),
+                None => f.tags.clone(),
+            };
             rows.push(DocRow {
                 module: e.name.clone(),
                 function: name.to_string(),
                 kind: f.kind.clone().unwrap_or_default(),
                 signature: render_signature(name, f),
-                summary: f.summary.clone().unwrap_or_default(),
-                description: f.description.clone().unwrap_or_default(),
-                example: f.example.clone().unwrap_or_default(),
-                tags: f.tags.join(", "),
+                summary,
+                description,
+                example,
+                tags: tags.join(", "),
                 loaded: is_loaded,
             });
         }
@@ -3575,6 +3639,38 @@ fn append_function_help(out: &mut String, row: &DocRow) {
         },
         if row.loaded { " (loaded)" } else { "" }
     );
+}
+
+#[cfg(test)]
+mod doc_merge_tests {
+    use super::*;
+
+    #[test]
+    fn merge_tags_unions_without_duplicates() {
+        let cat = vec!["banking".to_string(), "validator".to_string()];
+        let over = vec!["validator".to_string(), "iso20022".to_string()];
+        assert_eq!(
+            merge_tags(&cat, &over),
+            vec![
+                "banking".to_string(),
+                "validator".to_string(),
+                "iso20022".to_string(),
+            ],
+            "catalog tags kept in order, then new component tags appended, duplicates dropped"
+        );
+    }
+
+    #[test]
+    fn merge_tags_empty_override_returns_catalog() {
+        let cat = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(merge_tags(&cat, &[]), cat);
+    }
+
+    #[test]
+    fn merge_tags_empty_catalog_returns_override() {
+        let over = vec!["x".to_string()];
+        assert_eq!(merge_tags(&[], &over), over);
+    }
 }
 
 // --- ducklink_cache() -------------------------------------------------------
