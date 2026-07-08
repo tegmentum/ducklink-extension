@@ -137,6 +137,54 @@ mod loadable {
         }
     }
 
+    /// `ducklink_help(name)` — pretty-printed markdown for a single function
+    /// or module. Reads its input per row and renders the doc rows from
+    /// `ducklink.docs` in a scalar-friendly single VARCHAR output. Used
+    /// interactively (`SELECT ducklink_help('aba_validate');`) and by tools
+    /// that render markdown (Jupyter magics, docs generators). The heavy
+    /// lifting lives in `reg_duckdb::render_help` — the scalar is a thin
+    /// FFI translator.
+    struct DucklinkHelp;
+
+    impl VScalar for DucklinkHelp {
+        type State = ();
+
+        fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn Error>> {
+            let len = input.len();
+            let mut in_col = input.flat_vector(0);
+            let out = output.flat_vector();
+            // Input is a per-row VARCHAR; read each name, render help, emit
+            // the markdown blob. The slice deref is unsafe because the DuckDB
+            // string_t handles borrow from the chunk's per-row storage.
+            let names: Vec<String> = unsafe {
+                let s = in_col
+                    .as_mut_slice_with_len::<duckdb::ffi::duckdb_string_t>(len);
+                (0..len)
+                    .map(|i| {
+                        let mut t = s[i];
+                        duckdb::types::DuckString::new(&mut t).as_str().into_owned()
+                    })
+                    .collect()
+            };
+            for (i, name) in names.iter().enumerate() {
+                let rendered = crate::reg_duckdb::render_help(name);
+                out.insert(i, rendered.as_str());
+            }
+            Ok(())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Varchar.into()],
+                LogicalTypeId::Varchar.into(),
+            )]
+        }
+    }
+
     /// Loadable-extension entry point, named `ducklink_init_c_api` as DuckDB
     /// expects. Mirrors what the `duckdb_entrypoint_c_api` macro generates, but
     /// keeps the `duckdb_database` handle DuckDB hands us so it can open BOTH a
@@ -305,6 +353,8 @@ mod loadable {
         // description is set: DuckDB blocks it for entries in the system
         // catalog (which is where loadable-extension functions land), and the
         // stable C API has no scalar-function description setter.
+        con.register_scalar_function::<DucklinkHelp>("ducklink_help")
+            .map_err(stringify)?;
         con.register_scalar_function::<DucklinkVersion>("ducklink_version")
             .map_err(stringify)?;
         let engine = Arc::new(Engine2::new().map_err(stringify)?);

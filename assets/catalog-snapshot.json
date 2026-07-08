@@ -191,13 +191,21 @@
         {
           "name": "sample_plus_one",
           "kind": "scalar",
+          "returns": "INT64",
           "arguments": [
             {
               "name": "value",
-              "type": "BIGINT"
+              "type": "INT64"
             }
           ],
-          "returns": "BIGINT"
+          "summary": "Adds 1 to the input integer.",
+          "description": "The canonical trivial scalar. Useful as a smoke test that ducklink is wired up: `LOAD ducklink; LOAD WASM 'sample_extension'; SELECT sample_plus_one(41);` should return 42.",
+          "example": "SELECT sample_plus_one(41);   -- 42",
+          "tags": [
+            "sample",
+            "demo",
+            "smoke-test"
+          ]
         },
         {
           "name": "sample_emit_sequence",
@@ -205,42 +213,42 @@
           "arguments": [
             {
               "name": "limit",
-              "type": "BIGINT"
+              "type": "INT64"
             }
           ],
           "columns": [
             {
               "name": "value",
-              "type": "BIGINT"
-            }
-          ]
-        },
-        {
-          "name": "sample_read_path",
-          "kind": "table",
-          "arguments": [
-            {
-              "name": "path",
-              "type": "VARCHAR"
+              "type": "INT64"
             }
           ],
-          "columns": [
-            {
-              "name": "path",
-              "type": "VARCHAR"
-            }
+          "summary": "Table function emitting 0..limit as a single INT64 column.",
+          "description": "Analogous to DuckDB's built-in `range()`. Included so the sample component exercises the ducklink table-dispatch path.",
+          "example": "FROM sample_emit_sequence(5);   -- 0, 1, 2, 3, 4",
+          "tags": [
+            "sample",
+            "demo",
+            "table-function"
           ]
         },
         {
           "name": "sample_sum",
           "kind": "aggregate",
+          "returns": "INT64",
           "arguments": [
             {
               "name": "value",
-              "type": "BIGINT"
+              "type": "INT64"
             }
           ],
-          "returns": "BIGINT"
+          "summary": "Aggregate: sum of INT64 input values.",
+          "description": "Included so the sample component exercises the ducklink aggregate-dispatch path. Behaves like DuckDB's built-in `sum()` for INT64 columns.",
+          "example": "SELECT sample_sum(v) FROM range(100) t(v);   -- 4950",
+          "tags": [
+            "sample",
+            "demo",
+            "aggregate"
+          ]
         }
       ]
     },
@@ -769,35 +777,65 @@
         {
           "name": "aba_validate",
           "kind": "scalar",
+          "returns": "BOOLEAN",
           "arguments": [
             {
-              "name": "value",
+              "name": "routing_number",
               "type": "VARCHAR"
             }
           ],
-          "returns": "BOOLEAN"
+          "summary": "Validate an ABA routing number by its mod-10 checksum.",
+          "description": "The ABA routing number is a 9-digit code identifying US banks. This function verifies the check-digit (positions 1..8 weighted [3,7,1,3,7,1,3,7,1], mod 10 must equal position 9). Returns `TRUE` for a valid number, `FALSE` for a malformed one, and `NULL` for `NULL` input.",
+          "example": "SELECT aba_validate('021000021');   -- true (Bank of NY)",
+          "tags": [
+            "validator",
+            "banking",
+            "aba",
+            "routing-number",
+            "us"
+          ]
         },
         {
           "name": "aba_frb_district",
           "kind": "scalar",
+          "returns": "INT64",
           "arguments": [
             {
-              "name": "value",
+              "name": "routing_number",
               "type": "VARCHAR"
             }
           ],
-          "returns": "BIGINT"
+          "summary": "Extract the Federal Reserve District number (1..12) from an ABA routing number.",
+          "description": "The leading two digits of an ABA routing number encode the Federal Reserve District: '01' = Boston, '02' = New York, etc. Returns `NULL` for an invalid routing number.",
+          "example": "SELECT aba_frb_district('021000021');   -- 2 (New York)",
+          "tags": [
+            "banking",
+            "aba",
+            "federal-reserve",
+            "routing-number",
+            "us"
+          ]
         },
         {
           "name": "aba_fed_region",
           "kind": "scalar",
+          "returns": "VARCHAR",
           "arguments": [
             {
-              "name": "value",
+              "name": "routing_number",
               "type": "VARCHAR"
             }
           ],
-          "returns": "VARCHAR"
+          "summary": "Human-readable name of the Federal Reserve District (e.g. 'New York').",
+          "description": "Shorthand for `aba_frb_district` mapped to the district name. Returns `NULL` for an invalid routing number.",
+          "example": "SELECT aba_fed_region('021000021');   -- 'New York'",
+          "tags": [
+            "banking",
+            "aba",
+            "federal-reserve",
+            "routing-number",
+            "us"
+          ]
         }
       ]
     },

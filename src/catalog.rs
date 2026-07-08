@@ -57,6 +57,24 @@ pub struct FunctionSig {
     /// `returns` for scalars/aggregates).
     #[serde(default)]
     pub columns: Vec<FunctionArg>,
+    /// One-line synopsis. Shown in `ducklink.docs.summary` and in the header of
+    /// `ducklink_help('<name>')`. Absent for unenriched entries; the docs view
+    /// renders an empty cell.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Multi-paragraph markdown body. Free-form; renders through anywhere that
+    /// speaks markdown (docs.rs-style tools, Jupyter magics, etc.).
+    #[serde(default)]
+    pub description: Option<String>,
+    /// One canonical SQL example — the shortest thing that demonstrates the
+    /// function. Rendered under `### Example` in `ducklink_help()`.
+    #[serde(default)]
+    pub example: Option<String>,
+    /// Categorization tokens (`["validator", "banking"]`). Fed to
+    /// `ducklink_search` as high-weight keywords and joined comma-separated
+    /// into `ducklink.docs.tags` for `WHERE`-clause filtering.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// One `providers[]` entry an enriched catalog entry MAY carry. The published

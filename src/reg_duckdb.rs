@@ -2305,6 +2305,8 @@ pub fn register_load_function(
     con.register_table_function::<WasmModuleCompatibility>("ducklink_module_compatibility")?;
     con.register_table_function::<WasmEvents>("ducklink_events")?;
     con.register_table_function::<WasmHost>("ducklink_host")?;
+    con.register_table_function::<WasmDocs>("ducklink_docs")?;
+    con.register_table_function::<WasmSearch>("ducklink_search")?;
 
     // Create the public `ducklink` SCHEMA of system VIEWS over the internal TFs.
     // This is the discovery API surface: `SELECT * FROM ducklink.modules`, etc.
@@ -2339,7 +2341,8 @@ fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
          CREATE OR REPLACE VIEW ducklink.cache AS SELECT * FROM ducklink_cache();
          CREATE OR REPLACE VIEW ducklink.module_compatibility AS SELECT * FROM ducklink_module_compatibility();
          CREATE OR REPLACE VIEW ducklink.events AS SELECT * FROM ducklink_events();
-         CREATE OR REPLACE VIEW ducklink.host AS SELECT * FROM ducklink_host();",
+         CREATE OR REPLACE VIEW ducklink.host AS SELECT * FROM ducklink_host();
+         CREATE OR REPLACE VIEW ducklink.docs AS SELECT * FROM ducklink_docs();",
     )
 }
 
@@ -3174,6 +3177,404 @@ impl VTab for WasmHost {
             Ok(())
         })
     }
+}
+
+// --- ducklink_docs() + ducklink_search() + ducklink_help() -----------------
+
+/// One documentation row shared by `ducklink.docs`, `ducklink_search`, and
+/// `ducklink_help`. All fields are strings so they render straight out of a
+/// SELECT; `tags` is comma-joined for `LIKE`-friendly filtering (users who
+/// want the array form can `string_split(tags, ', ')`).
+#[derive(Clone)]
+struct DocRow {
+    module: String,
+    function: String,
+    kind: String,
+    signature: String,
+    summary: String,
+    description: String,
+    example: String,
+    tags: String,
+    loaded: bool,
+}
+
+/// Render a function signature in the same shape a SQL user would write:
+/// `name(arg1 T1, arg2 T2) -> RETURNS` for scalars/aggregates, and
+/// `name(...) TABLE(col1 T1, col2 T2)` for table functions.
+fn render_signature(name: &str, sig: &crate::catalog::FunctionSig) -> String {
+    let arg_text = sig
+        .arguments
+        .iter()
+        .map(|a| match (&a.name, &a.type_name) {
+            (Some(n), Some(t)) if !n.is_empty() => format!("{n} {t}"),
+            (_, Some(t)) => t.clone(),
+            (Some(n), None) => n.clone(),
+            (None, None) => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let is_table = sig.kind.as_deref() == Some("table") || !sig.columns.is_empty();
+    if is_table {
+        let cols = sig
+            .columns
+            .iter()
+            .map(|c| match (&c.name, &c.type_name) {
+                (Some(n), Some(t)) if !n.is_empty() => format!("{n} {t}"),
+                (_, Some(t)) => t.clone(),
+                (Some(n), None) => n.clone(),
+                (None, None) => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}({arg_text}) TABLE({cols})")
+    } else {
+        let ret = sig.returns.as_deref().unwrap_or("");
+        if ret.is_empty() {
+            format!("{name}({arg_text})")
+        } else {
+            format!("{name}({arg_text}) -> {ret}")
+        }
+    }
+}
+
+/// Scan the resolved catalog and materialize one `DocRow` per (module ×
+/// function). Only functions carrying catalog enrichment produce rows —
+/// bare exports (name only, no signature/summary) are skipped so a user
+/// scanning `ducklink.docs` doesn't see a wall of placeholder rows.
+fn build_doc_rows() -> Vec<DocRow> {
+    let catalog = crate::catalog::resolve_catalog();
+    let loaded = loaded_names();
+    let mut rows = Vec::new();
+    for e in &catalog.extensions {
+        let is_loaded = loaded.contains(&e.name);
+        for f in &e.functions {
+            let Some(name) = f.name.as_deref() else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            rows.push(DocRow {
+                module: e.name.clone(),
+                function: name.to_string(),
+                kind: f.kind.clone().unwrap_or_default(),
+                signature: render_signature(name, f),
+                summary: f.summary.clone().unwrap_or_default(),
+                description: f.description.clone().unwrap_or_default(),
+                example: f.example.clone().unwrap_or_default(),
+                tags: f.tags.join(", "),
+                loaded: is_loaded,
+            });
+        }
+    }
+    rows
+}
+
+struct WasmDocsBind {
+    rows: Vec<DocRow>,
+}
+
+/// `ducklink_docs()` — the searchable documentation surface. One row per
+/// enriched function across every catalog module. Use `WHERE` clauses over
+/// `description` / `tags` for plain lookups; use `ducklink_search('query')`
+/// for ranked matches.
+struct WasmDocs;
+
+impl VTab for WasmDocs {
+    type InitData = WasmTableInit;
+    type BindData = WasmDocsBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_docs bind", || {
+            let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            let boolean = || LogicalTypeHandle::from(LogicalTypeId::Boolean);
+            bind.add_result_column("module", vc());
+            bind.add_result_column("function", vc());
+            bind.add_result_column("kind", vc());
+            bind.add_result_column("signature", vc());
+            bind.add_result_column("summary", vc());
+            bind.add_result_column("description", vc());
+            bind.add_result_column("example", vc());
+            bind.add_result_column("tags", vc());
+            bind.add_result_column("loaded", boolean());
+            Ok(WasmDocsBind {
+                rows: build_doc_rows(),
+            })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_docs scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(0).insert(r, row.module.as_str());
+                output.flat_vector(1).insert(r, row.function.as_str());
+                output.flat_vector(2).insert(r, row.kind.as_str());
+                output.flat_vector(3).insert(r, row.signature.as_str());
+                output.flat_vector(4).insert(r, row.summary.as_str());
+                output.flat_vector(5).insert(r, row.description.as_str());
+                output.flat_vector(6).insert(r, row.example.as_str());
+                output.flat_vector(7).insert(r, row.tags.as_str());
+            }
+            unsafe {
+                let mut lv = output.flat_vector(8);
+                let l = lv.as_mut_slice::<bool>();
+                for r in 0..n {
+                    l[r] = bind.rows[start + r].loaded;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
+}
+
+/// One search result row: a `DocRow` shape plus a computed relevance `score`.
+/// Scored rows are sorted DESC at bind time so the caller sees the best match
+/// first without an explicit `ORDER BY`.
+#[derive(Clone)]
+struct SearchRow {
+    module: String,
+    function: String,
+    kind: String,
+    signature: String,
+    summary: String,
+    tags: String,
+    score: i64,
+}
+
+/// Weighted keyword score for one doc row against a set of lower-cased query
+/// tokens. Matches are counted as case-insensitive substring hits; matches in
+/// the function NAME weigh most (10×), tags 5×, summary 3×, description 1×.
+/// Empty query returns 0 so the search TF's `> 0` filter drops the row.
+fn score_doc(row: &DocRow, tokens: &[String]) -> i64 {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let name_lc = row.function.to_lowercase();
+    let tags_lc = row.tags.to_lowercase();
+    let summary_lc = row.summary.to_lowercase();
+    let description_lc = row.description.to_lowercase();
+    let mut score: i64 = 0;
+    for t in tokens {
+        if name_lc.contains(t) {
+            score += 10;
+        }
+        if tags_lc.contains(t) {
+            score += 5;
+        }
+        if summary_lc.contains(t) {
+            score += 3;
+        }
+        if description_lc.contains(t) {
+            score += 1;
+        }
+    }
+    score
+}
+
+struct WasmSearchBind {
+    rows: Vec<SearchRow>,
+}
+
+/// `ducklink_search('query')` — ranked search across the catalog docs. Splits
+/// the query on whitespace (case-insensitive substring match per token) and
+/// returns rows where score > 0, sorted by score DESC then module then
+/// function so the ordering is stable across runs.
+struct WasmSearch;
+
+impl VTab for WasmSearch {
+    type InitData = WasmTableInit;
+    type BindData = WasmSearchBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_search bind", || {
+            let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            let bi = || LogicalTypeHandle::from(LogicalTypeId::Bigint);
+            bind.add_result_column("module", vc());
+            bind.add_result_column("function", vc());
+            bind.add_result_column("kind", vc());
+            bind.add_result_column("signature", vc());
+            bind.add_result_column("summary", vc());
+            bind.add_result_column("tags", vc());
+            bind.add_result_column("score", bi());
+
+            let query = bind.get_parameter(0).to_string();
+            let tokens: Vec<String> = query
+                .split_whitespace()
+                .map(|t| t.to_lowercase())
+                .collect();
+            let docs = build_doc_rows();
+            let mut scored: Vec<SearchRow> = docs
+                .into_iter()
+                .filter_map(|row| {
+                    let s = score_doc(&row, &tokens);
+                    if s <= 0 {
+                        return None;
+                    }
+                    Some(SearchRow {
+                        module: row.module,
+                        function: row.function,
+                        kind: row.kind,
+                        signature: row.signature,
+                        summary: row.summary,
+                        tags: row.tags,
+                        score: s,
+                    })
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| a.module.cmp(&b.module))
+                    .then_with(|| a.function.cmp(&b.function))
+            });
+            Ok(WasmSearchBind { rows: scored })
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(WasmTableInit {
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_search scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            let start = init.cursor.load(Ordering::Relaxed);
+            let n = bind.rows.len().saturating_sub(start).min(2048);
+            if n == 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            for r in 0..n {
+                let row = &bind.rows[start + r];
+                output.flat_vector(0).insert(r, row.module.as_str());
+                output.flat_vector(1).insert(r, row.function.as_str());
+                output.flat_vector(2).insert(r, row.kind.as_str());
+                output.flat_vector(3).insert(r, row.signature.as_str());
+                output.flat_vector(4).insert(r, row.summary.as_str());
+                output.flat_vector(5).insert(r, row.tags.as_str());
+            }
+            unsafe {
+                let mut sv = output.flat_vector(6);
+                let s = sv.as_mut_slice::<i64>();
+                for r in 0..n {
+                    s[r] = bind.rows[start + r].score;
+                }
+            }
+            init.cursor.store(start + n, Ordering::Relaxed);
+            output.set_len(n);
+            Ok(())
+        })
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // Positional arg 0: the search query.
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+}
+
+/// Build a markdown help blob for `name`. `name` may be:
+/// - a fully-qualified function name (`aba_validate`) — one match
+/// - a module name (`aba`) — every function in the module
+/// - anything else — a "not found, use ducklink_search" hint
+///
+/// Returned string is safe to emit as VARCHAR from the scalar wrapper below.
+/// Used only via `ducklink_help()`; keeps the markdown formatting out of the
+/// FFI boundary so `DucklinkHelp::invoke` stays a thin translator.
+pub(crate) fn render_help(name: &str) -> String {
+    let name_lc = name.to_lowercase();
+    let docs = build_doc_rows();
+
+    // Prefer exact function-name matches first, then module matches.
+    let fn_matches: Vec<&DocRow> = docs
+        .iter()
+        .filter(|r| r.function.to_lowercase() == name_lc)
+        .collect();
+    if !fn_matches.is_empty() {
+        let mut out = String::new();
+        for (i, row) in fn_matches.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n---\n\n");
+            }
+            append_function_help(&mut out, row);
+        }
+        return out;
+    }
+
+    let mod_matches: Vec<&DocRow> = docs
+        .iter()
+        .filter(|r| r.module.to_lowercase() == name_lc)
+        .collect();
+    if !mod_matches.is_empty() {
+        let mut out = format!("# Module: {}\n\n", mod_matches[0].module);
+        for (i, row) in mod_matches.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            append_function_help(&mut out, row);
+        }
+        return out;
+    }
+
+    format!(
+        "No documentation found for '{name}'.\n\n\
+         Try `SELECT * FROM ducklink_search('{name}');` for ranked matches, or\n\
+         `SELECT * FROM ducklink.docs WHERE module ILIKE '%{name}%'` to browse.\n"
+    )
+}
+
+/// Append the markdown section for one function to `out`.
+fn append_function_help(out: &mut String, row: &DocRow) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "## `{}`\n", row.signature);
+    if !row.summary.is_empty() {
+        let _ = writeln!(out, "{}\n", row.summary);
+    }
+    if !row.description.is_empty() {
+        let _ = writeln!(out, "{}\n", row.description);
+    }
+    if !row.example.is_empty() {
+        let _ = writeln!(out, "### Example\n\n```sql\n{}\n```\n", row.example);
+    }
+    if !row.tags.is_empty() {
+        let _ = writeln!(out, "**Tags:** {}\n", row.tags);
+    }
+    let _ = writeln!(
+        out,
+        "*Module: `{}` — {}{}*",
+        row.module,
+        if row.kind.is_empty() {
+            "function"
+        } else {
+            row.kind.as_str()
+        },
+        if row.loaded { " (loaded)" } else { "" }
+    );
 }
 
 // --- ducklink_cache() -------------------------------------------------------
