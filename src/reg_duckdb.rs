@@ -2806,9 +2806,11 @@ struct ExtensionCompatibilityRow {
     /// a host loads ONLY modules whose OWN generation major equals the host
     /// generation major.
     runnable: bool,
-    /// Whether this provider is the one the host would select (== the entry's
-    /// selected/top-level digest).
-    is_default: bool,
+    /// Whether this row is the provider `ducklink_load('<module>')` would
+    /// resolve to on THIS host — the same choice `select_provider(host_major)`
+    /// makes. Exactly one row per module is `true` (or zero, if no provider
+    /// matches).
+    selected: bool,
 }
 
 /// Build the `ducklink_extension_compatibility()` rows from the resolved
@@ -2816,7 +2818,7 @@ struct ExtensionCompatibilityRow {
 /// `providers[]` array emit one row per WASM provider (generation from
 /// `providers[].abi`); entries without providers emit a single synthetic row
 /// for their top-level default artifact (generation from `wit_contract_version`).
-/// `runnable` and `is_default` are decided against the host generation
+/// `runnable` and `selected` are decided against the host generation
 /// `host_major`; the `host_generation` label is derived from
 /// `ducklink_runtime::CONTRACT_VERSION`.
 fn build_extension_compatibility_rows(host_major: u64) -> Vec<ExtensionCompatibilityRow> {
@@ -2845,12 +2847,12 @@ fn build_extension_compatibility_rows(host_major: u64) -> Vec<ExtensionCompatibi
                 host_generation: host_generation.clone(),
                 lifecycle: "unknown".to_string(),
                 runnable: entry_runnable,
-                is_default: true,
+                selected: true,
             });
         } else {
             for p in wasm {
                 let generation = normalize_generation(p.abi.clone());
-                let is_default = p.content_digest.is_some()
+                let selected = p.content_digest.is_some()
                     && p.content_digest == selected_digest;
                 rows.push(ExtensionCompatibilityRow {
                     module: e.name.clone(),
@@ -2858,7 +2860,7 @@ fn build_extension_compatibility_rows(host_major: u64) -> Vec<ExtensionCompatibi
                     host_generation: host_generation.clone(),
                     lifecycle: p.status.clone().unwrap_or_else(|| "unknown".to_string()),
                     runnable: entry_runnable,
-                    is_default,
+                    selected,
                 });
             }
         }
@@ -2916,7 +2918,7 @@ impl VTab for WasmExtensionCompatibility {
             bind.add_result_column("host_generation", vc());
             bind.add_result_column("lifecycle", vc());
             bind.add_result_column("runnable", boolean());
-            bind.add_result_column("is_default", boolean());
+            bind.add_result_column("selected", boolean());
             Ok(WasmExtensionCompatibilityBind {
                 rows: build_extension_compatibility_rows(host_generation_major()),
             })
@@ -2952,12 +2954,12 @@ impl VTab for WasmExtensionCompatibility {
             unsafe {
                 let mut rv = output.flat_vector(4);
                 let run = rv.as_mut_slice::<bool>();
-                let mut dv = output.flat_vector(5);
-                let def = dv.as_mut_slice::<bool>();
+                let mut sv = output.flat_vector(5);
+                let sel = sv.as_mut_slice::<bool>();
                 for r in 0..n {
                     let row = &bind.rows[start + r];
                     run[r] = row.runnable;
-                    def[r] = row.is_default;
+                    sel[r] = row.selected;
                 }
             }
             init.cursor.store(start + n, Ordering::Relaxed);
@@ -3405,9 +3407,9 @@ mod tests {
             // provider carries a stale @2.2.0 abi label). aba is a gen-4 ENTRY,
             // so on this gen-4 host it is runnable under strict same-major, and
             // it is the default (its gen-4 top-level digest is the resolved blob).
-            let (vgen, vhost, vrun, vdef): (String, String, bool, bool) = con
+            let (vgen, vhost, vrun, vsel): (String, String, bool, bool) = con
                 .query_row(
-                    "SELECT generation, host_generation, runnable, is_default \
+                    "SELECT generation, host_generation, runnable, selected \
                      FROM ducklink.extension_compatibility \
                      WHERE module='aba' AND generation LIKE '%@2.2.0'",
                     [],
@@ -3420,7 +3422,7 @@ mod tests {
                 "host_generation is normalized to duckdb:extension@X.Y.Z, got {vhost}"
             );
             assert!(vrun, "gen-4 aba runs on a gen-4 host (strict same-major)");
-            assert!(vdef, "aba's gen-4 digest is the selected default");
+            assert!(vsel, "aba's gen-4 digest is the selected provider");
 
             // IDEMPOTENCY: re-loading aba must NOT hard-error.
             let again = con.query_row(
