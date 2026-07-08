@@ -2828,10 +2828,7 @@ fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
         if wasm.is_empty() {
             // No per-generation providers: one synthetic row for the default
             // artifact, labelled with the entry's contract version if known.
-            let generation = e
-                .wit_contract_version
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
+            let generation = normalize_generation(e.wit_contract_version.clone());
             rows.push(VersionRow {
                 module: e.name.clone(),
                 generation,
@@ -2841,7 +2838,7 @@ fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
             });
         } else {
             for p in wasm {
-                let generation = p.abi.clone().unwrap_or_else(|| "unknown".to_string());
+                let generation = normalize_generation(p.abi.clone());
                 let is_default = p.content_digest.is_some()
                     && p.content_digest == selected_digest;
                 rows.push(VersionRow {
@@ -2855,6 +2852,33 @@ fn build_version_rows(host_major: u64) -> Vec<VersionRow> {
         }
     }
     rows
+}
+
+/// Present every `generation` cell in the canonical WIT-package form
+/// `duckdb:extension@X.Y.Z`. The catalog is inconsistent: entries with a
+/// structured `providers[]` array carry the fully-qualified `abi` string
+/// (`duckdb:extension@4.0.0`), while entries without one fall back to
+/// `wit_contract_version` (bare `4.0.0`). Two rows semantically identical to
+/// gen-4 would otherwise render as two different strings, so users can't
+/// group / filter by generation reliably. `None` and any placeholder that
+/// looks like a sentinel (no dot, empty, "unknown") stay as `"unknown"`.
+fn normalize_generation(raw: Option<String>) -> String {
+    let Some(raw) = raw else {
+        return "unknown".to_string();
+    };
+    if raw.is_empty() || raw == "unknown" {
+        "unknown".to_string()
+    } else if raw.contains('@') {
+        // Already fully-qualified.
+        raw
+    } else if raw.contains('.') {
+        // Bare semver → prefix with the canonical WIT package name.
+        format!("duckdb:extension@{raw}")
+    } else {
+        // Not a recognizable version string; leave as-is so the caller can see
+        // whatever oddity the catalog carried.
+        raw
+    }
 }
 
 struct WasmVersionsBind {
