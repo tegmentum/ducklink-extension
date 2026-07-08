@@ -23,7 +23,8 @@ use duckdb::ffi;
 use ducklink_runtime::reg;
 
 use crate::engine::{Engine2, LoadedComponent};
-use crate::reg_duckdb::{type_code, write_ret_raw};
+use crate::reg_duckdb::{type_code, write_col_from_raw};
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Duckvalue as WitVal;
 
 /// Process-global advanced-tier state. The C++ shim's bridge callbacks (invoked
 /// from DuckDB's parser / optimizer / scan) reach the embedded engine and the
@@ -433,6 +434,7 @@ unsafe fn ducklink_ts_fill_impl(_handle: u32, cursor: u32, chunk: *mut c_void) -
     }
 
     let ncols = col_codes.len();
+    let n = rows.len();
     // Hoist the per-row column-count check out of the inner (col × row) loop —
     // shape is invariant per row, so `ncols * rows` checks is `ncols - 1`
     // extra passes when one is enough. Runs before any writes so a shape error
@@ -446,17 +448,24 @@ unsafe fn ducklink_ts_fill_impl(_handle: u32, cursor: u32, chunk: *mut c_void) -
             return false;
         }
     }
-    ffi::duckdb_data_chunk_set_size(output, rows.len() as ffi::idx_t);
+    // Pivot row-major -> column-major ONCE per chunk. Every downstream column
+    // then rides `write_col_from_raw`'s hoisted per-column write — the typed
+    // data pointer and (code, WitVal) match happen once per column instead of
+    // once per emitted cell. Cost: one Vec allocation per column at ~n * size_of::<WitVal>();
+    // saves ~n * ncols FFI derefs + pattern matches.
+    let mut columns: Vec<Vec<WitVal>> =
+        (0..ncols).map(|_| Vec::with_capacity(n)).collect();
+    for row in rows {
+        for (c, v) in row.into_iter().enumerate() {
+            columns[c].push(v);
+        }
+    }
+    ffi::duckdb_data_chunk_set_size(output, n as ffi::idx_t);
     for (col_idx, &code) in col_codes.iter().enumerate() {
         let vector = ffi::duckdb_data_chunk_get_vector(output, col_idx as ffi::idx_t);
-        for (row, row_values) in rows.iter().enumerate() {
-            // Borrow the cell instead of cloning: `write_ret_raw` takes
-            // `&reg::DuckValue`, so TEXT/BLOB/COMPLEX don't repay their heap
-            // allocation on every emitted row.
-            if let Err(err) = write_ret_raw(code, vector, row, &row_values[col_idx]) {
-                ts_set_last_error(err);
-                return false;
-            }
+        if let Err(err) = write_col_from_raw(code, vector, &columns[col_idx], n) {
+            ts_set_last_error(err);
+            return false;
         }
     }
     true

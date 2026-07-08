@@ -337,24 +337,23 @@ impl Engine2 {
         Ok(result.cursor)
     }
 
-    /// Advanced tier — pull up to `max_rows` from a streaming cursor as neutral
-    /// rows. An empty result signals EOF. Drives `call-table-next`.
+    /// Advanced tier — pull up to `max_rows` from a streaming cursor. Returns
+    /// WIT-shaped rows directly; the pushdown-scan caller pivots to columns
+    /// and writes via `write_col_from_raw`'s column-hoisted memcpy path, so a
+    /// wit-to-neutral round-trip here would just be undone at the write side.
+    /// An empty result signals EOF. Drives `call-table-next`.
     pub fn dispatch_table_next(
         &self,
         extension: &str,
         handle: u32,
         cursor: u32,
         max_rows: u32,
-    ) -> Result<Vec<Vec<reg::DuckValue>>> {
+    ) -> Result<Vec<Vec<extension_types::Duckvalue>>> {
         let instance_arc = self.instance_arc(extension)?;
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
-        let rows = instance
+        instance
             .table_next(handle, cursor, max_rows)
-            .map_err(|e| anyhow!("table-stream next failed: {e:?}"))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| row.into_iter().map(wit_to_neutral).collect())
-            .collect())
+            .map_err(|e| anyhow!("table-stream next failed: {e:?}"))
     }
 
     /// Advanced tier — close a streaming cursor. Drives `call-table-close`.

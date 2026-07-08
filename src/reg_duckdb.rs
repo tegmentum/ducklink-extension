@@ -1326,6 +1326,216 @@ pub(crate) unsafe fn write_ret_raw(
     Ok(())
 }
 
+/// Column-hoisted analog of [`write_ret_raw`] for the advanced-tier pushdown
+/// scan: derive the typed data pointer + match on the return type ONCE per
+/// column, then walk the values in-place. Compared to the previous per-cell
+/// `write_ret_raw` loop, this saves `ncols * (nrows - 1)` FFI derefs of
+/// `duckdb_vector_get_data` and the same number of `(code, val)` pattern
+/// matches. For fixed-width columns it collapses to a straight pointer write
+/// per row; the variable-width TEXT/BLOB/COMPLEX arms still iterate rows
+/// because their storage is per-element in the DuckDB string arena.
+///
+/// # Safety
+/// `vector` must be a valid `duckdb_vector` whose column type is `code` and
+/// whose capacity is at least `len`. `vals.len()` must equal `len`.
+pub(crate) unsafe fn write_col_from_raw(
+    code: u8,
+    vector: ffi::duckdb_vector,
+    vals: &[WitVal],
+    len: usize,
+) -> Result<(), String> {
+    debug_assert_eq!(vals.len(), len, "write_col_from_raw len mismatch");
+    let data = ffi::duckdb_vector_get_data(vector);
+    // Any NULL in the column upgrades the validity mask; lazy so no-NULL
+    // columns pay nothing.
+    let mut validity_hot: Option<*mut u64> = None;
+    macro_rules! ensure_validity {
+        () => {{
+            match validity_hot {
+                Some(v) => v,
+                None => {
+                    ffi::duckdb_vector_ensure_validity_writable(vector);
+                    let v = ffi::duckdb_vector_get_validity(vector);
+                    validity_hot = Some(v);
+                    v
+                }
+            }
+        }};
+    }
+    macro_rules! hoist {
+        ($ty:ty, $variant:ident) => {{
+            let s = data as *mut $ty;
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    WitVal::$variant(x) => *s.add(i) = *x,
+                    WitVal::Null => {
+                        let validity = ensure_validity!();
+                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared return type"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }};
+    }
+    match code {
+        T_I64 => hoist!(i64, Int64),
+        T_U64 => hoist!(u64, Uint64),
+        T_F64 => hoist!(f64, Float64),
+        T_BOOL => hoist!(bool, Boolean),
+        T_I8 => hoist!(i8, Int8),
+        T_I16 => hoist!(i16, Int16),
+        T_I32 => hoist!(i32, Int32),
+        T_U8 => hoist!(u8, Uint8),
+        T_U16 => hoist!(u16, Uint16),
+        T_U32 => hoist!(u32, Uint32),
+        T_F32 => hoist!(f32, Float32),
+        // Temporal types share underlying integer storage.
+        T_TIMESTAMP => hoist!(i64, Timestamp),
+        T_DATE => hoist!(i32, Date),
+        T_TIME => hoist!(i64, Time),
+        T_TIMESTAMPTZ => hoist!(i64, Timestamptz),
+        T_TEXT => {
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    WitVal::Text(s) => ffi::duckdb_vector_assign_string_element_len(
+                        vector,
+                        i as u64,
+                        s.as_ptr() as *const c_char,
+                        s.len() as u64,
+                    ),
+                    WitVal::Null => {
+                        let validity = ensure_validity!();
+                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared TEXT column"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        T_BLOB => {
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    WitVal::Blob(b) => ffi::duckdb_vector_assign_string_element_len(
+                        vector,
+                        i as u64,
+                        b.as_ptr() as *const c_char,
+                        b.len() as u64,
+                    ),
+                    WitVal::Null => {
+                        let validity = ensure_validity!();
+                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared BLOB column"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        T_COMPLEX => {
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    WitVal::Complex(c) => ffi::duckdb_vector_assign_string_element_len(
+                        vector,
+                        i as u64,
+                        c.json.as_ptr() as *const c_char,
+                        c.json.len() as u64,
+                    ),
+                    WitVal::Null => {
+                        let validity = ensure_validity!();
+                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared COMPLEX column"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        T_INTERVAL => {
+            let s = data as *mut ffi::duckdb_interval;
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    WitVal::Interval(iv) => {
+                        *s.add(i) = ffi::duckdb_interval {
+                            months: iv.months,
+                            days: iv.days,
+                            micros: iv.micros,
+                        };
+                    }
+                    WitVal::Null => {
+                        let validity = ensure_validity!();
+                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared INTERVAL column"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        T_UUID => {
+            let s = data as *mut i128;
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    WitVal::Uuid(u) => {
+                        let logical = ((u.hi as u128) << 64) | u.lo as u128;
+                        *s.add(i) = uuid_storage_to_logical(logical as i128) as i128;
+                    }
+                    WitVal::Null => {
+                        let validity = ensure_validity!();
+                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared UUID column"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        T_DECIMAL => {
+            let s = data as *mut i128;
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    WitVal::Decimal(d) => {
+                        *s.add(i) = (((d.upper as u128) << 64) | d.lower as u128) as i128;
+                    }
+                    WitVal::Null => {
+                        let validity = ensure_validity!();
+                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "component returned {other:?}, incompatible with declared DECIMAL column"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "write_col_from_raw: unsupported column type code {code}"
+        )),
+    }
+}
+
 unsafe extern "C" fn agg_state_size(_info: ffi::duckdb_function_info) -> ffi::idx_t {
     std::mem::size_of::<*mut AggState>() as ffi::idx_t
 }
