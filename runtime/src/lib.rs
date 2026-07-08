@@ -18,7 +18,7 @@
 //! through an [`extension::ExtensionServices`] sink — the one direction-specific
 //! seam.
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use wasmtime::component::Component;
 use wasmtime::Engine;
@@ -1088,6 +1088,16 @@ pub struct CallbackEntry {
     pub extension: Arc<str>,
     pub dispatcher_handle: u32,
     pub kind: CallbackKind,
+    /// Weak handle to the owning `ExtensionInstance`, populated by the
+    /// direction-specific loader via [`CallbackRegistry::link_extension_instance`]
+    /// after the instance is wrapped in `Arc<Mutex<>>`. The dispatch prologue
+    /// tries `.upgrade()` first — a lock-free path that skips the second
+    /// HashMap lookup keyed on `extension`. Left as `Weak::new()` when
+    /// unpopulated (e.g. the standalone `ducklink` host that owns its own
+    /// instance map); callers that see `None` from `.upgrade()` fall back to
+    /// their normal lookup path, so this field is a pure optimisation with a
+    /// safe default.
+    pub instance: Weak<Mutex<ExtensionInstance>>,
 }
 
 /// A cache-line-padded slot in [`CallbackRegistry::entries`]. Two threads
@@ -1144,6 +1154,11 @@ impl CallbackRegistry {
             extension: Arc::from(extension),
             dispatcher_handle,
             kind,
+            // Filled in by [`link_extension_instance`] once the owning
+            // ExtensionInstance is wrapped in Arc<Mutex<>> (the loader can't
+            // do it here because that wrap happens AFTER load_component
+            // returns, and allocations fire during load_component's setup).
+            instance: Weak::new(),
         });
         verbose_log!(
             "[extension-manager] registered {} callback handle {} for '{}' (dispatcher={dispatcher_handle})",
@@ -1223,7 +1238,38 @@ impl CallbackRegistry {
             extension: Arc::from(extension),
             dispatcher_handle,
             kind,
+            instance: Weak::new(),
         });
         handle
+    }
+
+    /// Populate the `Weak<Mutex<ExtensionInstance>>` on every callback entry
+    /// owned by `extension_name`. Called by the direction-specific loader
+    /// (`Engine2::load` in the DuckDB extension) immediately after the newly
+    /// loaded [`ExtensionInstance`] is wrapped in `Arc<Mutex<>>`, so the
+    /// dispatch prologue can subsequently upgrade the Weak in a single atomic
+    /// load — skipping the second `HashMap<extension_name, ...>` lookup and
+    /// the `Arc<str>` clone that would otherwise happen on every dispatch.
+    ///
+    /// Iterates the `entries` `Vec` once and clones the same `Weak` into
+    /// every matching slot; typical component loads register a handful of
+    /// callbacks (scalars + tables + aggregates), so the walk is cheap.
+    ///
+    /// Idempotent: safe to call repeatedly (e.g. on re-load) — every slot
+    /// gets the latest weak. Slots for unrelated extensions are left alone,
+    /// so mixed-extension loads compose cleanly.
+    pub fn link_extension_instance(
+        &mut self,
+        extension_name: &str,
+        instance: &Arc<Mutex<ExtensionInstance>>,
+    ) {
+        let weak = Arc::downgrade(instance);
+        for slot in self.entries.iter_mut() {
+            if let Some(entry) = slot.0.as_mut() {
+                if &*entry.extension == extension_name {
+                    entry.instance = weak.clone();
+                }
+            }
+        }
     }
 }

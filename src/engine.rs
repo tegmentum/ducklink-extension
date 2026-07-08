@@ -261,10 +261,22 @@ impl Engine2 {
         let parsers = instance.take_pending_parsers();
         let optimizers = instance.take_pending_optimizers();
         let filterable_tables = instance.take_pending_filterable_tables();
+        let instance_arc = Arc::new(Mutex::new(instance));
         {
             let mut map = self.instances.write().expect("instances lock poisoned");
-            map.insert(extension.to_string(), Arc::new(Mutex::new(instance)));
+            map.insert(extension.to_string(), instance_arc.clone());
         }
+        // F3-b: link the newly-wrapped instance to every callback entry that
+        // load_component allocated during this component's setup. Dispatchers
+        // then upgrade the Weak in a single atomic load — skipping the
+        // `self.instances.read() -> HashMap<String,_>::get(&extension) ->
+        // Arc::clone` path that the pre-F3-b prologue paid per invocation.
+        // Safe idempotency: relinks on re-load, leaves other extensions' entries
+        // alone.
+        self.callbacks
+            .write()
+            .expect("callback registry poisoned")
+            .link_extension_instance(extension, &instance_arc);
         Ok(LoadedComponent {
             scalars,
             tables,
@@ -391,14 +403,26 @@ impl Engine2 {
         row_index: u64,
         args: Vec<reg::DuckValue>,
     ) -> Result<reg::DuckValue> {
-        let (extension, dispatcher_handle) = {
+        let (extension, dispatcher_handle, maybe_instance) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+            (
+                Arc::clone(&entry.extension),
+                entry.dispatcher_handle,
+                entry.instance.upgrade(),
+            )
         };
-        let instance_arc = self.instance_arc(&extension)?;
+        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
+        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
+        // back to `instance_arc()` only if the Weak was never populated (e.g.
+        // via the standalone `ducklink` host) or the instance has been unloaded
+        // since. In either case dispatch is unchanged from the caller's view.
+        let instance_arc = match maybe_instance {
+            Some(arc) => arc,
+            None => self.instance_arc(&extension)?,
+        };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
@@ -423,14 +447,26 @@ impl Engine2 {
         base_row_index: u64,
         wit_rows: &Vec<Vec<extension_types::Duckvalue>>,
     ) -> Result<Vec<extension_types::Duckvalue>> {
-        let (extension, dispatcher_handle) = {
+        let (extension, dispatcher_handle, maybe_instance) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+            (
+                Arc::clone(&entry.extension),
+                entry.dispatcher_handle,
+                entry.instance.upgrade(),
+            )
         };
-        let instance_arc = self.instance_arc(&extension)?;
+        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
+        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
+        // back to `instance_arc()` only if the Weak was never populated (e.g.
+        // via the standalone `ducklink` host) or the instance has been unloaded
+        // since. In either case dispatch is unchanged from the caller's view.
+        let instance_arc = match maybe_instance {
+            Some(arc) => arc,
+            None => self.instance_arc(&extension)?,
+        };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
@@ -452,14 +488,26 @@ impl Engine2 {
         base_row_index: u64,
         args: &[extension_column_types::Colvec],
     ) -> Result<extension_column_types::Colvec> {
-        let (extension, dispatcher_handle) = {
+        let (extension, dispatcher_handle, maybe_instance) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+            (
+                Arc::clone(&entry.extension),
+                entry.dispatcher_handle,
+                entry.instance.upgrade(),
+            )
         };
-        let instance_arc = self.instance_arc(&extension)?;
+        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
+        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
+        // back to `instance_arc()` only if the Weak was never populated (e.g.
+        // via the standalone `ducklink` host) or the instance has been unloaded
+        // since. In either case dispatch is unchanged from the caller's view.
+        let instance_arc = match maybe_instance {
+            Some(arc) => arc,
+            None => self.instance_arc(&extension)?,
+        };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
@@ -478,14 +526,26 @@ impl Engine2 {
         callback_handle: u32,
         args: Vec<reg::DuckValue>,
     ) -> Result<Vec<Vec<extension_types::Duckvalue>>> {
-        let (extension, dispatcher_handle) = {
+        let (extension, dispatcher_handle, maybe_instance) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+            (
+                Arc::clone(&entry.extension),
+                entry.dispatcher_handle,
+                entry.instance.upgrade(),
+            )
         };
-        let instance_arc = self.instance_arc(&extension)?;
+        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
+        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
+        // back to `instance_arc()` only if the Weak was never populated (e.g.
+        // via the standalone `ducklink` host) or the instance has been unloaded
+        // since. In either case dispatch is unchanged from the caller's view.
+        let instance_arc = match maybe_instance {
+            Some(arc) => arc,
+            None => self.instance_arc(&extension)?,
+        };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
@@ -507,14 +567,26 @@ impl Engine2 {
         callback_handle: u32,
         rows: Vec<Vec<reg::DuckValue>>,
     ) -> Result<reg::DuckValue> {
-        let (extension, dispatcher_handle) = {
+        let (extension, dispatcher_handle, maybe_instance) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+            (
+                Arc::clone(&entry.extension),
+                entry.dispatcher_handle,
+                entry.instance.upgrade(),
+            )
         };
-        let instance_arc = self.instance_arc(&extension)?;
+        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
+        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
+        // back to `instance_arc()` only if the Weak was never populated (e.g.
+        // via the standalone `ducklink` host) or the instance has been unloaded
+        // since. In either case dispatch is unchanged from the caller's view.
+        let instance_arc = match maybe_instance {
+            Some(arc) => arc,
+            None => self.instance_arc(&extension)?,
+        };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
             .into_iter()
@@ -536,14 +608,26 @@ impl Engine2 {
         callback_handle: u32,
         args: &[extension_column_types::Colvec],
     ) -> Result<reg::DuckValue> {
-        let (extension, dispatcher_handle) = {
+        let (extension, dispatcher_handle, maybe_instance) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (Arc::clone(&entry.extension), entry.dispatcher_handle)
+            (
+                Arc::clone(&entry.extension),
+                entry.dispatcher_handle,
+                entry.instance.upgrade(),
+            )
         };
-        let instance_arc = self.instance_arc(&extension)?;
+        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
+        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
+        // back to `instance_arc()` only if the Weak was never populated (e.g.
+        // via the standalone `ducklink` host) or the instance has been unloaded
+        // since. In either case dispatch is unchanged from the caller's view.
+        let instance_arc = match maybe_instance {
+            Some(arc) => arc,
+            None => self.instance_arc(&extension)?,
+        };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let result = instance
             .dispatch_aggregate_col(dispatcher_handle, args)
