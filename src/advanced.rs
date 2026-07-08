@@ -437,18 +437,27 @@ unsafe fn ducklink_ts_fill_impl(_handle: u32, cursor: u32, chunk: *mut c_void) -
     }
 
     let ncols = col_codes.len();
+    // Hoist the per-row column-count check out of the inner (col × row) loop —
+    // shape is invariant per row, so `ncols * rows` checks is `ncols - 1`
+    // extra passes when one is enough. Runs before any writes so a shape error
+    // aborts cleanly.
+    for (row, row_values) in rows.iter().enumerate() {
+        if row_values.len() != ncols {
+            ts_set_last_error(format!(
+                "ducklink_ts_fill: row {row} has {} cols, expected {ncols}",
+                row_values.len()
+            ));
+            return false;
+        }
+    }
     ffi::duckdb_data_chunk_set_size(output, rows.len() as ffi::idx_t);
     for (col_idx, &code) in col_codes.iter().enumerate() {
         let vector = ffi::duckdb_data_chunk_get_vector(output, col_idx as ffi::idx_t);
         for (row, row_values) in rows.iter().enumerate() {
-            if row_values.len() != ncols {
-                ts_set_last_error(format!(
-                    "ducklink_ts_fill: row {row} has {} cols, expected {ncols}",
-                    row_values.len()
-                ));
-                return false;
-            }
-            if let Err(err) = write_ret_raw(code, vector, row, row_values[col_idx].clone()) {
+            // Borrow the cell instead of cloning: `write_ret_raw` takes
+            // `&reg::DuckValue`, so TEXT/BLOB/COMPLEX don't repay their heap
+            // allocation on every emitted row.
+            if let Err(err) = write_ret_raw(code, vector, row, &row_values[col_idx]) {
                 ts_set_last_error(err);
                 return false;
             }

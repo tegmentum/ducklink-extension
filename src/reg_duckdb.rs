@@ -363,64 +363,13 @@ fn read_col_into(
     }
 }
 
-/// Convert a neutral value into the WIT value `write_ret` consumes. Used only by
-/// the cold table path (one materialized result set per query); the hot scalar
-/// path skips it entirely -- `read_arg` yields `WitVal` and the dispatcher
-/// returns `WitVal`, so nothing on that path touches `reg::DuckValue`.
-fn neutral_to_wit(v: reg::DuckValue) -> WitVal {
-    match v {
-        reg::DuckValue::Null => WitVal::Null,
-        reg::DuckValue::Boolean(b) => WitVal::Boolean(b),
-        reg::DuckValue::Int64(i) => WitVal::Int64(i),
-        reg::DuckValue::Uint64(u) => WitVal::Uint64(u),
-        reg::DuckValue::Float64(f) => WitVal::Float64(f),
-        reg::DuckValue::Text(s) => WitVal::Text(s),
-        reg::DuckValue::Blob(b) => WitVal::Blob(b),
-        reg::DuckValue::Int8(i) => WitVal::Int8(i),
-        reg::DuckValue::Int16(i) => WitVal::Int16(i),
-        reg::DuckValue::Int32(i) => WitVal::Int32(i),
-        reg::DuckValue::Uint8(u) => WitVal::Uint8(u),
-        reg::DuckValue::Uint16(u) => WitVal::Uint16(u),
-        reg::DuckValue::Uint32(u) => WitVal::Uint32(u),
-        reg::DuckValue::Float32(f) => WitVal::Float32(f),
-        reg::DuckValue::Timestamp(t) => WitVal::Timestamp(t),
-        reg::DuckValue::Date(d) => WitVal::Date(d),
-        reg::DuckValue::Time(t) => WitVal::Time(t),
-        reg::DuckValue::Timestamptz(t) => WitVal::Timestamptz(t),
-        reg::DuckValue::Decimal {
-            lower,
-            upper,
-            width,
-            scale,
-        } => WitVal::Decimal(WitDecimal {
-            lower,
-            upper,
-            width,
-            scale,
-        }),
-        reg::DuckValue::Interval {
-            months,
-            days,
-            micros,
-        } => WitVal::Interval(WitInterval {
-            months,
-            days,
-            micros,
-        }),
-        reg::DuckValue::Uuid { hi, lo } => WitVal::Uuid(WitUuid { hi, lo }),
-        reg::DuckValue::Complex { type_expr, json } => {
-            WitVal::Complex(WitComplex { type_expr, json })
-        }
-    }
-}
-
 /// Write a component-returned WIT value into row `i` of a flat output column.
 fn write_ret(
     code: u8,
     vec: &mut FlatVector,
     i: usize,
     len: usize,
-    v: WitVal,
+    v: &WitVal,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match (code, v) {
         // A component may return SQL NULL for any declared return type (e.g. a
@@ -428,64 +377,64 @@ fn write_ret(
         (_, WitVal::Null) => vec.set_null(i),
         (T_I64, WitVal::Int64(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_U64, WitVal::Uint64(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<u64>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_F64, WitVal::Float64(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<f64>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_BOOL, WitVal::Boolean(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<bool>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_I8, WitVal::Int8(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i8>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_I16, WitVal::Int16(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i16>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_I32, WitVal::Int32(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i32>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_U8, WitVal::Uint8(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<u8>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_U16, WitVal::Uint16(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<u16>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_U32, WitVal::Uint32(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<u32>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_F32, WitVal::Float32(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<f32>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         // Temporal types share their underlying integer storage.
         (T_TIMESTAMP, WitVal::Timestamp(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_DATE, WitVal::Date(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i32>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_TIME, WitVal::Time(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_TIMESTAMPTZ, WitVal::Timestamptz(x)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
-            s[i] = x;
+            s[i] = *x;
         }
         (T_INTERVAL, WitVal::Interval(iv)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<ffi::duckdb_interval>(len) };
@@ -539,7 +488,7 @@ fn write_ret(
 fn write_col_from(
     code: u8,
     out: &mut FlatVector,
-    results: Vec<WitVal>,
+    results: &[WitVal],
     null_mask: Option<&[bool]>,
     len: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -562,7 +511,7 @@ fn write_col_from(
                         return Err(format!(
                             "component returned {other:?}, incompatible with declared return type"
                         )
-                        .into())
+                        .into());
                     }
                 }
             }
@@ -593,7 +542,7 @@ fn write_col_from(
         // Variable-width (TEXT/BLOB/COMPLEX) and the rarer HUGEINT-backed fixed
         // types (DECIMAL/INTERVAL/UUID) keep the per-row writer.
         _ => {
-            for (i, r) in results.into_iter().enumerate() {
+            for (i, r) in results.iter().enumerate() {
                 if is_null(i) {
                     out.set_null(i);
                 } else {
@@ -713,7 +662,7 @@ impl VScalar for WasmScalar {
             // Write the whole result column at once: the fixed-width hot types
             // derive the typed output slice and match the return type a single
             // time per chunk (column-major), mirroring the read side.
-            write_col_from(state.ret_code, &mut out, results, null_mask.as_deref(), len)?;
+            write_col_from(state.ret_code, &mut out, &results, null_mask.as_deref(), len)?;
             Ok(())
         })
     }
@@ -798,14 +747,18 @@ struct WasmTableExtra {
     col_names: Vec<String>,
 }
 
-/// Bind result: the full set of rows the component produced for this call, plus
-/// the column type codes used to write them out.
+/// Bind result: the full set of rows the component produced for this call,
+/// PIVOTED at bind time from row-major into column-major WitVal storage. Each
+/// `func` chunk then hands `write_col_from` a `&[WitVal]` slice per output
+/// column and the fixed-width types write via the hoisted memcpy path; the
+/// per-row `neutral_to_wit + clone + write_ret` of the previous shape is gone.
 struct WasmTableBind {
-    rows: Vec<Vec<reg::DuckValue>>,
+    columns: Vec<Vec<WitVal>>,
+    total_rows: usize,
     col_codes: Vec<u8>,
 }
 
-/// Init state: a cursor over `WasmTableBind::rows` across `func` chunks.
+/// Init state: a cursor over `WasmTableBind::columns` across `func` chunks.
 struct WasmTableInit {
     cursor: AtomicUsize,
 }
@@ -843,8 +796,29 @@ impl VTab for WasmTable {
                     .dispatch_table(extra.callback_handle, args)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
             };
+            // Pivot row-major -> column-major ONCE per bind. This lets `func`
+            // chunks hand `write_col_from` a `&[WitVal]` slice per column and
+            // reap the fixed-width hoist (memcpy), which the per-row-per-cell
+            // write_ret loop of the previous shape did not.
+            let total_rows = rows.len();
+            let ncols = extra.col_codes.len();
+            let mut columns: Vec<Vec<WitVal>> =
+                (0..ncols).map(|_| Vec::with_capacity(total_rows)).collect();
+            for row in rows {
+                if row.len() != ncols {
+                    return Err(format!(
+                        "table function returned {} cols, expected {ncols}",
+                        row.len()
+                    )
+                    .into());
+                }
+                for (c, v) in row.into_iter().enumerate() {
+                    columns[c].push(v);
+                }
+            }
             Ok(WasmTableBind {
-                rows,
+                columns,
+                total_rows,
                 col_codes: extra.col_codes.clone(),
             })
         })
@@ -864,17 +838,15 @@ impl VTab for WasmTable {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind.total_rows.saturating_sub(start).min(2048);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
             }
             for (c, &code) in bind.col_codes.iter().enumerate() {
                 let mut col = output.flat_vector(c);
-                for r in 0..n {
-                    let val = neutral_to_wit(bind.rows[start + r][c].clone());
-                    write_ret(code, &mut col, r, n, val)?;
-                }
+                let slice = &bind.columns[c][start..start + n];
+                write_col_from(code, &mut col, slice, None, n)?;
             }
             init.cursor.store(start + n, Ordering::Relaxed);
             output.set_len(n);
@@ -1048,12 +1020,14 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
     }
 }
 
-/// Write a neutral value into row `i` of a raw result vector (type `code`).
+/// Write a neutral value into row `i` of a raw result vector (type `code`). Takes
+/// the value by reference so the caller (advanced-tier pushdown scan) can walk
+/// its `Vec<Vec<DuckValue>>` without cloning each cell.
 pub(crate) unsafe fn write_ret_raw(
     code: u8,
     vector: ffi::duckdb_vector,
     i: usize,
-    v: reg::DuckValue,
+    v: &reg::DuckValue,
 ) -> Result<(), String> {
     if matches!(v, reg::DuckValue::Null) {
         ffi::duckdb_vector_ensure_validity_writable(vector);
@@ -1063,10 +1037,10 @@ pub(crate) unsafe fn write_ret_raw(
     }
     let data = ffi::duckdb_vector_get_data(vector);
     match (code, v) {
-        (T_I64, reg::DuckValue::Int64(x)) => *(data as *mut i64).add(i) = x,
-        (T_U64, reg::DuckValue::Uint64(x)) => *(data as *mut u64).add(i) = x,
-        (T_F64, reg::DuckValue::Float64(x)) => *(data as *mut f64).add(i) = x,
-        (T_BOOL, reg::DuckValue::Boolean(x)) => *(data as *mut bool).add(i) = x,
+        (T_I64, reg::DuckValue::Int64(x)) => *(data as *mut i64).add(i) = *x,
+        (T_U64, reg::DuckValue::Uint64(x)) => *(data as *mut u64).add(i) = *x,
+        (T_F64, reg::DuckValue::Float64(x)) => *(data as *mut f64).add(i) = *x,
+        (T_BOOL, reg::DuckValue::Boolean(x)) => *(data as *mut bool).add(i) = *x,
         (T_TEXT, reg::DuckValue::Text(s)) => {
             ffi::duckdb_vector_assign_string_element_len(
                 vector,
@@ -1083,26 +1057,26 @@ pub(crate) unsafe fn write_ret_raw(
                 b.len() as u64,
             );
         }
-        (T_I8, reg::DuckValue::Int8(x)) => *(data as *mut i8).add(i) = x,
-        (T_I16, reg::DuckValue::Int16(x)) => *(data as *mut i16).add(i) = x,
-        (T_I32, reg::DuckValue::Int32(x)) => *(data as *mut i32).add(i) = x,
-        (T_U8, reg::DuckValue::Uint8(x)) => *(data as *mut u8).add(i) = x,
-        (T_U16, reg::DuckValue::Uint16(x)) => *(data as *mut u16).add(i) = x,
-        (T_U32, reg::DuckValue::Uint32(x)) => *(data as *mut u32).add(i) = x,
-        (T_F32, reg::DuckValue::Float32(x)) => *(data as *mut f32).add(i) = x,
-        (T_TIMESTAMP, reg::DuckValue::Timestamp(x)) => *(data as *mut i64).add(i) = x,
-        (T_DATE, reg::DuckValue::Date(x)) => *(data as *mut i32).add(i) = x,
-        (T_TIME, reg::DuckValue::Time(x)) => *(data as *mut i64).add(i) = x,
-        (T_TIMESTAMPTZ, reg::DuckValue::Timestamptz(x)) => *(data as *mut i64).add(i) = x,
+        (T_I8, reg::DuckValue::Int8(x)) => *(data as *mut i8).add(i) = *x,
+        (T_I16, reg::DuckValue::Int16(x)) => *(data as *mut i16).add(i) = *x,
+        (T_I32, reg::DuckValue::Int32(x)) => *(data as *mut i32).add(i) = *x,
+        (T_U8, reg::DuckValue::Uint8(x)) => *(data as *mut u8).add(i) = *x,
+        (T_U16, reg::DuckValue::Uint16(x)) => *(data as *mut u16).add(i) = *x,
+        (T_U32, reg::DuckValue::Uint32(x)) => *(data as *mut u32).add(i) = *x,
+        (T_F32, reg::DuckValue::Float32(x)) => *(data as *mut f32).add(i) = *x,
+        (T_TIMESTAMP, reg::DuckValue::Timestamp(x)) => *(data as *mut i64).add(i) = *x,
+        (T_DATE, reg::DuckValue::Date(x)) => *(data as *mut i32).add(i) = *x,
+        (T_TIME, reg::DuckValue::Time(x)) => *(data as *mut i64).add(i) = *x,
+        (T_TIMESTAMPTZ, reg::DuckValue::Timestamptz(x)) => *(data as *mut i64).add(i) = *x,
         (T_INTERVAL, reg::DuckValue::Interval { months, days, micros }) => {
             *(data as *mut ffi::duckdb_interval).add(i) = ffi::duckdb_interval {
-                months,
-                days,
-                micros,
+                months: *months,
+                days: *days,
+                micros: *micros,
             };
         }
         (T_UUID, reg::DuckValue::Uuid { hi, lo }) => {
-            let logical = ((hi as u128) << 64) | lo as u128;
+            let logical = ((*hi as u128) << 64) | *lo as u128;
             *(data as *mut i128).add(i) = uuid_storage_to_logical(logical as i128) as i128;
         }
         (T_COMPLEX, reg::DuckValue::Complex { json, .. }) => {
@@ -1192,7 +1166,7 @@ unsafe extern "C" fn agg_finalize(
             let out = offset as usize + i;
             let write = dispatched
                 .map_err(|e| e.to_string())
-                .and_then(|v| write_ret_raw(extra.ret_code, result, out, v));
+                .and_then(|v| write_ret_raw(extra.ret_code, result, out, &v));
             if let Err(msg) = write {
                 if let Ok(c) = CString::new(msg) {
                     ffi::duckdb_aggregate_function_set_error(info, c.as_ptr());

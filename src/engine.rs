@@ -434,7 +434,7 @@ impl Engine2 {
         &mut self,
         callback_handle: u32,
         args: Vec<reg::DuckValue>,
-    ) -> Result<Vec<Vec<reg::DuckValue>>> {
+    ) -> Result<Vec<Vec<extension_types::Duckvalue>>> {
         let entry = {
             let registry = self.callbacks.lock().expect("callback registry poisoned");
             registry
@@ -447,13 +447,13 @@ impl Engine2 {
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
-        let rows = instance
+        // Return WIT-shaped rows directly: the WasmTable bind pivots them into
+        // column-major WitVal and reads via write_col_from's fixed-width hoist,
+        // so a wit_to_neutral pass here would just be undone by a neutral_to_wit
+        // pass in the caller.
+        instance
             .dispatch_table(entry.dispatcher_handle, &wit_args)
-            .map_err(|e| anyhow!("table dispatch failed: {e:?}"))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| row.into_iter().map(wit_to_neutral).collect())
-            .collect())
+            .map_err(|e| anyhow!("table dispatch failed: {e:?}"))
     }
 
     /// Invoke a component aggregate over all accumulated input `rows` (each row is
