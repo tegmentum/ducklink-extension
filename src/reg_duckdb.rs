@@ -2169,7 +2169,7 @@ struct ModuleRow {
     scalars: i32,
     tables: i32,
     aggregates: i32,
-    requires: String,
+    kinds: String,
     compatible: bool,
 }
 
@@ -2200,7 +2200,7 @@ impl VTab for WasmModules {
             bind.add_result_column("scalars", int());
             bind.add_result_column("tables", int());
             bind.add_result_column("aggregates", int());
-            bind.add_result_column("requires", vc());
+            bind.add_result_column("kinds", vc());
             bind.add_result_column("compatible", boolean());
 
             let caps = host_caps();
@@ -2231,7 +2231,7 @@ impl VTab for WasmModules {
                         scalars,
                         tables,
                         aggregates,
-                        requires: e.requires.join(", "),
+                        kinds: e.requires.join(", "),
                         compatible: module_compatible(&e.requires, &caps),
                     }
                 })
@@ -2265,7 +2265,7 @@ impl VTab for WasmModules {
                 output.flat_vector(1).insert(r, row.version.as_str());
                 output.flat_vector(2).insert(r, row.description.as_str());
                 output.flat_vector(3).insert(r, row.categories.as_str());
-                output.flat_vector(8).insert(r, row.requires.as_str());
+                output.flat_vector(8).insert(r, row.kinds.as_str());
             }
             // Fixed-width columns: fill the typed slices after the string inserts.
             unsafe {
