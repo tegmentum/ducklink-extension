@@ -128,6 +128,15 @@ harness = false
 name = "scalar_query"
 harness = false
 
+# Cross-extension parallel scalar dispatch. Two threads dispatching into
+# DIFFERENT loaded instances; the delta vs the serial baseline is bucket D's
+# per-instance mutex unlock (main's process-wide engine mutex would serialize
+# them regardless of core count). Run:
+#   cargo bench --no-default-features --bench parallel_scalar
+[[bench]]
+name = "parallel_scalar"
+harness = false
+
 [profile.release]
 lto = true
 strip = true

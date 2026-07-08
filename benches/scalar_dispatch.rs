@@ -18,6 +18,9 @@ use std::path::PathBuf;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 use ducklink::engine::Engine2;
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::column_types::{
+    Column as ColvecColumn, Colvec,
+};
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
     Complexvalue as WitComplex, Decimalvalue as WitDecimal, Duckvalue as WitVal,
     Intervalvalue as WitInterval, Uuidvalue as WitUuid,
@@ -167,6 +170,35 @@ fn bench_scalar_dispatch(c: &mut Criterion) {
                 black_box(out);
             }
         });
+    });
+
+    // Bucket C — column-native scalar batch dispatch. The DuckDB bridge now
+    // builds `Vec<Colvec>` directly (per-column memcpy) and calls this method,
+    // skipping the runtime's internal `rows_to_colvecs` pivot on the read side
+    // and its `colvec_to_values` lowering on the write side. This case supplies
+    // the args already in Colvec form (matching what the bridge does) so the
+    // gap vs `plus_one_i64_2048` above is the row-major pivot cost the old
+    // path paid on every chunk.
+    group.bench_function("plus_one_col_i64_2048", |b| {
+        b.iter_batched(
+            || {
+                // A single Int64 argument colvec of ROWS values, all-valid.
+                let data = (0..ROWS as i64).collect::<Vec<_>>();
+                vec![Colvec {
+                    data: ColvecColumn::Int64(data),
+                    validity: Vec::new(),
+                    rows: ROWS as u32,
+                }]
+            },
+            |args| {
+                let args = black_box(args);
+                let out = engine
+                    .dispatch_scalar_batch_col(handle, 0, &args)
+                    .expect("dispatch col");
+                black_box(out);
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();
