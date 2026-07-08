@@ -1090,21 +1090,32 @@ pub struct CallbackEntry {
     pub kind: CallbackKind,
 }
 
+/// A cache-line-padded slot in [`CallbackRegistry::entries`]. Two threads
+/// dispatching on DIFFERENT (but nearby) handles read `entries[a]` and
+/// `entries[b]`; without padding those Options land within the same 64-byte
+/// line on typical x86_64 / aarch64 and each read invalidates the other's
+/// cache line — a 5%+ regression measured on the `parallel_cross_ext` bench
+/// after switching to Vec-indexed storage. `align(64)` forces every slot
+/// onto its own line so cross-instance dispatch scales cleanly.
+#[repr(align(64))]
+#[derive(Default)]
+struct CallbackSlot(Option<CallbackEntry>);
+
 /// Allocates stable host-side handles and maps them to `CallbackEntry`s. The
 /// host hands a handle to DuckDB at registration; DuckDB passes it back on every
 /// invocation, and the engine routes it to the owning component.
 ///
 /// Handles are dense small ints starting at 1, monotonically increasing. The
-/// backing store is a `Vec<Option<CallbackEntry>>` indexed by handle — a
-/// direct pointer offset instead of a HashMap hash + bucket walk on every
-/// dispatch. Slot 0 is unused (handles start at 1) so the index math is a
-/// straight cast. Removed callbacks leave `None` in place; the Vec never
-/// shrinks, matching the "handles never rebind" contract loadable extensions
-/// rely on.
+/// backing store is a `Vec<CallbackSlot>` (each slot 64-byte aligned) indexed
+/// by handle — a direct pointer offset instead of a HashMap hash + bucket
+/// walk on every dispatch. Slot 0 is unused (handles start at 1) so the index
+/// math is a straight cast. Removed callbacks leave `None` in place; the Vec
+/// never shrinks, matching the "handles never rebind" contract loadable
+/// extensions rely on.
 #[derive(Default)]
 pub struct CallbackRegistry {
     next_handle: u32,
-    entries: Vec<Option<CallbackEntry>>,
+    entries: Vec<CallbackSlot>,
 }
 
 impl CallbackRegistry {
@@ -1120,7 +1131,8 @@ impl CallbackRegistry {
     fn ensure_slot(&mut self, handle: u32) {
         let idx = handle as usize;
         if self.entries.len() <= idx {
-            self.entries.resize(idx + 1, None);
+            self.entries
+                .resize_with(idx + 1, CallbackSlot::default);
         }
     }
 
@@ -1128,7 +1140,7 @@ impl CallbackRegistry {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1).max(1);
         self.ensure_slot(handle);
-        self.entries[handle as usize] = Some(CallbackEntry {
+        self.entries[handle as usize].0 = Some(CallbackEntry {
             extension: Arc::from(extension),
             dispatcher_handle,
             kind,
@@ -1145,7 +1157,7 @@ impl CallbackRegistry {
     pub fn remove(&mut self, handle: u32) {
         let idx = handle as usize;
         if let Some(slot) = self.entries.get_mut(idx) {
-            if let Some(entry) = slot.take() {
+            if let Some(entry) = slot.0.take() {
                 verbose_log!(
                     "[extension-manager] released {} callback handle {} for '{}'",
                     entry.kind.describe(),
@@ -1160,10 +1172,11 @@ impl CallbackRegistry {
         let mut removed = 0usize;
         for slot in self.entries.iter_mut() {
             let matches = slot
+                .0
                 .as_ref()
                 .is_some_and(|entry| &*entry.extension == extension);
             if matches {
-                *slot = None;
+                slot.0 = None;
                 removed += 1;
             }
         }
@@ -1178,7 +1191,7 @@ impl CallbackRegistry {
     pub fn get(&self, handle: u32) -> Option<CallbackEntry> {
         self.entries
             .get(handle as usize)
-            .and_then(|slot| slot.clone())
+            .and_then(|slot| slot.0.clone())
     }
 
     /// Borrowing handle resolution for the dispatch hot path. Unlike [`get`],
@@ -1191,7 +1204,7 @@ impl CallbackRegistry {
     pub fn resolve(&self, handle: u32) -> Option<&CallbackEntry> {
         self.entries
             .get(handle as usize)
-            .and_then(|slot| slot.as_ref())
+            .and_then(|slot| slot.0.as_ref())
     }
 
     /// Like [`allocate`] but without the per-registration `eprintln!`. Used by
@@ -1206,7 +1219,7 @@ impl CallbackRegistry {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1).max(1);
         self.ensure_slot(handle);
-        self.entries[handle as usize] = Some(CallbackEntry {
+        self.entries[handle as usize].0 = Some(CallbackEntry {
             extension: Arc::from(extension),
             dispatcher_handle,
             kind,
