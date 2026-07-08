@@ -369,16 +369,17 @@ impl Engine2 {
         row_index: u64,
         args: Vec<reg::DuckValue>,
     ) -> Result<reg::DuckValue> {
-        let entry = {
+        let (extension, dispatcher_handle) = {
             let registry = self.callbacks.lock().expect("callback registry poisoned");
-            registry
-                .get(callback_handle)
-                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
         let instance = self
             .instances
-            .get_mut(&*entry.extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+            .get_mut(&*extension)
+            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
         let ctx = extension_runtime::Invokeinfo {
@@ -386,7 +387,7 @@ impl Engine2 {
             iswindow: false,
         };
         let result = instance
-            .dispatch_scalar(entry.dispatcher_handle, &wit_args, ctx)
+            .dispatch_scalar(dispatcher_handle, &wit_args, ctx)
             .map_err(|e| anyhow!("scalar dispatch failed: {e:?}"))?;
         Ok(wit_to_neutral(result))
     }
@@ -408,22 +409,23 @@ impl Engine2 {
         // Vec<Vec<>> allocation. The canonical-ABI lowering reads `wit_rows`
         // straight into the guest; the result comes back in the WIT type too, so
         // nothing on this path rebuilds or converts the value vectors.
-        let entry = {
+        let (extension, dispatcher_handle) = {
             let registry = self.callbacks.lock().expect("callback registry poisoned");
-            registry
-                .get(callback_handle)
-                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
         let instance = self
             .instances
-            .get_mut(&*entry.extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+            .get_mut(&*extension)
+            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
             iswindow: false,
         };
         instance
-            .dispatch_scalar_batch(entry.dispatcher_handle, wit_rows, ctx)
+            .dispatch_scalar_batch(dispatcher_handle, wit_rows, ctx)
             .map_err(|e| anyhow!("scalar batch dispatch failed: {e:?}"))
     }
 
@@ -435,16 +437,17 @@ impl Engine2 {
         callback_handle: u32,
         args: Vec<reg::DuckValue>,
     ) -> Result<Vec<Vec<extension_types::Duckvalue>>> {
-        let entry = {
+        let (extension, dispatcher_handle) = {
             let registry = self.callbacks.lock().expect("callback registry poisoned");
-            registry
-                .get(callback_handle)
-                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
         let instance = self
             .instances
-            .get_mut(&*entry.extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+            .get_mut(&*extension)
+            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
         // Return WIT-shaped rows directly: the WasmTable bind pivots them into
@@ -452,7 +455,7 @@ impl Engine2 {
         // so a wit_to_neutral pass here would just be undone by a neutral_to_wit
         // pass in the caller.
         instance
-            .dispatch_table(entry.dispatcher_handle, &wit_args)
+            .dispatch_table(dispatcher_handle, &wit_args)
             .map_err(|e| anyhow!("table dispatch failed: {e:?}"))
     }
 
@@ -465,22 +468,23 @@ impl Engine2 {
         callback_handle: u32,
         rows: Vec<Vec<reg::DuckValue>>,
     ) -> Result<reg::DuckValue> {
-        let entry = {
+        let (extension, dispatcher_handle) = {
             let registry = self.callbacks.lock().expect("callback registry poisoned");
-            registry
-                .get(callback_handle)
-                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            (Arc::clone(&entry.extension), entry.dispatcher_handle)
         };
         let instance = self
             .instances
-            .get_mut(&*entry.extension)
-            .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
+            .get_mut(&*extension)
+            .ok_or_else(|| anyhow!("extension '{}' is not loaded", extension))?;
         let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
             .into_iter()
             .map(|row| row.into_iter().map(neutral_to_wit).collect())
             .collect();
         let result = instance
-            .dispatch_aggregate(entry.dispatcher_handle, &wit_rows)
+            .dispatch_aggregate(dispatcher_handle, &wit_rows)
             .map_err(|e| anyhow!("aggregate dispatch failed: {e:?}"))?;
         Ok(wit_to_neutral(result))
     }
