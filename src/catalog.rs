@@ -166,18 +166,6 @@ where
 }
 
 impl CatalogEntry {
-    /// Provenance-based source language for the `language` column. A non-empty
-    /// `crates` list is the "built from Rust crates" signal; otherwise the
-    /// module ships as a bare wasm component of unknown source language. This is
-    /// a plain catalog-derived field — NOT a compile step.
-    pub fn language(&self) -> &'static str {
-        if !self.crates.is_empty() {
-            "rust"
-        } else {
-            "wasm"
-        }
-    }
-
     /// Count of required capability kinds of each class, inferred from
     /// `requires`, for the unloaded-module `scalars`/`tables`/`aggregates`
     /// columns. Returns 0 when the class is not required. These are coarse

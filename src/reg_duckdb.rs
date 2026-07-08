@@ -2235,7 +2235,6 @@ struct ModuleRow {
     version: String,
     description: String,
     categories: String,
-    language: String,
     loaded: bool,
     scalars: i32,
     tables: i32,
@@ -2267,7 +2266,6 @@ impl VTab for WasmModules {
             bind.add_result_column("version", vc());
             bind.add_result_column("description", vc());
             bind.add_result_column("categories", vc());
-            bind.add_result_column("language", vc());
             bind.add_result_column("loaded", boolean());
             bind.add_result_column("scalars", int());
             bind.add_result_column("tables", int());
@@ -2299,7 +2297,6 @@ impl VTab for WasmModules {
                         version: e.version.clone().unwrap_or_default(),
                         description: e.description.clone().unwrap_or_default(),
                         categories: e.categories.join(", "),
-                        language: e.language().to_string(),
                         loaded: is_loaded,
                         scalars,
                         tables,
@@ -2338,20 +2335,19 @@ impl VTab for WasmModules {
                 output.flat_vector(1).insert(r, row.version.as_str());
                 output.flat_vector(2).insert(r, row.description.as_str());
                 output.flat_vector(3).insert(r, row.categories.as_str());
-                output.flat_vector(4).insert(r, row.language.as_str());
-                output.flat_vector(9).insert(r, row.requires.as_str());
+                output.flat_vector(8).insert(r, row.requires.as_str());
             }
             // Fixed-width columns: fill the typed slices after the string inserts.
             unsafe {
-                let mut lv = output.flat_vector(5);
+                let mut lv = output.flat_vector(4);
                 let l = lv.as_mut_slice::<bool>();
-                let mut sv = output.flat_vector(6);
+                let mut sv = output.flat_vector(5);
                 let s = sv.as_mut_slice::<i32>();
-                let mut tv = output.flat_vector(7);
+                let mut tv = output.flat_vector(6);
                 let t = tv.as_mut_slice::<i32>();
-                let mut av = output.flat_vector(8);
+                let mut av = output.flat_vector(7);
                 let a = av.as_mut_slice::<i32>();
-                let mut cv = output.flat_vector(10);
+                let mut cv = output.flat_vector(9);
                 let c = cv.as_mut_slice::<bool>();
                 for r in 0..n {
                     let row = &bind.rows[start + r];
@@ -2378,7 +2374,6 @@ struct FunctionRow {
     kind: String,
     arguments: String,
     returns: String,
-    language: String,
     loaded: bool,
 }
 
@@ -2405,7 +2400,6 @@ impl VTab for WasmFunctions {
             bind.add_result_column("kind", vc());
             bind.add_result_column("arguments", vc());
             bind.add_result_column("returns", vc());
-            bind.add_result_column("language", vc());
             bind.add_result_column("loaded", boolean());
 
             // Live signatures for loaded modules, keyed by module name.
@@ -2423,7 +2417,6 @@ impl VTab for WasmFunctions {
             let catalog = crate::catalog::resolve_catalog();
             let mut rows: Vec<FunctionRow> = Vec::new();
             for e in &catalog.extensions {
-                let language = e.language().to_string();
                 if let Some(funcs) = live.get(&e.name) {
                     // LOADED: exact live engine signatures.
                     for f in funcs {
@@ -2433,7 +2426,6 @@ impl VTab for WasmFunctions {
                             kind: f.kind.to_string(),
                             arguments: f.arguments.clone(),
                             returns: f.returns.clone(),
-                            language: language.clone(),
                             loaded: true,
                         });
                     }
@@ -2458,7 +2450,6 @@ impl VTab for WasmFunctions {
                             kind: f.kind.clone().unwrap_or_default(),
                             arguments: args,
                             returns: f.returns.clone().unwrap_or_default(),
-                            language: language.clone(),
                             loaded: false,
                         });
                     }
@@ -2471,7 +2462,6 @@ impl VTab for WasmFunctions {
                             kind: String::new(),
                             arguments: String::new(),
                             returns: String::new(),
-                            language: language.clone(),
                             loaded: false,
                         });
                     }
@@ -2507,10 +2497,9 @@ impl VTab for WasmFunctions {
                 output.flat_vector(2).insert(r, row.kind.as_str());
                 output.flat_vector(3).insert(r, row.arguments.as_str());
                 output.flat_vector(4).insert(r, row.returns.as_str());
-                output.flat_vector(5).insert(r, row.language.as_str());
             }
             unsafe {
-                let mut lv = output.flat_vector(6);
+                let mut lv = output.flat_vector(5);
                 let l = lv.as_mut_slice::<bool>();
                 for r in 0..n {
                     l[r] = bind.rows[start + r].loaded;
@@ -3355,16 +3344,14 @@ mod tests {
                 n_ext > 150,
                 "expected 199 catalog rows, got {n_ext}"
             );
-            // aba is one of them, its language is a plain provenance field, and it
-            // is NOT loaded yet.
-            let (lang, is_loaded): (String, bool) = con
+            // aba is one of them and is NOT loaded yet.
+            let is_loaded: bool = con
                 .query_row(
-                    "SELECT language, loaded FROM ducklink.modules WHERE name = 'aba'",
+                    "SELECT loaded FROM ducklink.modules WHERE name = 'aba'",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| r.get(0),
                 )
                 .expect("aba row in ducklink.modules");
-            assert!(!lang.is_empty(), "language should be a non-empty provenance field");
             assert!(!is_loaded, "aba must not be loaded before ducklink_load");
 
             // ducklink.functions lists aba's exported function name pre-load.
