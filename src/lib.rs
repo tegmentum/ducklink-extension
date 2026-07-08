@@ -53,7 +53,7 @@ pub mod advanced;
 mod loadable {
     use std::error::Error;
     use std::ffi::{CStr, CString};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeId};
     use duckdb::ffi;
@@ -307,7 +307,7 @@ mod loadable {
         // stable C API has no scalar-function description setter.
         con.register_scalar_function::<DucklinkVersion>("ducklink_version")
             .map_err(stringify)?;
-        let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
+        let engine = Arc::new(Engine2::new().map_err(stringify)?);
 
         // Register `ducklink_load(path)`: the in-SQL analogue of DuckDB's `LOAD`,
         // which loads a component at RUNTIME (from a SQL statement) and registers
