@@ -234,6 +234,33 @@ unsafe fn row_valid(validity: *const u64, r: usize) -> bool {
     *validity.add(r / 64) & (1u64 << (r % 64)) != 0
 }
 
+/// Bulk-scan a DuckDB validity bitmask for any zero bit within the first
+/// `len` rows. Reads whole u64 words — 64 rows at a time — so a non-null
+/// mask over an all-valid column costs `(len + 63) / 64` word compares, not
+/// `len` per-row bit tests. The last partial word masks out the excess bits
+/// beyond `len` (DuckDB does not guarantee they are 1).
+///
+/// # Safety
+/// `validity` must be non-null and point to at least `(len + 63) / 64`
+/// contiguous u64 words.
+#[inline]
+unsafe fn validity_has_any_null(validity: *const u64, len: usize) -> bool {
+    let full_words = len / 64;
+    for w in 0..full_words {
+        if *validity.add(w) != u64::MAX {
+            return true;
+        }
+    }
+    let tail_bits = len % 64;
+    if tail_bits != 0 {
+        let mask = (1u64 << tail_bits) - 1;
+        if *validity.add(full_words) & mask != mask {
+            return true;
+        }
+    }
+    false
+}
+
 /// Copy a DuckDB validity bit-mask into the byte-packed form the WIT `Colvec`
 /// expects. DuckDB packs one bit per row into u64 words; `Colvec::validity` is
 /// `Vec<u8>` packed 8 rows to a byte, using the same bit ordering (bit `i & 7`
@@ -952,7 +979,15 @@ impl VScalar for WasmScalar {
                     ffi::duckdb_vector_get_validity(v) as *const u64
                 };
                 args.push(unsafe { read_col_to_colvec(code, &cols[j], validity, len) });
-                if !validity.is_null() {
+                if !validity.is_null()
+                    && unsafe { validity_has_any_null(validity, len) }
+                {
+                    // Only pay for the Vec<bool> allocation + per-bit scan when
+                    // the column ACTUALLY contains a NULL. A common pattern is a
+                    // column that COULD hold NULLs (so DuckDB gives it a
+                    // validity mask) but the rows in the chunk are all-valid;
+                    // the bulk word scan above catches that in a handful of
+                    // u64 reads.
                     let nm = null_mask.get_or_insert_with(|| vec![false; len]);
                     for (i, slot) in nm.iter_mut().enumerate() {
                         if unsafe { !row_valid(validity, i) } {
