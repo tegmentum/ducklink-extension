@@ -117,6 +117,15 @@ harness = false
 name = "parallel_scalar"
 harness = false
 
+# `duckdb.docs` wasm custom-section overhead. Every Engine2::load calls
+# parse_docs_from_wasm on the .wasm bytes; this quantifies the per-load cost
+# of that scan for both the "no section present" (steady-state today) and
+# "section carries realistic payload" cases. Run:
+#   cargo bench --no-default-features --bench docs_section
+[[bench]]
+name = "docs_section"
+harness = false
+
 [profile.release]
 lto = true
 strip = true
