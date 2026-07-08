@@ -16,6 +16,12 @@
 
 pub mod engine;
 
+/// Read a component's optional `duckdb.docs` wasm custom section (JSON
+/// per-function docs the guest can bundle inside the component itself) and
+/// merge it into `ducklink.docs` at query time. Pure std + serde_json + a
+/// hand-rolled custom-section scanner, so no DuckDB or wasmtime dep is needed.
+pub mod docs_section;
+
 /// Process-wide runtime event log — the bounded ring buffer behind the
 /// `ducklink.events` system view. Decoupled from any runtime handle so any code
 /// path (catalog resolution, load bind, the advanced `LOAD WASM` bridge) can

@@ -147,6 +147,10 @@ pub struct LoadedComponent {
     pub optimizers: Vec<reg::OptimizerReg>,
     /// Advanced tier: streaming + FILTER-PUSHDOWN table functions.
     pub filterable_tables: Vec<reg::FilterableTableReg>,
+    /// Component-provided documentation parsed from the wasm's `duckdb.docs`
+    /// custom section, if present. Overrides catalog docs field-by-field at
+    /// query time; `None` for components that don't ship a section.
+    pub docs: Option<crate::docs_section::ComponentDocs>,
 }
 
 /// Process-wide Direction-2 engine: loads components and dispatches DuckDB
@@ -191,6 +195,12 @@ impl Engine2 {
         let component = Component::from_file(&self.engine, path)
             .map_err(anyhow::Error::from)
             .with_context(|| format!("loading component at {}", path.display()))?;
+        // Read the component's optional `duckdb.docs` custom section from
+        // the on-disk wasm. Non-fatal: an absent / malformed section returns
+        // `None` (verbose-only diagnostic). The parsed docs are cached on the
+        // returned `LoadedComponent` so the DuckDB sink can merge them into
+        // `ducklink.docs`.
+        let docs = crate::docs_section::parse_docs_from_wasm(path);
         // Grant outbound network + name lookup so network-using components (dns,
         // http, httpfs, ...) work. Best-effort, not a sandbox: a component that
         // does not use sockets is unaffected. (A future opt-in gate could mirror
@@ -262,6 +272,7 @@ impl Engine2 {
             parsers,
             optimizers,
             filterable_tables,
+            docs,
         })
     }
 
