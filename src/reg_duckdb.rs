@@ -2793,13 +2793,18 @@ impl VTab for WasmModules {
                 output.set_len(0);
                 return Ok(());
             }
+            let c0 = output.flat_vector(0);
+            let c1 = output.flat_vector(1);
+            let c2 = output.flat_vector(2);
+            let c3 = output.flat_vector(3);
+            let c8 = output.flat_vector(8);
             for r in 0..n {
                 let row = &bind.rows[start + r];
-                output.flat_vector(0).insert(r, row.name.as_str());
-                output.flat_vector(1).insert(r, row.version.as_str());
-                output.flat_vector(2).insert(r, row.description.as_str());
-                output.flat_vector(3).insert(r, row.categories.as_str());
-                output.flat_vector(8).insert(r, row.capabilities.as_str());
+                c0.insert(r, row.name.as_str());
+                c1.insert(r, row.version.as_str());
+                c2.insert(r, row.description.as_str());
+                c3.insert(r, row.categories.as_str());
+                c8.insert(r, row.capabilities.as_str());
             }
             // Fixed-width columns: fill the typed slices after the string inserts.
             unsafe {
@@ -2954,13 +2959,18 @@ impl VTab for WasmFunctions {
                 output.set_len(0);
                 return Ok(());
             }
+            let c0 = output.flat_vector(0);
+            let c1 = output.flat_vector(1);
+            let c2 = output.flat_vector(2);
+            let c3 = output.flat_vector(3);
+            let c4 = output.flat_vector(4);
             for r in 0..n {
                 let row = &bind.rows[start + r];
-                output.flat_vector(0).insert(r, row.module.as_str());
-                output.flat_vector(1).insert(r, row.name.as_str());
-                output.flat_vector(2).insert(r, row.kind.as_str());
-                output.flat_vector(3).insert(r, row.arguments.as_str());
-                output.flat_vector(4).insert(r, row.returns.as_str());
+                c0.insert(r, row.module.as_str());
+                c1.insert(r, row.name.as_str());
+                c2.insert(r, row.kind.as_str());
+                c3.insert(r, row.arguments.as_str());
+                c4.insert(r, row.returns.as_str());
             }
             unsafe {
                 let mut lv = output.flat_vector(5);
@@ -3082,10 +3092,12 @@ impl VTab for WasmHostCapabilities {
                 output.set_len(0);
                 return Ok(());
             }
+            let c0 = output.flat_vector(0);
+            let c2 = output.flat_vector(2);
             for r in 0..n {
                 let row = &bind.rows[start + r];
-                output.flat_vector(0).insert(r, row.name.as_str());
-                output.flat_vector(2).insert(r, row.detail.as_str());
+                c0.insert(r, row.name.as_str());
+                c2.insert(r, row.detail.as_str());
             }
             unsafe {
                 let mut av = output.flat_vector(1);
@@ -3469,16 +3481,24 @@ impl VTab for WasmDocs {
                 output.set_len(0);
                 return Ok(());
             }
+            let c0 = output.flat_vector(0);
+            let c1 = output.flat_vector(1);
+            let c2 = output.flat_vector(2);
+            let c3 = output.flat_vector(3);
+            let c4 = output.flat_vector(4);
+            let c5 = output.flat_vector(5);
+            let c6 = output.flat_vector(6);
+            let c7 = output.flat_vector(7);
             for r in 0..n {
                 let row = &rows[start + r];
-                output.flat_vector(0).insert(r, row.module.as_str());
-                output.flat_vector(1).insert(r, row.function.as_str());
-                output.flat_vector(2).insert(r, row.kind.as_str());
-                output.flat_vector(3).insert(r, row.signature.as_str());
-                output.flat_vector(4).insert(r, row.summary.as_str());
-                output.flat_vector(5).insert(r, row.description.as_str());
-                output.flat_vector(6).insert(r, row.example.as_str());
-                output.flat_vector(7).insert(r, row.tags.as_str());
+                c0.insert(r, row.module.as_str());
+                c1.insert(r, row.function.as_str());
+                c2.insert(r, row.kind.as_str());
+                c3.insert(r, row.signature.as_str());
+                c4.insert(r, row.summary.as_str());
+                c5.insert(r, row.description.as_str());
+                c6.insert(r, row.example.as_str());
+                c7.insert(r, row.tags.as_str());
             }
             unsafe {
                 let mut lv = output.flat_vector(8);
@@ -3621,14 +3641,20 @@ impl VTab for WasmSearch {
                 output.set_len(0);
                 return Ok(());
             }
+            let c0 = output.flat_vector(0);
+            let c1 = output.flat_vector(1);
+            let c2 = output.flat_vector(2);
+            let c3 = output.flat_vector(3);
+            let c4 = output.flat_vector(4);
+            let c5 = output.flat_vector(5);
             for r in 0..n {
                 let row = &bind.rows[start + r];
-                output.flat_vector(0).insert(r, row.module.as_str());
-                output.flat_vector(1).insert(r, row.function.as_str());
-                output.flat_vector(2).insert(r, row.kind.as_str());
-                output.flat_vector(3).insert(r, row.signature.as_str());
-                output.flat_vector(4).insert(r, row.summary.as_str());
-                output.flat_vector(5).insert(r, row.tags.as_str());
+                c0.insert(r, row.module.as_str());
+                c1.insert(r, row.function.as_str());
+                c2.insert(r, row.kind.as_str());
+                c3.insert(r, row.signature.as_str());
+                c4.insert(r, row.summary.as_str());
+                c5.insert(r, row.tags.as_str());
             }
             unsafe {
                 let mut sv = output.flat_vector(6);
@@ -3878,11 +3904,14 @@ impl VTab for WasmCache {
                 output.set_len(0);
                 return Ok(());
             }
+            let c0 = output.flat_vector(0);
+            let c1 = output.flat_vector(1);
+            let c4 = output.flat_vector(4);
             for r in 0..n {
                 let row = &bind.rows[start + r];
-                output.flat_vector(0).insert(r, row.digest.as_str());
-                output.flat_vector(1).insert(r, row.name.as_str());
-                output.flat_vector(4).insert(r, row.path.as_str());
+                c0.insert(r, row.digest.as_str());
+                c1.insert(r, row.name.as_str());
+                c4.insert(r, row.path.as_str());
             }
             unsafe {
                 let mut bv = output.flat_vector(2);
@@ -3954,9 +3983,10 @@ impl VTab for WasmEvents {
                 output.set_len(0);
                 return Ok(());
             }
+            let c2 = output.flat_vector(2);
             for r in 0..n {
                 let row = &bind.rows[start + r];
-                output.flat_vector(2).insert(r, row.kind.as_str());
+                c2.insert(r, row.kind.as_str());
                 match row.module.as_deref() {
                     Some(m) => output.flat_vector(3).insert(r, m),
                     // NULL module column when the event is not module-scoped
@@ -4144,12 +4174,16 @@ impl VTab for WasmModuleCompatibility {
                 output.set_len(0);
                 return Ok(());
             }
+            let c0 = output.flat_vector(0);
+            let c1 = output.flat_vector(1);
+            let c2 = output.flat_vector(2);
+            let c3 = output.flat_vector(3);
             for r in 0..n {
                 let row = &bind.rows[start + r];
-                output.flat_vector(0).insert(r, row.module.as_str());
-                output.flat_vector(1).insert(r, row.module_generation.as_str());
-                output.flat_vector(2).insert(r, row.host_generation.as_str());
-                output.flat_vector(3).insert(r, row.lifecycle.as_str());
+                c0.insert(r, row.module.as_str());
+                c1.insert(r, row.module_generation.as_str());
+                c2.insert(r, row.host_generation.as_str());
+                c3.insert(r, row.lifecycle.as_str());
             }
             unsafe {
                 let mut rv = output.flat_vector(4);
