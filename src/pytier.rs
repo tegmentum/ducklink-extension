@@ -380,11 +380,55 @@ fn offload_payload(entry: &str, args: Vec<rmpv::Value>) -> Vec<u8> {
 /// The arrow bytes are one Arrow IPC STREAM carrying the whole DataChunk's
 /// argument columns (`arg0`, `arg1`, ...); the guest applies the fn row-wise and
 /// returns one Arrow IPC stream with a single `result` column.
-fn offload_arrow_payload(entry: &str, arrow: Vec<u8>) -> Vec<u8> {
-    mp_encode(&rmpv::Value::Map(vec![
-        (rmpv::Value::from("entry"), rmpv::Value::from(entry)),
-        (rmpv::Value::from("arrow"), rmpv::Value::Binary(arrow)),
-    ]))
+///
+/// Hand-encoded rather than routed through `rmpv::Value::Binary(arrow_vec)` +
+/// `mp_encode`: the general encoder walks a `Value` tree and does a second
+/// traversal to emit bytes, so every chunk paid for one intermediate `Value`
+/// per field plus a recursive `write_value` dispatch. This writes the fixed
+/// two-entry map directly into a pre-sized buffer — one straight-through pass.
+fn offload_arrow_payload(entry: &str, arrow: &[u8]) -> Vec<u8> {
+    let entry_bytes = entry.as_bytes();
+    // fixmap header + ("entry" key + value header + entry_bytes)
+    //                + ("arrow" key + bin32 header + arrow_bytes)
+    let cap = 1                           // fixmap(2) header
+        + 1 + 5                           // key "entry" (fixstr)
+        + 5 + entry_bytes.len()           // value entry_bytes (worst-case str32)
+        + 1 + 5                           // key "arrow" (fixstr)
+        + 5 + arrow.len();                // value arrow (bin32)
+    let mut out = Vec::with_capacity(cap);
+    // fixmap with 2 entries: 0x80 | count
+    out.push(0x82);
+
+    // key: "entry" as fixstr(5).
+    out.push(0xa5);
+    out.extend_from_slice(b"entry");
+
+    // value: entry string, sized encoding per msgpack.
+    let n = entry_bytes.len();
+    if n <= 31 {
+        out.push(0xa0 | n as u8);
+    } else if n <= u8::MAX as usize {
+        out.push(0xd9);
+        out.push(n as u8);
+    } else if n <= u16::MAX as usize {
+        out.push(0xda);
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        out.push(0xdb);
+        out.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+    out.extend_from_slice(entry_bytes);
+
+    // key: "arrow" as fixstr(5).
+    out.push(0xa5);
+    out.extend_from_slice(b"arrow");
+
+    // value: arrow bytes as bin32 (always, so the guest reader is fixed-width).
+    out.push(0xc6);
+    out.extend_from_slice(&(arrow.len() as u32).to_be_bytes());
+    out.extend_from_slice(arrow);
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -398,62 +442,86 @@ fn offload_arrow_payload(entry: &str, arrow: Vec<u8>) -> Vec<u8> {
 /// applies DuckDB NULL semantics. Reading a NULL VARCHAR cell's `duckdb_string_t`
 /// would deref garbage, so a NULL row is appended as null WITHOUT touching the
 /// slot.
+///
+/// Fast path when the column has no NULLs (a null validity pointer): the
+/// fixed-width primitives (Bigint/Double/Boolean) are constructed straight from
+/// the DuckDB-owned slice by `Int64Array::from_iter_values` + friends — one
+/// bulk copy, no per-row `append_value` branch on validity.
 fn column_to_arrow(
     ty: PyType,
     col: &FlatVector,
     len: usize,
     validity: *const u64,
 ) -> ArrayRef {
-    let valid = |i: usize| validity.is_null() || unsafe { row_valid(validity, i) };
+    let null_free = validity.is_null();
     match ty {
         PyType::Varchar => {
             let s = unsafe { col.as_slice_with_len::<duckdb_string_t>(len) };
             let mut b = StringBuilder::new();
-            for i in 0..len {
-                if valid(i) {
+            if null_free {
+                for i in 0..len {
                     let mut t = s[i];
                     b.append_value(DuckString::new(&mut t).as_str());
-                } else {
-                    b.append_null();
+                }
+            } else {
+                for i in 0..len {
+                    if unsafe { row_valid(validity, i) } {
+                        let mut t = s[i];
+                        b.append_value(DuckString::new(&mut t).as_str());
+                    } else {
+                        b.append_null();
+                    }
                 }
             }
             Arc::new(b.finish())
         }
         PyType::Bigint => {
             let s = unsafe { col.as_slice_with_len::<i64>(len) };
-            let mut b = Int64Builder::with_capacity(len);
-            for i in 0..len {
-                if valid(i) {
-                    b.append_value(s[i]);
-                } else {
-                    b.append_null();
+            if null_free {
+                Arc::new(Int64Array::from_iter_values(s.iter().copied()))
+            } else {
+                let mut b = Int64Builder::with_capacity(len);
+                for i in 0..len {
+                    if unsafe { row_valid(validity, i) } {
+                        b.append_value(s[i]);
+                    } else {
+                        b.append_null();
+                    }
                 }
+                Arc::new(b.finish())
             }
-            Arc::new(b.finish())
         }
         PyType::Double => {
             let s = unsafe { col.as_slice_with_len::<f64>(len) };
-            let mut b = Float64Builder::with_capacity(len);
-            for i in 0..len {
-                if valid(i) {
-                    b.append_value(s[i]);
-                } else {
-                    b.append_null();
+            if null_free {
+                Arc::new(Float64Array::from_iter_values(s.iter().copied()))
+            } else {
+                let mut b = Float64Builder::with_capacity(len);
+                for i in 0..len {
+                    if unsafe { row_valid(validity, i) } {
+                        b.append_value(s[i]);
+                    } else {
+                        b.append_null();
+                    }
                 }
+                Arc::new(b.finish())
             }
-            Arc::new(b.finish())
         }
         PyType::Boolean => {
             let s = unsafe { col.as_slice_with_len::<bool>(len) };
-            let mut b = BooleanBuilder::with_capacity(len);
-            for i in 0..len {
-                if valid(i) {
-                    b.append_value(s[i]);
-                } else {
-                    b.append_null();
+            if null_free {
+                Arc::new(BooleanArray::from_iter(s.iter().copied().map(Some)))
+            } else {
+                let mut b = BooleanBuilder::with_capacity(len);
+                for i in 0..len {
+                    if unsafe { row_valid(validity, i) } {
+                        b.append_value(s[i]);
+                    } else {
+                        b.append_null();
+                    }
                 }
+                Arc::new(b.finish())
             }
-            Arc::new(b.finish())
         }
     }
 }
@@ -469,25 +537,25 @@ fn arrow_field(ty: PyType, name: &str) -> Field {
 }
 
 /// Serialize the argument columns into one Arrow IPC STREAM (columns `arg0`,
-/// `arg1`, ...). One stream per DataChunk -> one WIT crossing per chunk.
+/// `arg1`, ...). One stream per DataChunk -> one WIT crossing per chunk. The
+/// schema is pre-built at registration and passed in — the fields/types never
+/// change over the function's lifetime.
 fn encode_arg_batch(
+    arg_schema: &Arc<Schema>,
     arg_types: &[PyType],
     cols: &[FlatVector],
     len: usize,
     validities: &[*const u64],
 ) -> Result<Vec<u8>, String> {
-    let mut fields = Vec::with_capacity(arg_types.len());
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(arg_types.len());
     for (j, &ty) in arg_types.iter().enumerate() {
-        fields.push(arrow_field(ty, &format!("arg{j}")));
         arrays.push(column_to_arrow(ty, &cols[j], len, validities[j]));
     }
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema.clone(), arrays)
+    let batch = RecordBatch::try_new(arg_schema.clone(), arrays)
         .map_err(|e| format!("arrow: build arg batch: {e}"))?;
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut w = StreamWriter::try_new(&mut buf, &schema)
+        let mut w = StreamWriter::try_new(&mut buf, arg_schema)
             .map_err(|e| format!("arrow: stream writer: {e}"))?;
         w.write(&batch).map_err(|e| format!("arrow: write batch: {e}"))?;
         w.finish().map_err(|e| format!("arrow: finish stream: {e}"))?;
@@ -537,17 +605,22 @@ fn decode_result_into(
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| format!("arrow: expected int64 result, got {}", arr.data_type()))?;
-                // Set nulls first (needs &mut out), then fill values via the slice
-                // (a distinct &mut borrow) — the two can't overlap.
-                for i in 0..n {
-                    if a.is_null(i) {
-                        out.set_null(row + i);
+                if a.null_count() == 0 {
+                    // Bulk-copy the Arrow value buffer straight into the DuckDB
+                    // output slice — one memcpy per chunk instead of two row loops.
+                    let slot = unsafe { out.as_mut_slice::<i64>() };
+                    slot[row..row + n].copy_from_slice(a.values());
+                } else {
+                    for i in 0..n {
+                        if a.is_null(i) {
+                            out.set_null(row + i);
+                        }
                     }
-                }
-                let slot = unsafe { out.as_mut_slice::<i64>() };
-                for i in 0..n {
-                    if !a.is_null(i) {
-                        slot[row + i] = a.value(i);
+                    let slot = unsafe { out.as_mut_slice::<i64>() };
+                    for i in 0..n {
+                        if !a.is_null(i) {
+                            slot[row + i] = a.value(i);
+                        }
                     }
                 }
             }
@@ -556,15 +629,20 @@ fn decode_result_into(
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| format!("arrow: expected float64 result, got {}", arr.data_type()))?;
-                for i in 0..n {
-                    if a.is_null(i) {
-                        out.set_null(row + i);
+                if a.null_count() == 0 {
+                    let slot = unsafe { out.as_mut_slice::<f64>() };
+                    slot[row..row + n].copy_from_slice(a.values());
+                } else {
+                    for i in 0..n {
+                        if a.is_null(i) {
+                            out.set_null(row + i);
+                        }
                     }
-                }
-                let slot = unsafe { out.as_mut_slice::<f64>() };
-                for i in 0..n {
-                    if !a.is_null(i) {
-                        slot[row + i] = a.value(i);
+                    let slot = unsafe { out.as_mut_slice::<f64>() };
+                    for i in 0..n {
+                        if !a.is_null(i) {
+                            slot[row + i] = a.value(i);
+                        }
                     }
                 }
             }
@@ -573,15 +651,26 @@ fn decode_result_into(
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .ok_or_else(|| format!("arrow: expected bool result, got {}", arr.data_type()))?;
-                for i in 0..n {
-                    if a.is_null(i) {
-                        out.set_null(row + i);
-                    }
-                }
-                let slot = unsafe { out.as_mut_slice::<bool>() };
-                for i in 0..n {
-                    if !a.is_null(i) {
+                // Arrow packs booleans into a bit buffer; DuckDB writes one bool
+                // per byte. There's no memcpy shortcut — even in the NULL-free
+                // case each output byte reads a single bit. Skip the null-mask
+                // pre-pass when there are no nulls.
+                if a.null_count() == 0 {
+                    let slot = unsafe { out.as_mut_slice::<bool>() };
+                    for i in 0..n {
                         slot[row + i] = a.value(i);
+                    }
+                } else {
+                    for i in 0..n {
+                        if a.is_null(i) {
+                            out.set_null(row + i);
+                        }
+                    }
+                    let slot = unsafe { out.as_mut_slice::<bool>() };
+                    for i in 0..n {
+                        if !a.is_null(i) {
+                            slot[row + i] = a.value(i);
+                        }
                     }
                 }
             }
@@ -703,13 +792,17 @@ fn parse_manifest(v: &rmpv::Value) -> Vec<PyScalarSig> {
 // ---------------------------------------------------------------------------
 
 /// Per-function state DuckDB hands to `PyScalar::invoke`: the resident pylon
-/// runtime (to drive `offload`), the manifest `entry` string, and the arg/return
-/// types (for marshalling). One `PyScalar` impl serves every authored scalar.
+/// runtime (to drive `offload`), the manifest `entry` string, the arg/return
+/// types (for marshalling), and a pre-built Arrow schema whose fields are the
+/// fixed `arg0`, `arg1`, ... columns the guest expects. The schema doesn't
+/// depend on chunk data, so caching it here removes a per-chunk Schema+Fields
+/// allocation.
 #[derive(Clone)]
 struct PyScalarState {
     entry: String,
     args: Vec<PyType>,
     ret: PyType,
+    arg_schema: Arc<Schema>,
 }
 
 // The SQL signature is static per `VScalar::signatures()` (no access to state),
@@ -791,8 +884,9 @@ impl VScalar for PyScalar {
         // once, decode the returned `result` column back into the output vector.
         // (The per-row msgpack `offload` remains as `invoke_per_row` for
         // unsupported/fallback types.)
-        let arrow = encode_arg_batch(&state.args, &cols, len, &validities).map_err(to_boxed)?;
-        let payload = offload_arrow_payload(&state.entry, arrow);
+        let arrow = encode_arg_batch(&state.arg_schema, &state.args, &cols, len, &validities)
+            .map_err(to_boxed)?;
+        let payload = offload_arrow_payload(&state.entry, &arrow);
         let resp = rt.call("offload_arrow", &payload).map_err(to_boxed)?;
         decode_result_into(state.ret, &resp, &mut out, len).map_err(to_boxed)?;
         Ok(())
@@ -897,10 +991,20 @@ fn write_cell(
 fn register_py_scalars(con: &Connection, sigs: &[PyScalarSig]) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for f in sigs {
+        // Build the arg schema ONCE at registration. The Arrow field names
+        // ("arg0", "arg1", ...) and types are fixed for the function's lifetime;
+        // `encode_arg_batch` would otherwise rebuild them on every DataChunk.
+        let fields: Vec<Field> = f
+            .args
+            .iter()
+            .enumerate()
+            .map(|(j, &ty)| arrow_field(ty, &format!("arg{j}")))
+            .collect();
         let state = PyScalarState {
             entry: f.entry.clone(),
             args: f.args.clone(),
             ret: f.ret,
+            arg_schema: Arc::new(Schema::new(fields)),
         };
         PENDING_PY_SIG.with(|s| *s.borrow_mut() = Some((f.args.clone(), f.ret)));
         let result = con.register_scalar_function_with_state::<PyScalar>(&f.name, &state);
