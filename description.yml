@@ -3,7 +3,7 @@
 extension:
   name: ducklink
   description: Load portable WebAssembly extension modules into DuckDB from SQL
-  version: 4.1.0
+  version: 4.1.1
   language: Rust
   build: cargo
   license: MIT
@@ -19,7 +19,7 @@ extension:
 
 repo:
   github: tegmentum/ducklink-extension
-  ref: v4.1.0
+  ref: v4.1.1
 
 docs:
   hello_world: |
@@ -62,6 +62,12 @@ docs:
     tags, summary, and description; `ducklink_help('name')` renders the
     markdown block for a single function or every function in a module —
     so the catalog is discoverable from SQL without leaving the session.
+
+    Components can also ship their own docs bundled in the `.wasm` binary
+    via a `duckdb.docs` custom section (JSON per function). Ducklink reads
+    the section at load and merges it with the catalog docs — component
+    summary/description/example override the catalog, tags union — so
+    third-party modules can keep their own docs authoritative.
 
     On Linux and macOS an advanced tier also enables a `LOAD WASM '<name>'`
     statement — an explicit, sandbox-aware alternative to `ducklink_load` that
