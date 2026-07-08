@@ -2127,8 +2127,10 @@ struct LoadedRecord {
     /// Optional per-function documentation overrides the component shipped in
     /// its `duckdb.docs` wasm custom section. Merged into `ducklink.docs` at
     /// query time — summary / description / example REPLACE catalog values,
-    /// tags are UNIONed. `None` for components without the section.
-    docs: Option<crate::docs_section::ComponentDocs>,
+    /// tags are UNIONed. `None` for components without the section. Wrapped
+    /// in an `Arc` so `snapshot_component_docs` is a refcount bump instead of
+    /// deep-cloning the full ComponentDocs on every doc-view bind.
+    docs: Option<Arc<crate::docs_section::ComponentDocs>>,
 }
 
 /// A single live function signature captured from a loaded component, for the
@@ -2439,13 +2441,14 @@ pub unsafe fn load_wasm_into_db(
             aggregates: agg,
             path: path_str,
             funcs: capture_live_sigs(&loaded),
-            docs: loaded.docs.clone(),
+            docs: loaded.docs.clone().map(Arc::new),
         };
         match loaded_list.iter_mut().find(|r| r.name == name) {
             Some(existing) => *existing = rec,
             None => loaded_list.push(rec),
         }
     }
+    bump_doc_cache_generation();
 
     crate::events::emit(
         "load_ok",
@@ -2584,13 +2587,14 @@ impl VTab for WasmLoad {
                     aggregates: agg,
                     path: path_str.clone(),
                     funcs: capture_live_sigs(&loaded),
-                    docs: loaded.docs.clone(),
+                    docs: loaded.docs.clone().map(Arc::new),
                 };
                 match loaded_list.iter_mut().find(|r| r.name == name) {
                     Some(existing) => *existing = rec,
                     None => loaded_list.push(rec),
                 }
             }
+            bump_doc_cache_generation();
 
             crate::events::emit(
                 "load_ok",
@@ -3245,22 +3249,97 @@ fn render_signature(name: &str, sig: &crate::catalog::FunctionSig) -> String {
 }
 
 /// Snapshot the per-module `ComponentDocs` for every loaded module carrying a
-/// `duckdb.docs` custom section. Cloned out under the runtime lock (small
-/// per-module blobs) so `build_doc_rows` can look up an override without
-/// re-taking the lock per row. Empty when no loaded module ships docs, or
-/// when the runtime isn't up.
-fn snapshot_component_docs()
-    -> std::collections::HashMap<String, crate::docs_section::ComponentDocs>
+/// `duckdb.docs` custom section. Takes the runtime lock once and returns
+/// refcount-bumped `Arc<ComponentDocs>` handles — the deep-clone the previous
+/// shape did on every doc-view bind is gone. Empty when no loaded module
+/// ships docs, or when the runtime isn't up.
+fn snapshot_component_docs() -> std::collections::HashMap<String, Arc<crate::docs_section::ComponentDocs>>
 {
     match RUNTIME.get() {
         Some(rt) => {
             let list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
             list.iter()
-                .filter_map(|r| r.docs.as_ref().map(|d| (r.name.clone(), d.clone())))
+                .filter_map(|r| r.docs.as_ref().map(|d| (r.name.clone(), Arc::clone(d))))
                 .collect()
         }
         None => std::collections::HashMap::new(),
     }
+}
+
+/// Pre-lowercased side data for one `DocRow`, indexed positionally against
+/// `CachedDocs::rows`. Built ONCE per generation so `ducklink_search`'s
+/// per-query scoring is a plain `contains()` scan rather than four
+/// `to_lowercase()` allocations per row per bind.
+#[derive(Clone)]
+struct DocRowLower {
+    function: String,
+    tags: String,
+    summary: String,
+    description: String,
+}
+
+/// The session-cached doc set. Owned via `Arc` in the OnceLock below and by
+/// every doc/search/help bind that inspects it — so per-query work reduces to
+/// scanning a fixed shared slice instead of rebuilding ~639 `DocRow`s + ~5K
+/// String allocations per bind. Rebuilt lazily when the load-generation
+/// counter changes.
+struct CachedDocs {
+    rows: Vec<DocRow>,
+    lc: Vec<DocRowLower>,
+}
+
+/// Monotonic load-generation counter. Bumped after every successful component
+/// load (both `ducklink_load` and `LOAD WASM 'name'` sites). The cache below
+/// records the generation it was built against; a mismatch triggers a
+/// rebuild.
+static DOC_CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cached (generation, doc-set) pair. `Mutex<Option<..>>` because we build
+/// lazily on first read. Once populated, reads are Arc clones under a short
+/// lock; rebuilds happen only on cache miss.
+static DOC_CACHE: std::sync::OnceLock<Mutex<Option<(u64, Arc<CachedDocs>)>>> =
+    std::sync::OnceLock::new();
+
+/// Invalidate the docs cache. Called after every successful component load
+/// so the next doc-view read observes the newly-loaded module's
+/// component-provided docs (if any) plus its `loaded=true` flag.
+fn bump_doc_cache_generation() {
+    DOC_CACHE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Return the current cached doc set, rebuilding if the generation has moved
+/// since the last cache write. The `Arc` clone is cheap; the caller can hold
+/// it for the duration of a bind + scan without contending with rebuilds
+/// (which take the mutex only briefly to swap in the new snapshot).
+fn get_or_build_doc_cache() -> Arc<CachedDocs> {
+    let cell = DOC_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let current_gen = DOC_CACHE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some((cached_gen, cached)) = guard.as_ref() {
+        if *cached_gen == current_gen {
+            return Arc::clone(cached);
+        }
+    }
+    let built = Arc::new(build_cached_docs());
+    *guard = Some((current_gen, Arc::clone(&built)));
+    built
+}
+
+/// Build the cached doc set from scratch: materialize DocRows via the same
+/// path `build_doc_rows` used, then precompute the lowercased side data for
+/// search. Called only on cache miss.
+fn build_cached_docs() -> CachedDocs {
+    let rows = build_doc_rows();
+    let lc: Vec<DocRowLower> = rows
+        .iter()
+        .map(|r| DocRowLower {
+            function: r.function.to_lowercase(),
+            tags: r.tags.to_lowercase(),
+            summary: r.summary.to_lowercase(),
+            description: r.description.to_lowercase(),
+        })
+        .collect();
+    CachedDocs { rows, lc }
 }
 
 /// UNION `override_tags` into `catalog_tags`, preserving order (catalog first,
@@ -3335,7 +3414,10 @@ fn build_doc_rows() -> Vec<DocRow> {
 }
 
 struct WasmDocsBind {
-    rows: Vec<DocRow>,
+    /// The session-cached doc set — an `Arc` clone of what
+    /// `get_or_build_doc_cache` returned at bind time. `func()` scans
+    /// `docs.rows` without allocation.
+    docs: Arc<CachedDocs>,
 }
 
 /// `ducklink_docs()` — the searchable documentation surface. One row per
@@ -3362,7 +3444,7 @@ impl VTab for WasmDocs {
             bind.add_result_column("tags", vc());
             bind.add_result_column("loaded", boolean());
             Ok(WasmDocsBind {
-                rows: build_doc_rows(),
+                docs: get_or_build_doc_cache(),
             })
         })
     }
@@ -3381,13 +3463,14 @@ impl VTab for WasmDocs {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let rows = &bind.docs.rows;
+            let n = rows.len().saturating_sub(start).min(2048);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
             }
             for r in 0..n {
-                let row = &bind.rows[start + r];
+                let row = &rows[start + r];
                 output.flat_vector(0).insert(r, row.module.as_str());
                 output.flat_vector(1).insert(r, row.function.as_str());
                 output.flat_vector(2).insert(r, row.kind.as_str());
@@ -3401,7 +3484,7 @@ impl VTab for WasmDocs {
                 let mut lv = output.flat_vector(8);
                 let l = lv.as_mut_slice::<bool>();
                 for r in 0..n {
-                    l[r] = bind.rows[start + r].loaded;
+                    l[r] = rows[start + r].loaded;
                 }
             }
             init.cursor.store(start + n, Ordering::Relaxed);
@@ -3429,26 +3512,24 @@ struct SearchRow {
 /// tokens. Matches are counted as case-insensitive substring hits; matches in
 /// the function NAME weigh most (10×), tags 5×, summary 3×, description 1×.
 /// Empty query returns 0 so the search TF's `> 0` filter drops the row.
-fn score_doc(row: &DocRow, tokens: &[String]) -> i64 {
+/// Reads from the pre-lowercased side data cached alongside each `DocRow` so
+/// `to_lowercase()` isn't re-run per row per bind.
+fn score_doc(lc: &DocRowLower, tokens: &[String]) -> i64 {
     if tokens.is_empty() {
         return 0;
     }
-    let name_lc = row.function.to_lowercase();
-    let tags_lc = row.tags.to_lowercase();
-    let summary_lc = row.summary.to_lowercase();
-    let description_lc = row.description.to_lowercase();
     let mut score: i64 = 0;
     for t in tokens {
-        if name_lc.contains(t) {
+        if lc.function.contains(t.as_str()) {
             score += 10;
         }
-        if tags_lc.contains(t) {
+        if lc.tags.contains(t.as_str()) {
             score += 5;
         }
-        if summary_lc.contains(t) {
+        if lc.summary.contains(t.as_str()) {
             score += 3;
         }
-        if description_lc.contains(t) {
+        if lc.description.contains(t.as_str()) {
             score += 1;
         }
     }
@@ -3486,21 +3567,27 @@ impl VTab for WasmSearch {
                 .split_whitespace()
                 .map(|t| t.to_lowercase())
                 .collect();
-            let docs = build_doc_rows();
+            // Scan the CACHED doc set (built lazily on load-generation change)
+            // and score against pre-lowercased side data — no per-row
+            // to_lowercase() allocation. Only matched rows pay a String
+            // clone into the `SearchRow` output.
+            let docs = get_or_build_doc_cache();
             let mut scored: Vec<SearchRow> = docs
-                .into_iter()
-                .filter_map(|row| {
-                    let s = score_doc(&row, &tokens);
+                .rows
+                .iter()
+                .zip(docs.lc.iter())
+                .filter_map(|(row, lc)| {
+                    let s = score_doc(lc, &tokens);
                     if s <= 0 {
                         return None;
                     }
                     Some(SearchRow {
-                        module: row.module,
-                        function: row.function,
-                        kind: row.kind,
-                        signature: row.signature,
-                        summary: row.summary,
-                        tags: row.tags,
+                        module: row.module.clone(),
+                        function: row.function.clone(),
+                        kind: row.kind.clone(),
+                        signature: row.signature.clone(),
+                        summary: row.summary.clone(),
+                        tags: row.tags.clone(),
                         score: s,
                     })
                 })
@@ -3572,35 +3659,43 @@ impl VTab for WasmSearch {
 /// FFI boundary so `DucklinkHelp::invoke` stays a thin translator.
 pub(crate) fn render_help(name: &str) -> String {
     let name_lc = name.to_lowercase();
-    let docs = build_doc_rows();
+    // Cached — a `SELECT ducklink_help(name) FROM ducklink.modules` no longer
+    // rebuilds the entire doc set once per row. Match against the cached
+    // per-row lc side data so we don't allocate a `to_lowercase()` per row
+    // per invocation.
+    let docs = get_or_build_doc_cache();
 
     // Prefer exact function-name matches first, then module matches.
-    let fn_matches: Vec<&DocRow> = docs
+    let fn_indices: Vec<usize> = docs
+        .lc
         .iter()
-        .filter(|r| r.function.to_lowercase() == name_lc)
+        .enumerate()
+        .filter_map(|(i, lc)| (lc.function == name_lc).then_some(i))
         .collect();
-    if !fn_matches.is_empty() {
+    if !fn_indices.is_empty() {
         let mut out = String::new();
-        for (i, row) in fn_matches.iter().enumerate() {
+        for (i, idx) in fn_indices.iter().enumerate() {
             if i > 0 {
                 out.push_str("\n---\n\n");
             }
-            append_function_help(&mut out, row);
+            append_function_help(&mut out, &docs.rows[*idx]);
         }
         return out;
     }
 
-    let mod_matches: Vec<&DocRow> = docs
+    let mod_indices: Vec<usize> = docs
+        .rows
         .iter()
-        .filter(|r| r.module.to_lowercase() == name_lc)
+        .enumerate()
+        .filter_map(|(i, r)| (r.module.eq_ignore_ascii_case(name)).then_some(i))
         .collect();
-    if !mod_matches.is_empty() {
-        let mut out = format!("# Module: {}\n\n", mod_matches[0].module);
-        for (i, row) in mod_matches.iter().enumerate() {
+    if !mod_indices.is_empty() {
+        let mut out = format!("# Module: {}\n\n", docs.rows[mod_indices[0]].module);
+        for (i, idx) in mod_indices.iter().enumerate() {
             if i > 0 {
                 out.push('\n');
             }
-            append_function_help(&mut out, row);
+            append_function_help(&mut out, &docs.rows[*idx]);
         }
         return out;
     }
