@@ -4528,17 +4528,26 @@ impl VTab for WasmEvents {
                 output.set_len(0);
                 return Ok(());
             }
+            // Hoist every string column's flat_vector handle above the row
+            // loop — c3/c4 were missed by the F2 sweep because c3 is fetched
+            // inside a `match` arm (twice per row, once for the Some path and
+            // once for None's set_null) and c4 sits on its own line but was
+            // still called per row. The F2 pattern already caught c2. `mut`
+            // is required only on c3 because `set_null` takes &mut self;
+            // insert() takes &self on FlatVector (proven by the F2 hoist).
             let c2 = output.flat_vector(2);
+            let mut c3 = output.flat_vector(3);
+            let c4 = output.flat_vector(4);
             for r in 0..n {
                 let row = &bind.rows[start + r];
                 c2.insert(r, row.kind.as_str());
                 match row.module.as_deref() {
-                    Some(m) => output.flat_vector(3).insert(r, m),
+                    Some(m) => c3.insert(r, m),
                     // NULL module column when the event is not module-scoped
                     // (e.g. catalog_fetch / catalog_fallback).
-                    None => output.flat_vector(3).set_null(r),
+                    None => c3.set_null(r),
                 }
-                output.flat_vector(4).insert(r, row.detail.as_str());
+                c4.insert(r, row.detail.as_str());
             }
             unsafe {
                 let mut sv = output.flat_vector(0);
