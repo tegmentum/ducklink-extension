@@ -200,15 +200,27 @@ impl Engine2 {
     /// Load a `duckdb:extension` component, run its `load()`, and return the
     /// functions it registered. The instance is retained for dispatch.
     pub fn load(&self, extension: &str, path: &Path) -> Result<LoadedComponent> {
-        let component = Component::from_file(&self.engine, path)
+        // J3: read the wasm bytes ONCE and share them between the wasmtime
+        // compile path and the `duckdb.docs` custom-section scanner.
+        // Previously each did its own `std::fs::read` of the same file —
+        // ~10ms per load on a 20MB component doing redundant disk I/O.
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading component at {}", path.display()))?;
+        let component = Component::from_binary(&self.engine, &bytes)
             .map_err(anyhow::Error::from)
             .with_context(|| format!("loading component at {}", path.display()))?;
-        // Read the component's optional `duckdb.docs` custom section from
-        // the on-disk wasm. Non-fatal: an absent / malformed section returns
-        // `None` (verbose-only diagnostic). The parsed docs are cached on the
+        // Parse the optional `duckdb.docs` custom section from the same
+        // buffer. Non-fatal: an absent / malformed section returns `None`
+        // (verbose-only diagnostic). The parsed docs are cached on the
         // returned `LoadedComponent` so the DuckDB sink can merge them into
         // `ducklink.docs`.
-        let docs = crate::docs_section::parse_docs_from_wasm(path);
+        let docs = crate::docs_section::parse_docs_from_bytes(
+            &bytes,
+            &path.display().to_string(),
+        );
+        // Bytes have served their two purposes; drop before crossing into
+        // wasmtime's instantiation path.
+        drop(bytes);
         // Grant outbound network + name lookup so network-using components (dns,
         // http, httpfs, ...) work. Best-effort, not a sandbox: a component that
         // does not use sockets is unaffected. (A future opt-in gate could mirror
