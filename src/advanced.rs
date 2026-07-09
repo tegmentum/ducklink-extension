@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use duckdb::ffi;
 
@@ -32,30 +32,44 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Duckv
 struct Advanced {
     engine: Arc<Engine2>,
     /// Every component-declared PARSER extension as (owning component, the
-    /// component's guest dispatcher handle).
-    parsers: Mutex<Vec<(String, u32)>>,
+    /// component's guest dispatcher handle). RwLock because the parser bridge
+    /// (`ducklink_parse`) reads this on every unrecognized-statement retry to
+    /// offer the SQL to each registered component; writes only happen at
+    /// component load. Multiple concurrent parses shouldn't serialize.
+    parsers: RwLock<Vec<(String, u32)>>,
     /// Every component-declared OPTIMIZER rule as (owning component, handle).
-    optimizers: Mutex<Vec<(String, u32)>>,
+    /// RwLock for symmetry with `parsers`; C++ shim reads this per query
+    /// plan.
+    optimizers: RwLock<Vec<(String, u32)>>,
     /// Filterable streaming table functions, keyed by the table's callback
     /// handle: the owning component + its full declared column types (used to
-    /// derive the projected schema for writing chunks).
-    filterable: Mutex<HashMap<u32, (String, Vec<reg::LogicalType>)>>,
+    /// derive the projected schema for writing chunks). RwLock because
+    /// `ducklink_ts_open` (per scan) reads it, writes only happen at load.
+    filterable: RwLock<HashMap<u32, (String, Vec<reg::LogicalType>)>>,
     /// Live streaming cursors, keyed by a bridge-local id (so component cursor
-    /// ids can never collide across components).
+    /// ids can never collide across components). Stays a Mutex — every fill
+    /// mutates via the reads-then-cursor-clones dance below, and open/close
+    /// are the write paths.
     cursors: Mutex<HashMap<u32, CursorState>>,
     /// Most recent table-stream bridge error (valid until the next bridge call).
     ts_last_error: Mutex<Option<CString>>,
 }
 
 /// Per-cursor state for an open streaming scan.
+///
+/// `extension` is `Arc<str>` and `col_codes` is `Arc<[u8]>` so every
+/// `ducklink_ts_fill` — which today runs 2048 rows per call, thousands of
+/// times per scan — can capture them via one atomic refcount bump each,
+/// instead of the `String::clone` + `Vec::clone` the pre-G3 shape paid on
+/// every fill.
 struct CursorState {
-    extension: String,
+    extension: Arc<str>,
     /// The table function's callback handle (passed to next/close).
     handle: u32,
     /// The component-side cursor handle returned by open.
     component_cursor: u32,
     /// Type codes of the emitted (post-projection) columns, in emit order.
-    col_codes: Vec<u8>,
+    col_codes: Arc<[u8]>,
 }
 
 /// Sentinel prefix the parser bridge returns for a `LOAD WASM '<arg>'` statement.
@@ -71,9 +85,9 @@ static CURSOR_SEQ: AtomicU32 = AtomicU32::new(1);
 fn advanced_or_init(engine: &Arc<Engine2>) -> &'static Advanced {
     ADVANCED.get_or_init(|| Advanced {
         engine: engine.clone(),
-        parsers: Mutex::new(Vec::new()),
-        optimizers: Mutex::new(Vec::new()),
-        filterable: Mutex::new(HashMap::new()),
+        parsers: RwLock::new(Vec::new()),
+        optimizers: RwLock::new(Vec::new()),
+        filterable: RwLock::new(HashMap::new()),
         cursors: Mutex::new(HashMap::new()),
         ts_last_error: Mutex::new(None),
     })
@@ -135,7 +149,7 @@ pub fn register(db: ffi::duckdb_database, engine: &Arc<Engine2>, loaded: &Loaded
 
     if !loaded.parsers.is_empty() {
         {
-            let mut guard = adv.parsers.lock().expect("advanced parsers mutex poisoned");
+            let mut guard = adv.parsers.write().expect("advanced parsers lock poisoned");
             for parser in &loaded.parsers {
                 guard.push((parser.extension.clone(), parser.callback_handle));
             }
@@ -148,7 +162,7 @@ pub fn register(db: ffi::duckdb_database, engine: &Arc<Engine2>, loaded: &Loaded
 
     if !loaded.optimizers.is_empty() {
         {
-            let mut guard = adv.optimizers.lock().expect("advanced optimizers mutex poisoned");
+            let mut guard = adv.optimizers.write().expect("advanced optimizers lock poisoned");
             for rule in &loaded.optimizers {
                 guard.push((rule.extension.clone(), rule.callback_handle));
             }
@@ -173,7 +187,7 @@ pub fn register(db: ffi::duckdb_database, engine: &Arc<Engine2>, loaded: &Loaded
             .collect::<Vec<_>>()
             .join("\n");
         {
-            let mut guard = adv.filterable.lock().expect("advanced filterable mutex poisoned");
+            let mut guard = adv.filterable.write().expect("advanced filterable lock poisoned");
             guard.insert(
                 table.callback_handle,
                 (
@@ -287,7 +301,7 @@ unsafe fn ducklink_ts_open_impl(
         None => return 0,
     };
     let (extension, columns) = {
-        let guard = adv.filterable.lock().expect("advanced filterable mutex poisoned");
+        let guard = adv.filterable.read().expect("advanced filterable lock poisoned");
         match guard.get(&handle) {
             Some((ext, cols)) => (ext.clone(), cols.clone()),
             None => {
@@ -356,13 +370,16 @@ unsafe fn ducklink_ts_open_impl(
     };
 
     let cursor_id = CURSOR_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Wrap the per-cursor identity fields as Arc so every subsequent
+    // `ducklink_ts_fill` (thousands of calls per scan) captures them via a
+    // refcount bump instead of a String / Vec clone.
     adv.cursors.lock().expect("cursors mutex poisoned").insert(
         cursor_id,
         CursorState {
-            extension,
+            extension: Arc::from(extension),
             handle,
             component_cursor,
-            col_codes,
+            col_codes: Arc::from(col_codes),
         },
     );
     cursor_id
@@ -388,14 +405,17 @@ unsafe fn ducklink_ts_fill_impl(_handle: u32, cursor: u32, chunk: *mut c_void) -
         ts_set_last_error("ducklink_ts_fill: null chunk".to_string());
         return false;
     }
+    // G3: extension and col_codes are Arc-wrapped in CursorState, so clone()
+    // here is one atomic refcount bump each — no String / Vec allocation on
+    // the fill hot path.
     let (extension, handle, component_cursor, col_codes) = {
         let guard = adv.cursors.lock().expect("cursors mutex poisoned");
         match guard.get(&cursor) {
             Some(s) => (
-                s.extension.clone(),
+                Arc::clone(&s.extension),
                 s.handle,
                 s.component_cursor,
-                s.col_codes.clone(),
+                Arc::clone(&s.col_codes),
             ),
             None => {
                 ts_set_last_error(format!("ducklink_ts_fill: unknown cursor {cursor}"));
@@ -595,8 +615,8 @@ unsafe fn ducklink_optimizer_try_rewrite_impl(
     let handles = {
         let guard = adv
             .optimizers
-            .lock()
-            .expect("advanced optimizers mutex poisoned");
+            .read()
+            .expect("advanced optimizers lock poisoned");
         if guard.is_empty() {
             return std::ptr::null_mut();
         }
@@ -664,7 +684,7 @@ unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
         None => return std::ptr::null_mut(),
     };
     let handles = {
-        let guard = adv.parsers.lock().expect("advanced parsers mutex poisoned");
+        let guard = adv.parsers.read().expect("advanced parsers lock poisoned");
         if guard.is_empty() {
             return std::ptr::null_mut();
         }
