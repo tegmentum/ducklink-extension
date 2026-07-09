@@ -403,25 +403,21 @@ impl Engine2 {
         row_index: u64,
         args: Vec<reg::DuckValue>,
     ) -> Result<reg::DuckValue> {
-        let (extension, dispatcher_handle, maybe_instance) = {
+        let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (
-                Arc::clone(&entry.extension),
-                entry.dispatcher_handle,
-                entry.instance.upgrade(),
-            )
-        };
-        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
-        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
-        // back to `instance_arc()` only if the Weak was never populated (e.g.
-        // via the standalone `ducklink` host) or the instance has been unloaded
-        // since. In either case dispatch is unchanged from the caller's view.
-        let instance_arc = match maybe_instance {
-            Some(arc) => arc,
-            None => self.instance_arc(&extension)?,
+            let dispatcher_handle = entry.dispatcher_handle;
+            // F3-b fast path: if the Weak upgrades we hold the instance Arc
+            // directly — no HashMap lookup, no Arc<str> clone. Only when the
+            // Weak has never been populated (standalone host) or the instance
+            // has been unloaded do we fall back to `instance_arc()` and pay
+            // for the name string reference.
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
         };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_args: Vec<extension_types::Duckvalue> =
@@ -447,25 +443,21 @@ impl Engine2 {
         base_row_index: u64,
         wit_rows: &Vec<Vec<extension_types::Duckvalue>>,
     ) -> Result<Vec<extension_types::Duckvalue>> {
-        let (extension, dispatcher_handle, maybe_instance) = {
+        let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (
-                Arc::clone(&entry.extension),
-                entry.dispatcher_handle,
-                entry.instance.upgrade(),
-            )
-        };
-        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
-        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
-        // back to `instance_arc()` only if the Weak was never populated (e.g.
-        // via the standalone `ducklink` host) or the instance has been unloaded
-        // since. In either case dispatch is unchanged from the caller's view.
-        let instance_arc = match maybe_instance {
-            Some(arc) => arc,
-            None => self.instance_arc(&extension)?,
+            let dispatcher_handle = entry.dispatcher_handle;
+            // F3-b fast path: if the Weak upgrades we hold the instance Arc
+            // directly — no HashMap lookup, no Arc<str> clone. Only when the
+            // Weak has never been populated (standalone host) or the instance
+            // has been unloaded do we fall back to `instance_arc()` and pay
+            // for the name string reference.
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
         };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
@@ -488,25 +480,21 @@ impl Engine2 {
         base_row_index: u64,
         args: &[extension_column_types::Colvec],
     ) -> Result<extension_column_types::Colvec> {
-        let (extension, dispatcher_handle, maybe_instance) = {
+        let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (
-                Arc::clone(&entry.extension),
-                entry.dispatcher_handle,
-                entry.instance.upgrade(),
-            )
-        };
-        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
-        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
-        // back to `instance_arc()` only if the Weak was never populated (e.g.
-        // via the standalone `ducklink` host) or the instance has been unloaded
-        // since. In either case dispatch is unchanged from the caller's view.
-        let instance_arc = match maybe_instance {
-            Some(arc) => arc,
-            None => self.instance_arc(&extension)?,
+            let dispatcher_handle = entry.dispatcher_handle;
+            // F3-b fast path: if the Weak upgrades we hold the instance Arc
+            // directly — no HashMap lookup, no Arc<str> clone. Only when the
+            // Weak has never been populated (standalone host) or the instance
+            // has been unloaded do we fall back to `instance_arc()` and pay
+            // for the name string reference.
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
         };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
@@ -526,25 +514,21 @@ impl Engine2 {
         callback_handle: u32,
         args: Vec<reg::DuckValue>,
     ) -> Result<Vec<Vec<extension_types::Duckvalue>>> {
-        let (extension, dispatcher_handle, maybe_instance) = {
+        let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (
-                Arc::clone(&entry.extension),
-                entry.dispatcher_handle,
-                entry.instance.upgrade(),
-            )
-        };
-        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
-        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
-        // back to `instance_arc()` only if the Weak was never populated (e.g.
-        // via the standalone `ducklink` host) or the instance has been unloaded
-        // since. In either case dispatch is unchanged from the caller's view.
-        let instance_arc = match maybe_instance {
-            Some(arc) => arc,
-            None => self.instance_arc(&extension)?,
+            let dispatcher_handle = entry.dispatcher_handle;
+            // F3-b fast path: if the Weak upgrades we hold the instance Arc
+            // directly — no HashMap lookup, no Arc<str> clone. Only when the
+            // Weak has never been populated (standalone host) or the instance
+            // has been unloaded do we fall back to `instance_arc()` and pay
+            // for the name string reference.
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
         };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_args: Vec<extension_types::Duckvalue> =
@@ -567,25 +551,21 @@ impl Engine2 {
         callback_handle: u32,
         rows: Vec<Vec<reg::DuckValue>>,
     ) -> Result<reg::DuckValue> {
-        let (extension, dispatcher_handle, maybe_instance) = {
+        let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (
-                Arc::clone(&entry.extension),
-                entry.dispatcher_handle,
-                entry.instance.upgrade(),
-            )
-        };
-        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
-        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
-        // back to `instance_arc()` only if the Weak was never populated (e.g.
-        // via the standalone `ducklink` host) or the instance has been unloaded
-        // since. In either case dispatch is unchanged from the caller's view.
-        let instance_arc = match maybe_instance {
-            Some(arc) => arc,
-            None => self.instance_arc(&extension)?,
+            let dispatcher_handle = entry.dispatcher_handle;
+            // F3-b fast path: if the Weak upgrades we hold the instance Arc
+            // directly — no HashMap lookup, no Arc<str> clone. Only when the
+            // Weak has never been populated (standalone host) or the instance
+            // has been unloaded do we fall back to `instance_arc()` and pay
+            // for the name string reference.
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
         };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
@@ -608,25 +588,21 @@ impl Engine2 {
         callback_handle: u32,
         args: &[extension_column_types::Colvec],
     ) -> Result<reg::DuckValue> {
-        let (extension, dispatcher_handle, maybe_instance) = {
+        let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
-            (
-                Arc::clone(&entry.extension),
-                entry.dispatcher_handle,
-                entry.instance.upgrade(),
-            )
-        };
-        // F3-b fast path: if the Weak on the CallbackEntry upgraded, we already
-        // hold the Arc<Mutex<Instance>> — no second HashMap lookup needed. Fall
-        // back to `instance_arc()` only if the Weak was never populated (e.g.
-        // via the standalone `ducklink` host) or the instance has been unloaded
-        // since. In either case dispatch is unchanged from the caller's view.
-        let instance_arc = match maybe_instance {
-            Some(arc) => arc,
-            None => self.instance_arc(&extension)?,
+            let dispatcher_handle = entry.dispatcher_handle;
+            // F3-b fast path: if the Weak upgrades we hold the instance Arc
+            // directly — no HashMap lookup, no Arc<str> clone. Only when the
+            // Weak has never been populated (standalone host) or the instance
+            // has been unloaded do we fall back to `instance_arc()` and pay
+            // for the name string reference.
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
         };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let result = instance
