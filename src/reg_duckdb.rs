@@ -1522,6 +1522,137 @@ impl ColNativeState {
         self.n += 1;
     }
 
+    /// Bulk-append the ENTIRE input chunk into this state's per-column
+    /// accumulators. This is the H1 fast path — fires only when every state
+    /// pointer in the `states` array is the same (the ungrouped `SELECT
+    /// agg(f(x)) FROM t` shape, which is the dominant real workload). For
+    /// primitive columns this is one `Vec::extend_from_slice` from the DuckDB
+    /// flat vector (a single memcpy per column, no per-row branch, no per-row
+    /// FFI validity read). NULL handling stays lazy: the validity mask is
+    /// materialised only if the input actually contains NULLs, then the NULL
+    /// bits are translated into the accumulator's mask (still O(n) but pays
+    /// nothing on the all-valid common case).
+    ///
+    /// TEXT/BLOB fall back to per-row `push_row` since each cell owns its
+    /// String/Vec<u8> allocation; the primitive win covers ~99% of aggregate
+    /// input types in practice.
+    ///
+    /// # Safety
+    /// Every `vectors[c]` must be a DuckDB flat vector storing
+    /// `arg_codes[c]`-typed values covering at least `n` rows;
+    /// `validities[c]` (if non-null) must cover at least `n` rows.
+    unsafe fn append_chunk(
+        &mut self,
+        arg_codes: &[u8],
+        vectors: &[ffi::duckdb_vector],
+        validities: &[*const u64],
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+        // TEXT/BLOB break the primitive fast path (variable-length storage,
+        // per-cell allocation). If any column is TEXT/BLOB, fall back to the
+        // per-row path — still uses the same accumulators, no boxing / no
+        // Vec-per-row.
+        let has_varlen = arg_codes.iter().any(|&c| matches!(c, T_TEXT | T_BLOB));
+        if has_varlen {
+            for row in 0..n {
+                self.push_row(arg_codes, vectors, validities, row);
+            }
+            return;
+        }
+
+        let base = self.n;
+        for c in 0..arg_codes.len() {
+            let code = arg_codes[c];
+            let vec = vectors[c];
+            let data = ffi::duckdb_vector_get_data(vec);
+
+            // One memcpy per column, no per-row branch, no per-row FFI hit.
+            macro_rules! bulk_prim {
+                ($variant:ident, $ty:ty) => {{
+                    if let ColvecColumn::$variant(v) = &mut self.columns[c] {
+                        let src = std::slice::from_raw_parts(data as *const $ty, n);
+                        v.extend_from_slice(src);
+                    }
+                }};
+            }
+            match code {
+                T_I64 => bulk_prim!(Int64, i64),
+                T_U64 => bulk_prim!(Uint64, u64),
+                T_F64 => bulk_prim!(Float64, f64),
+                T_BOOL => bulk_prim!(Boolean, bool),
+                T_I8 => bulk_prim!(Int8, i8),
+                T_I16 => bulk_prim!(Int16, i16),
+                T_I32 => bulk_prim!(Int32, i32),
+                T_U8 => bulk_prim!(Uint8, u8),
+                T_U16 => bulk_prim!(Uint16, u16),
+                T_U32 => bulk_prim!(Uint32, u32),
+                T_F32 => bulk_prim!(Float32, f32),
+                T_TIMESTAMP => bulk_prim!(Timestamp, i64),
+                T_DATE => bulk_prim!(Date, i32),
+                T_TIME => bulk_prim!(Time, i64),
+                T_TIMESTAMPTZ => bulk_prim!(Timestamptz, i64),
+                _ => {
+                    // Unreachable: supports_col_native_agg gates construction
+                    // to the arms above (has_varlen check already caught TEXT
+                    // and BLOB). Falling through as a no-op would drift row
+                    // counts, so panic — this is a programming error.
+                    unreachable!("append_chunk primitive arm reached with code {code}");
+                }
+            }
+
+            // Validity: pay nothing on the all-valid common case (validity
+            // pointer null OR no NULL bits in a bulk word-scan). Otherwise
+            // translate the DuckDB bit-mask into our accumulator's mask.
+            let validity = validities[c];
+            if !validity.is_null() {
+                // Bulk word-scan for any NULL in [0, n). Same trick
+                // `read_col_to_colvec` uses to skip the mark loop when the
+                // column *could* hold NULLs but this chunk doesn't.
+                if validity_has_any_null(validity, n) {
+                    self.merge_input_validity(c, base, validity, n);
+                }
+            }
+        }
+        self.n += n;
+    }
+
+    /// Copy `n` bits from the DuckDB validity bit-mask `src` into
+    /// `self.validity[c]` starting at `base`. Materialises the accumulator
+    /// mask if needed (lazy — first NULL). Only cleared (NULL) bits are
+    /// touched; the accumulator's default all-1s pattern already covers
+    /// valid rows.
+    ///
+    /// # Safety
+    /// `src` must be non-null and cover at least `n` rows.
+    unsafe fn merge_input_validity(
+        &mut self,
+        c: usize,
+        base: usize,
+        src: *const u64,
+        n: usize,
+    ) {
+        // Ensure the accumulator mask covers positions [0, base + n).
+        let need_bytes = (base + n + 7) / 8;
+        if self.validity[c].is_empty() {
+            self.validity[c] = vec![0xFFu8; need_bytes];
+        } else if self.validity[c].len() < need_bytes {
+            self.validity[c].resize(need_bytes, 0xFFu8);
+        }
+        // Walk `n` bits of the input validity; clear the corresponding
+        // accumulator bit for each NULL row. A byte-at-a-time inner loop
+        // suffices — the outer `validity_has_any_null` gate already ruled
+        // out the common all-valid case.
+        for row in 0..n {
+            if !ffi::duckdb_validity_row_is_valid(src as *mut u64, row as u64) {
+                let dst_row = base + row;
+                self.validity[c][dst_row >> 3] &= !(1u8 << (dst_row & 7));
+            }
+        }
+    }
+
     /// Ensure `validity[c]` has bits allocated for the current accumulated
     /// row count, then clear the bit for the next row (which is about to be
     /// appended). Grows the mask by whole bytes as needed.
@@ -2333,6 +2464,43 @@ unsafe extern "C" fn agg_update(
             .iter()
             .map(|&v| ffi::duckdb_vector_get_validity(v) as *const u64)
             .collect();
+        // H1 fast path: when every row in the chunk targets the SAME state
+        // pointer (the ungrouped `SELECT agg(f(x)) FROM t` shape — the whole
+        // aggregate accumulates into one group), we can bulk-copy the whole
+        // chunk into that group's accumulator instead of pushing one row at a
+        // time. Detection is a single-pass pointer-equality scan; on the
+        // uniform-state case it costs O(n) reads with no branch and unlocks
+        // an O(n) memcpy per column instead of O(n) individual Vec::push
+        // calls.
+        //
+        // GROUP BY chunks with mixed pointers fall through to the per-row
+        // loop unchanged.
+        let uniform_state = if n > 0 {
+            let first = *states.add(0);
+            (1..n).all(|r| *states.add(r) == first)
+        } else {
+            true
+        };
+        if uniform_state && n > 0 {
+            let st = *states.add(0);
+            let group = &mut **(st as *mut *mut AggState);
+            if let AggState::ColNative(state) = group {
+                state.append_chunk(&extra.arg_codes, &vectors, &validities, n);
+                return;
+            }
+            // RowMajor uniform-state: still row-major (need per-row
+            // DuckValue), but at least avoid the per-row states.add() FFI.
+            if let AggState::RowMajor(rows) = group {
+                for row in 0..n {
+                    let argrow: Vec<reg::DuckValue> = (0..ncols)
+                        .map(|c| read_arg_raw(extra.arg_codes[c], vectors[c], row))
+                        .collect();
+                    rows.push(argrow);
+                }
+                return;
+            }
+        }
+
         for row in 0..n {
             // The state for this input row (states is parallel to the input chunk).
             let st = *states.add(row);
