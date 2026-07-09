@@ -66,28 +66,56 @@ mod bundled {
             .expect("register components");
 
         const N: u64 = 1_000_000; // ~488 chunks of STANDARD_VECTOR_SIZE
-        let sql = format!("SELECT sum(sample_plus_one(i)) FROM range({N}) t(i)");
+
+        // ----- Scalar: WASM sample_plus_one vs native `i + 1` -----
+        //
+        // Both queries return the same result: sum of (i+1) over range(N).
+        // The DIFFERENCE is what a WASM scalar dispatch costs vs a native
+        // arithmetic expression — DuckDB's SQL optimizer + vectorized
+        // executor for `i + 1` is the ceiling we're comparing to.
+        let wasm_scalar_sql = format!("SELECT sum(sample_plus_one(i)) FROM range({N}) t(i)");
+        let native_scalar_sql = format!("SELECT sum(i + 1) FROM range({N}) t(i)");
 
         let mut group = c.benchmark_group("scalar_query");
         group.throughput(Throughput::Elements(N));
         group.bench_function("plus_one_sum_1M", |b| {
             b.iter(|| {
-                let s: i64 = con.query_row(&sql, [], |r| r.get(0)).expect("query");
+                let s: i64 = con.query_row(&wasm_scalar_sql, [], |r| r.get(0)).expect("wasm scalar");
+                black_box(s);
+            });
+        });
+        group.bench_function("plus_one_sum_1M_native", |b| {
+            b.iter(|| {
+                let s: i64 = con.query_row(&native_scalar_sql, [], |r| r.get(0)).expect("native scalar");
                 black_box(s);
             });
         });
         group.finish();
 
-        // Aggregate hot path: `sample_sum` accumulates every input row's argument
-        // tuple in per-group state (`update`), then crosses into the component once
-        // at `finalize`. This is the per-row marshalling cost the raw-C aggregate
-        // bridge pays; benched at the same scale so the two paths are comparable.
-        let agg_sql = format!("SELECT sample_sum(i) FROM range({N}) t(i)");
+        // ----- Aggregate: WASM sample_sum vs native `sum` -----
+        //
+        // `sample_sum` accumulates every input row's argument tuple in
+        // per-group state (`update`), then crosses into the component
+        // once at `finalize`. Native `sum` is DuckDB's built-in vectorized
+        // aggregate — the ceiling we're comparing to.
+        let wasm_agg_sql = format!("SELECT sample_sum(i) FROM range({N}) t(i)");
+        let native_agg_sql = format!("SELECT sum(i) FROM range({N}) t(i)");
         let mut agg_group = c.benchmark_group("aggregate_query");
         agg_group.throughput(Throughput::Elements(N));
         agg_group.bench_function("sample_sum_1M", |b| {
             b.iter(|| {
-                let s: i64 = con.query_row(&agg_sql, [], |r| r.get(0)).expect("agg query");
+                let s: i64 = con.query_row(&wasm_agg_sql, [], |r| r.get(0)).expect("wasm agg");
+                black_box(s);
+            });
+        });
+        agg_group.bench_function("sample_sum_1M_native", |b| {
+            // DuckDB's `sum(i64)` returns HUGEINT (i128), so query into that
+            // via a String cast to keep the type-agnostic query_row shape.
+            let native_agg_sql_cast = format!(
+                "SELECT CAST(sum(i) AS BIGINT) FROM range({N}) t(i)"
+            );
+            b.iter(|| {
+                let s: i64 = con.query_row(&native_agg_sql_cast, [], |r| r.get(0)).expect("native agg");
                 black_box(s);
             });
         });
