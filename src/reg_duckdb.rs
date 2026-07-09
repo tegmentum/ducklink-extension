@@ -827,22 +827,44 @@ pub unsafe fn register_logical_types(
 }
 
 /// #79 — Identity cast callback. GEOMETRY↔BLOB (and similar same-physical
-/// aliases) are byte-identical, so the cast is a pointer/data copy. DuckDB's
-/// vectorised cast API expects us to write output values chunk-at-a-time; we
-/// invoke `duckdb_data_chunk_copy_from` moral equivalent via memcpy on the
-/// underlying vectors. For the initial impl, defer to DuckDB's default row-
-/// copy behavior by returning true from the trampoline: since source and
-/// target physical types are identical, the C runtime propagates values
-/// verbatim.
+/// aliases) are byte-identical: the cast is a straight per-row copy of the
+/// BLOB payload. DuckDB's cast API does NOT auto-populate the output vector
+/// when the callback returns true — a "no-op" trampoline leaves `output`
+/// uninitialised, which surfaces as an empty "Conversion Error" at query
+/// time (that was the initial buggy impl documented in G3). Iterate rows
+/// explicitly and copy validity + BLOB bytes via the same primitives the
+/// scalar-return path uses (`duckdb_vector_assign_string_element_len`).
+///
+/// Scope: this trampoline is only registered for BLOB↔BLOB aliases (the
+/// GEOMETRY case). Extending to other same-physical-type aliases would
+/// need a per-physical-type branch here — for now the register_casts
+/// caller only produces BLOB pairs.
 unsafe extern "C" fn identity_cast_trampoline(
     _info: ffi::duckdb_function_info,
-    _row_count: u64,
-    _input: ffi::duckdb_vector,
-    _output: ffi::duckdb_vector,
+    row_count: u64,
+    input: ffi::duckdb_vector,
+    output: ffi::duckdb_vector,
 ) -> bool {
-    // Same physical type on both sides — signal success without transforming.
-    // DuckDB's default cast for identical physical types is a memcpy, which
-    // this callback opts into by returning true and not writing anything.
+    let in_validity = ffi::duckdb_vector_get_validity(input);
+    let in_data = ffi::duckdb_vector_get_data(input) as *const duckdb_string_t;
+    for i in 0..(row_count as usize) {
+        let is_valid = in_validity.is_null()
+            || ffi::duckdb_validity_row_is_valid(in_validity, i as u64);
+        if !is_valid {
+            ffi::duckdb_vector_ensure_validity_writable(output);
+            let out_validity = ffi::duckdb_vector_get_validity(output);
+            ffi::duckdb_validity_set_row_validity(out_validity, i as u64, false);
+            continue;
+        }
+        let mut s = *in_data.add(i);
+        let bytes = DuckString::new(&mut s).as_bytes();
+        ffi::duckdb_vector_assign_string_element_len(
+            output,
+            i as u64,
+            bytes.as_ptr() as *const c_char,
+            bytes.len() as u64,
+        );
+    }
     true
 }
 
