@@ -91,16 +91,44 @@ Native costs:
 
 ## Which components to prioritise
 
+**First filter: don't rebundle capabilities that already exist as native community extensions.**
+
+Many ducklink corpus components are WASM reimplementations of things that already exist natively — hash functions, base64, hex, some timestamp parsers, various encodings. For those, ducklink's WASM version has real value (portable, sandboxed, dynamic-load), but a native version would just duplicate work someone else already did. Bad citizenship, no unique value, and it splinters the ecosystem.
+
+Before any native build, check:
+- DuckDB core (already ships common ops)
+- duckdb/community-extensions (existing native extensions)
+- Ubiquitous ecosystem packages (arrow, icu, etc.)
+
+If a native equivalent exists, ducklink keeps the WASM version for its distinct properties, and we don't ship a native duplicate.
+
+**Second filter: does the perf gap actually matter?**
+
 Best return on the effort (in decreasing order):
 
-1. **High call frequency + tight compute**: validators (aba, credit-card checksums), encoders (base58, ascii85, bech32), hashes.
-2. **String manipulation over large row sets**: encoding conversions, sanitisers.
-3. **Numeric transforms on many rows**: unit conversions, geohash, currency math.
+1. **High call frequency + tight compute + no native equivalent**: niche validators (aba US bank routing, iban, country-specific IDs), specialty encoders (base45 for EU digital certs, bech32, ascii85, bencode).
+2. **String manipulation over large row sets with no existing native**.
+3. **Domain-specific transforms** the ecosystem doesn't cover.
 
 Not worth the effort:
-- I/O-bound extensions (network, filesystem) — WASM overhead dominated by I/O anyway.
+- **Duplicates of existing native community extensions** (per rule above).
+- I/O-bound extensions — WASM overhead dominated by I/O anyway.
 - Rarely-called extensions — 30× on 100 calls/day is meaningless.
-- Extensions with heavy per-call work — WASM overhead is amortised, ratio drops to 2-5×.
+- Heavy per-call work — WASM overhead is amortised, ratio drops to 2-5×.
+
+## Publishing scope
+
+Aim for **1-2 flagship native extensions**, not a systematic native-ify pass.
+
+- Pilot with a single perf-sensitive, unique capability (aba is a strong candidate — no native equivalent, tight-loop checksum, real-world use case).
+- Measure the ratio, publish it, prove the pattern works.
+- Publish the pattern (this doc + working code) so anyone who needs a native version of a specific component can build one themselves.
+- Don't proactively native-ify the rest of the corpus. The catalog stays WASM-only.
+
+Explicitly rejected:
+- **One giant `ducklink-native` bundle** (all 216 components in one extension): monolithic, no unloading, contradicts DuckDB's per-capability extension model, cross-cuts the two user experiences.
+- **Category bundles** (validators, encoders, hashes, etc.): still ~5-10 extensions to maintain, category boundaries are arbitrary, and each category still needs the "does a native equivalent already exist" filter applied.
+- **Systematic per-component publishing** (216 native extensions): unmaintainable, community-extensions maintainers wouldn't accept the review load, users can't find what they need.
 
 ## What this repo does
 
