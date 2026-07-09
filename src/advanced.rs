@@ -670,26 +670,22 @@ unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
         Err(_) => return std::ptr::null_mut(),
     };
 
-    // `LOAD WASM '<name-or-path>'` — the advanced-tier statement that loads a
-    // component AT RUNTIME from SQL, the native analogue of the host's
-    // execute-level `LOAD WASM`. DuckDB's built-in parser rejects it (the `WASM`
-    // keyword is ours), so it reaches this ParserExtension. We return a SENTINEL
-    // rewrite (`LOAD_WASM_SENTINEL` + the argument); the C++ plan path recognizes
-    // it and calls `ducklink_load_wasm` with the parser's LIVE `context.db`,
-    // which loads the component and registers its functions on the connection the
-    // statement is actually running on (so they resolve in the NEXT statement).
-    if let Some(arg) = parse_load_wasm(&query) {
-        let sentinel = format!("{LOAD_WASM_SENTINEL}{arg}");
-        return CString::new(sentinel)
-            .map(|c| c.into_raw())
-            .unwrap_or(std::ptr::null_mut());
-    }
-
-    // `LOAD NATIVE '<name>'` — companion to `LOAD WASM`. Same sentinel
-    // pipeline: return a marker + arg; the C++ plan path recognizes it and
-    // calls `ducklink_load_native` with the live `context.db`.
-    if let Some(arg) = parse_load_native(&query) {
-        let sentinel = format!("{LOAD_NATIVE_SENTINEL}{arg}");
+    // `DUCKLINK LOAD '<name>' [WASM|NATIVE]` — the advanced-tier statement that
+    // loads a component (WASM by default, native when explicit) at runtime from
+    // SQL. DuckDB's built-in parser rejects it (the `DUCKLINK` keyword is ours),
+    // so it reaches this ParserExtension. We return a SENTINEL rewrite
+    // (a per-kind sentinel + the argument); the C++ plan path recognizes it and
+    // dispatches to `ducklink_load_wasm` or `ducklink_load_native` with the
+    // parser's LIVE `context.db`.
+    //
+    // Default kind is WASM because WASM is the safer trust posture (sandboxed;
+    // no `allow_unsigned_extensions` change required). Users force native with
+    // an explicit trailing `NATIVE` keyword, accepting the trust trade.
+    if let Some((name, kind)) = parse_ducklink_load(&query) {
+        let sentinel = match kind {
+            LoadKind::Wasm => format!("{LOAD_WASM_SENTINEL}{name}"),
+            LoadKind::Native => format!("{LOAD_NATIVE_SENTINEL}{name}"),
+        };
         return CString::new(sentinel)
             .map(|c| c.into_raw())
             .unwrap_or(std::ptr::null_mut());
@@ -780,76 +776,78 @@ unsafe fn ducklink_load_wasm_impl(
     }
 }
 
-/// Recognize `LOAD WASM '<name-or-path>'` (case-insensitive on the keywords,
-/// optional trailing `;`/whitespace) and return the quoted argument. Total and
-/// allocation-light: any statement that is not exactly this shape returns
-/// `None`, so a normal `LOAD <ext>` or any other rejected statement falls
-/// through to the component parser path unchanged.
-fn parse_load_wasm(sql: &str) -> Option<String> {
-    let s = sql.trim().trim_end_matches(';').trim();
-    // Split off the leading `LOAD` keyword (case-insensitive).
-    let rest = s.strip_prefix("LOAD").or_else(|| s.strip_prefix("load")).or_else(|| {
-        // Mixed case: compare the first 4 chars case-insensitively.
-        if s.len() >= 4 && s[..4].eq_ignore_ascii_case("LOAD") {
-            Some(&s[4..])
-        } else {
-            None
-        }
-    })?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let rest = rest.trim_start();
-    // Next token must be the `WASM` keyword (case-insensitive), then whitespace.
-    if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case("WASM") {
-        return None;
-    }
-    let after = &rest[4..];
-    if !after.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let arg = after.trim();
-    // The argument must be a single-quoted string literal.
-    let inner = arg.strip_prefix('\'')?.strip_suffix('\'')?;
-    // Reject an embedded unescaped quote (would not be a single literal); the
-    // loader argument is a path or catalog name, neither of which needs quotes.
-    if inner.contains('\'') {
-        return None;
-    }
-    Some(inner.to_string())
+/// Which loader path a `DUCKLINK LOAD` statement selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadKind {
+    Wasm,
+    Native,
 }
 
-/// Recognize `LOAD NATIVE '<name>'` (case-insensitive on the keywords, optional
-/// trailing `;`/whitespace) and return the quoted name. Same shape as
-/// [`parse_load_wasm`]; kept as a separate function so the accepted keyword and
-/// the error strings stay clear.
-fn parse_load_native(sql: &str) -> Option<String> {
+/// Case-insensitive prefix strip of a keyword. Returns the remainder AFTER the
+/// keyword's characters (does not require trailing whitespace). Uses byte-
+/// indexing so it's cheap; safe because keywords are ASCII.
+fn strip_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    if s.len() >= kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw) {
+        Some(&s[kw.len()..])
+    } else {
+        None
+    }
+}
+
+/// Recognize `DUCKLINK LOAD '<name>' [WASM|NATIVE]` (case-insensitive on the
+/// keywords, optional trailing `;`/whitespace) and return the quoted argument
+/// together with the selected loader kind. Default kind is [`LoadKind::Wasm`]
+/// when the trailing keyword is omitted — WASM is the safer trust posture
+/// (sandboxed, no signature-check gate), so users have to opt into `NATIVE`
+/// explicitly.
+///
+/// Any statement that isn't exactly this shape returns `None`, so an
+/// unrecognised statement falls through to the component parser path
+/// unchanged.
+fn parse_ducklink_load(sql: &str) -> Option<(String, LoadKind)> {
     let s = sql.trim().trim_end_matches(';').trim();
-    let rest = s.strip_prefix("LOAD").or_else(|| s.strip_prefix("load")).or_else(|| {
-        if s.len() >= 4 && s[..4].eq_ignore_ascii_case("LOAD") {
-            Some(&s[4..])
-        } else {
-            None
-        }
-    })?;
+
+    // `DUCKLINK` keyword.
+    let rest = strip_keyword(s, "DUCKLINK")?;
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
     let rest = rest.trim_start();
-    // `NATIVE` keyword (case-insensitive).
-    if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("NATIVE") {
+
+    // `LOAD` keyword.
+    let rest = strip_keyword(rest, "LOAD")?;
+    if !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    let after = &rest[6..];
-    if !after.starts_with(char::is_whitespace) {
+    let rest = rest.trim_start();
+
+    // Single-quoted name.
+    let after_open = rest.strip_prefix('\'')?;
+    let quote_end = after_open.find('\'')?;
+    let name = &after_open[..quote_end];
+    if name.is_empty() {
         return None;
     }
-    let arg = after.trim();
-    let inner = arg.strip_prefix('\'')?.strip_suffix('\'')?;
-    if inner.contains('\'') {
+    let after_close = after_open[quote_end + 1..].trim_start();
+
+    // Optional trailing `WASM` / `NATIVE` keyword; default WASM.
+    let kind = if after_close.is_empty() {
+        LoadKind::Wasm
+    } else if let Some(after) = strip_keyword(after_close, "WASM") {
+        if !after.trim_start().is_empty() {
+            return None;
+        }
+        LoadKind::Wasm
+    } else if let Some(after) = strip_keyword(after_close, "NATIVE") {
+        if !after.trim_start().is_empty() {
+            return None;
+        }
+        LoadKind::Native
+    } else {
         return None;
-    }
-    Some(inner.to_string())
+    };
+
+    Some((name.to_string(), kind))
 }
 
 /// The `duckdb_version` string the extension was compiled against. Used to

@@ -3232,6 +3232,31 @@ impl VTab for WasmLoad {
             let arg_val = bind.get_parameter(0);
             let arg_str = arg_val.to_string();
 
+            // Named parameter `kind` selects the loader path:
+            //   * "wasm" (default) — resolve as a wasm component and load via
+            //     the embedded wasmtime engine, registering functions on the
+            //     runtime's persistent connection.
+            //   * "native"        — resolve a matching-platform / matching-
+            //     duckdb-version native provider, download + sha256-verify
+            //     into ducklink's native cache, and invoke DuckDB's own LOAD
+            //     on the cached path. The user must have started DuckDB with
+            //     `-unsigned` (or the equivalent SET) — we do NOT flip that
+            //     flag automatically. See docs/duckdb-upstream-custom-trusted-keys.md.
+            let kind = bind
+                .get_named_parameter("kind")
+                .map(|v| v.to_string().to_ascii_lowercase())
+                .unwrap_or_else(|| "wasm".to_string());
+            match kind.as_str() {
+                "wasm" => {}
+                "native" => return native_load(rt, bind, &arg_str),
+                other => {
+                    return Err(format!(
+                        "ducklink_load: kind must be 'wasm' or 'native', got '{other}'"
+                    )
+                    .into());
+                }
+            }
+
             let looks_like_path = arg_str.contains('/')
                 || arg_str.contains('\\')
                 || arg_str.ends_with(".wasm")
@@ -3385,11 +3410,120 @@ impl VTab for WasmLoad {
     }
 
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
-        // Optional `name :=` override; defaults to the file stem.
-        Some(vec![(
-            "name".to_string(),
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        )])
+        // Named parameters:
+        //   * `name :=`  overrides the display name (defaults to the file stem
+        //     for a path arg, or the catalog name for a name arg).
+        //   * `kind :=`  selects the loader path; 'wasm' (default) or 'native'.
+        Some(vec![
+            (
+                "name".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "kind".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+        ])
+    }
+}
+
+/// Native branch of `ducklink_load(name, kind => 'native')`.
+///
+/// Resolves the catalog entry's native provider matching this platform +
+/// DuckDB version, downloads + sha256-verifies into ducklink's native cache
+/// if missing, then invokes DuckDB's own LOAD on the cached absolute path via
+/// the runtime's persistent connection.
+///
+/// Does NOT flip `allow_unsigned_extensions`. If the user hasn't started
+/// DuckDB with `-unsigned`, the LOAD errors out with a message directing
+/// them to restart with the flag. See `docs/duckdb-upstream-custom-trusted-keys.md`
+/// for the upstream feature that will eventually eliminate this friction.
+///
+/// The reported `scalars` / `tables` / `aggregates` counts are `-1` for the
+/// native path — DuckDB's LOAD doesn't tell us which functions the extension
+/// registered, and probing the catalog before/after would race and be
+/// expensive. The sentinel makes it visible that these counts don't apply,
+/// while keeping the output column shape identical to the WASM path.
+fn native_load(
+    rt: &DucklinkRuntime,
+    bind: &BindInfo,
+    name_arg: &str,
+) -> Result<WasmLoadBind, Box<dyn std::error::Error>> {
+    let cached = crate::catalog::resolve_name_to_native(
+        name_arg,
+        crate::catalog::NATIVE_PLATFORM,
+        crate::catalog::HOST_DUCKDB_VERSION,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let path_str = cached.to_string_lossy().into_owned();
+
+    crate::events::emit("load_native_start", Some(name_arg), path_str.clone());
+
+    // Invoke DuckDB's own LOAD on the absolute cached path. Path is
+    // single-quoted; internal quotes are escaped by doubling (the same
+    // convention SQL uses for string literals).
+    let escaped = path_str.replace('\'', "''");
+    let sql = format!("LOAD '{escaped}'");
+    let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+    match con.execute(&sql, []) {
+        Ok(_) => {
+            crate::events::emit("load_native_ok", Some(name_arg), path_str.clone());
+            bind.add_result_column(
+                "name",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "path",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "scalars",
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            );
+            bind.add_result_column(
+                "tables",
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            );
+            bind.add_result_column(
+                "aggregates",
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            );
+            Ok(WasmLoadBind {
+                name: name_arg.to_string(),
+                path: path_str,
+                scalars: usize::MAX, // sentinel: "n/a" for native
+                tables: usize::MAX,
+                aggregates: usize::MAX,
+            })
+        }
+        Err(err) => {
+            let err_msg = err.to_string();
+            crate::events::emit("load_native_error", Some(name_arg), err_msg.clone());
+            let msg = if err_msg.contains("allow_unsigned_extensions")
+                || err_msg.contains("signature")
+            {
+                format!(
+                    "ducklink_load(kind='native'): '{name_arg}' was installed at {path_str} but its \
+                     signature is not trusted by this DuckDB build.\n\
+                     \n\
+                     `allow_unsigned_extensions` can only be set at DuckDB startup, not from a \
+                     running session. Restart DuckDB with `-unsigned` (or the equivalent SET at \
+                     startup), then re-run this query.\n\
+                     \n\
+                     The friction is intentional: enabling unsigned extensions is a session-wide \
+                     trust posture change and the user needs to make it explicitly. See \
+                     docs/duckdb-upstream-custom-trusted-keys.md for the upstream feature that \
+                     will remove this friction.\n\
+                     \n\
+                     Underlying DuckDB error: {err_msg}"
+                )
+            } else {
+                format!(
+                    "ducklink_load(kind='native'): DuckDB LOAD failed for '{name_arg}': {err_msg}"
+                )
+            };
+            Err(msg.into())
+        }
     }
 }
 
