@@ -1093,6 +1093,20 @@ thread_local! {
     /// once a specific function has warmed up the scratch every following
     /// chunk hits `refill_colvec`'s reuse fast path.
     static SCALAR_ARGS_SCRATCH: RefCell<Vec<Colvec>> = const { RefCell::new(Vec::new()) };
+
+    /// Per-thread input NULL-mask scratch for scalar dispatch. Previously
+    /// allocated fresh as `vec![false; len]` (~2 KB + zero-fill) any time a
+    /// chunk contained a NULL; now reuses the same buffer across chunks.
+    /// After each invoke it's left at len == 0 (so the next invoke either
+    /// stays empty on the all-valid path, or resizes/fills once). The buffer
+    /// capacity persists so the second and later NULL-bearing chunks pay
+    /// only a zero-fill, never an allocation.
+    ///
+    /// (A parallel FlatVector cache was considered but rejected: FlatVector
+    /// borrows from DataChunkHandle so it can't live in a 'static
+    /// thread_local. The per-chunk Vec churn on the FlatVector list is
+    /// <100 ns and not worth an unsafe lifetime transmute.)
+    static SCALAR_NULL_MASK_SCRATCH: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One `VScalar` impl serving every component scalar. The argument / return
@@ -1120,24 +1134,14 @@ impl VScalar for WasmScalar {
             // mask every cell). NULL-free columns -> null mask -> branch-free reads.
             let raw_chunk = input.get_ptr();
 
-            // Marshal the whole chunk column-natively, then cross into the
-            // component once. Each input column becomes ONE `Colvec` — for the
-            // primitive arms (I64/F64/BOOL/temporal/...) that's a single
-            // clear+extend into the per-thread SCALAR_ARGS_SCRATCH slot,
-            // reusing the previous chunk's allocation. No row-major
-            // `Vec<Vec<WitVal>>` scratch is materialised, and the runtime
-            // hands the colvecs straight to `call-scalar-batch-col` without
-            // its own `rows_to_colvecs` pivot.
             let arity = state.arg_codes.len();
-            // DuckDB does not propagate input NULLs to the output for these scalars
-            // (it invokes the function on NULL rows and keeps the result), so the
-            // bridge enforces SQL semantics itself: any row with a NULL input yields
-            // a NULL result, overriding whatever the component computed from the
-            // placeholder it was fed. `None` until a NULL-bearing column is seen, so
-            // the all-valid common case allocates nothing and skips the scan.
-            let mut null_mask: Option<Vec<bool>> = None;
-            let result = SCALAR_ARGS_SCRATCH.with(
-                |cell| -> Result<Colvec, Box<dyn std::error::Error>> {
+            // I1: NULL mask is stored in a per-thread scratch buffer that
+            // persists across chunks. The all-valid common case leaves it
+            // empty (zero allocation); NULL-bearing chunks resize once on
+            // the first NULL, reusing the buffer thereafter. `has_input_null`
+            // is the value we would previously read from `null_mask.is_some()`.
+            let (result, has_input_null) = SCALAR_ARGS_SCRATCH.with(
+                |cell| -> Result<(Colvec, bool), Box<dyn std::error::Error>> {
                     let mut args = cell.borrow_mut();
                     // Ensure the scratch has exactly `arity` slots. Grow with
                     // placeholder Int64 Colvecs on first use; shrink to arity
@@ -1151,47 +1155,62 @@ impl VScalar for WasmScalar {
                     } else if args.len() > arity {
                         args.truncate(arity);
                     }
-                    for (j, &code) in state.arg_codes.iter().enumerate() {
-                        // Fetch the column's validity mask once (null when no NULLs).
-                        let validity = unsafe {
-                            let v =
-                                ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
-                            ffi::duckdb_vector_get_validity(v) as *const u64
-                        };
-                        unsafe {
-                            refill_colvec(&mut args[j], code, &cols[j], validity, len);
-                        }
-                        if !validity.is_null()
-                            && unsafe { validity_has_any_null(validity, len) }
-                        {
-                            // Only pay for the Vec<bool> allocation + per-bit scan when
-                            // the column ACTUALLY contains a NULL. A common pattern is
-                            // a column that COULD hold NULLs (so DuckDB gives it a
-                            // validity mask) but the rows in the chunk are all-valid;
-                            // the bulk word scan above catches that in a handful of
-                            // u64 reads.
-                            let nm = null_mask.get_or_insert_with(|| vec![false; len]);
-                            for (i, slot) in nm.iter_mut().enumerate() {
-                                if unsafe { !row_valid(validity, i) } {
-                                    *slot = true;
+                    let has_null = SCALAR_NULL_MASK_SCRATCH.with(|nm_cell| -> bool {
+                        let mut nm_guard = nm_cell.borrow_mut();
+                        // Reset for this chunk — clears length to 0 but
+                        // keeps the underlying allocation. Chunks with no
+                        // NULLs never re-grow it; NULL-bearing chunks
+                        // resize-fill once and reuse thereafter.
+                        nm_guard.clear();
+                        for (j, &code) in state.arg_codes.iter().enumerate() {
+                            let validity = unsafe {
+                                let v = ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
+                                ffi::duckdb_vector_get_validity(v) as *const u64
+                            };
+                            unsafe {
+                                refill_colvec(&mut args[j], code, &cols[j], validity, len);
+                            }
+                            if !validity.is_null()
+                                && unsafe { validity_has_any_null(validity, len) }
+                            {
+                                // First NULL-bearing column in this chunk:
+                                // materialise the mask. Capacity from previous
+                                // chunks persists, so `resize` is amortized
+                                // to zero after the first NULL-bearing chunk
+                                // this thread ever sees.
+                                if nm_guard.is_empty() {
+                                    nm_guard.resize(len, false);
+                                }
+                                for i in 0..len {
+                                    if unsafe { !row_valid(validity, i) } {
+                                        nm_guard[i] = true;
+                                    }
                                 }
                             }
                         }
-                    }
+                        !nm_guard.is_empty()
+                    });
                     let engine = &state.engine;
-                    engine
+                    let result = engine
                         .dispatch_scalar_batch_col(state.callback_handle, 0, &args)
-                        .map_err(|e| -> Box<dyn std::error::Error> {
-                            e.to_string().into()
-                        })
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+                    Ok((result, has_null))
                 },
             )?;
 
-            // Write the whole result column at once. The primitive arms of
-            // `write_colvec` take a `slice::copy_from_slice` fast-path (one
-            // memcpy per chunk) when neither the input null_mask nor the
-            // Colvec's validity mask is set.
-            write_colvec(state.ret_code, &mut out, result, null_mask.as_deref(), len)?;
+            // Write the whole result column at once. On the all-valid path
+            // pass `None` — write_colvec's primitive arms hit the
+            // `copy_from_slice` fast-path (one memcpy per chunk). On a
+            // NULL-bearing chunk, pass the scratch's slice so any input-null
+            // row overrides the component's return with NULL.
+            if has_input_null {
+                SCALAR_NULL_MASK_SCRATCH.with(|nm_cell| -> Result<_, Box<dyn std::error::Error>> {
+                    let nm_guard = nm_cell.borrow();
+                    write_colvec(state.ret_code, &mut out, result, Some(&nm_guard[..]), len)
+                })?;
+            } else {
+                write_colvec(state.ret_code, &mut out, result, None, len)?;
+            }
             Ok(())
         })
     }
