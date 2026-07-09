@@ -155,6 +155,148 @@ and aggregates as `name(arg T, ...) -> RETURNS` and table functions as
   taxonomy for one function; look at neighbouring modules first and reuse
   existing tags where you can.
 
+## 3a. Native providers (`providers[]` with `kind: "native"`)
+
+The catalog can advertise a native `.duckdb_extension` alongside — or instead
+of — a WASM component. When an entry carries a native provider, `LOAD NATIVE
+'name'` resolves it directly to a platform-specific `.duckdb_extension` file
+and hands the cached path to DuckDB's own `LOAD`. There is no wasmtime host on
+that path; the extension is native code linked against DuckDB's C Extension
+API.
+
+Native providers live in the same `providers[]` array as WASM providers.
+The Rust struct for one is (see `src/catalog.rs`):
+
+```rust
+pub struct Provider {
+    pub id: Option<String>,               // free-form identifier
+    pub kind: Option<String>,             // "native"
+    pub content_digest: Option<String>,   // sha256 of the .duckdb_extension bytes
+    pub platform: Option<String>,         // DuckDB's convention: "osx_arm64", "linux_amd64", ...
+    pub duckdb_version: Option<String>,   // exact DuckDB version, e.g. "v1.5.4"
+    pub url: Option<String>,              // optional download URL override
+    pub status: Option<String>,           // "supported" | "deprecated" | "eol"
+    // (abi is ignored for native providers)
+}
+```
+
+### Required fields, and the strict match rule
+
+`LOAD NATIVE 'name'` resolves a native provider by an **exact** match on both
+`platform` **and** `duckdb_version`. Native `.duckdb_extension` binaries are
+tightly coupled to a specific host — a `v1.5.4`-built extension will not load
+into `v1.5.3` — so the resolver refuses anything but an exact fit. Concretely,
+a native provider is only selected when:
+
+- `kind` is exactly `"native"`, and
+- `platform` matches the host build's `NATIVE_PLATFORM` string (DuckDB's
+  convention, e.g. `"osx_arm64"`, `"osx_amd64"`, `"linux_amd64"`,
+  `"linux_arm64"`, `"linux_amd64_musl"`, `"windows_amd64"`), and
+- `duckdb_version` matches the exact DuckDB version DuckDB reports (leading
+  `v`, e.g. `"v1.5.4"`), and
+- `content_digest` is a lowercase-hex sha256 of the `.duckdb_extension` bytes.
+
+If no provider matches, the resolver emits a clear error naming the requested
+`platform/duckdb_version` and (if any native providers exist at all) listing
+the available ones — a strong hint to fall back to `ducklink_load('name')` for
+the WASM version.
+
+### `url` — optional download override
+
+If `url` is present, it is the URL the loader `GET`s to fetch the blob.
+Otherwise the loader constructs one from `NATIVE_BLOB_BASE`:
+
+```
+https://ext.ducklink.dev/native/sha256/<content_digest>/<platform>/<name>.duckdb_extension
+```
+
+Either way, the downloaded bytes' sha256 must match `content_digest` — a
+mismatch is a hard error; the corrupt blob is never cached. The verified blob
+is stored digest-keyed at
+`$XDG_CACHE_HOME/ducklink/native/sha256/<digest>/<name>.duckdb_extension`, so
+two providers that ship the same content share one cache entry.
+
+### Example: a native-only entry
+
+`ducklink_native` is the bundled reference — the curated bundle of
+perf-sensitive scalars (ABA, IBAN, ISBN, Luhn, credit-card) compiled
+directly against DuckDB's C Extension API. Its entry carries a single native
+provider and no WASM one:
+
+```json
+{
+  "name": "ducklink_native",
+  "description": "Curated native DuckDB extension bundle: perf-sensitive scalars compiled directly against duckdb-rs.",
+  "categories": ["curated"],
+  "exports": ["aba_validate", "iban_validate", "cc_validate", "..."],
+  "requires": ["scalar"],
+  "providers": [
+    {
+      "id": "native-osx-arm64-v1.5.4",
+      "kind": "native",
+      "platform": "osx_arm64",
+      "duckdb_version": "v1.5.4",
+      "content_digest": "0a02e570f7a8b538b88a2e437c66bc190d7f80474b21902e3e6abfbc677f5565",
+      "status": "supported"
+    }
+  ]
+}
+```
+
+`LOAD NATIVE 'ducklink_native'` on an `osx_arm64` DuckDB `v1.5.4` build picks
+this provider, downloads (or cache-hits) the `.duckdb_extension`, verifies its
+sha256, and hands the path to DuckDB. On any other platform or DuckDB version
+the resolver refuses with the mismatch message.
+
+### Example: an entry with both WASM and native providers
+
+An entry can advertise both a WASM component AND per-platform natives. The
+two paths coexist and are chosen by which loader the user calls:
+`ducklink_load('name')` selects a WASM provider (strict same-major on
+`abi`); `LOAD NATIVE 'name'` selects a native provider (strict-exact on
+`platform` + `duckdb_version`). A future `aba` entry could look like:
+
+```json
+{
+  "name": "aba",
+  "description": "ABA routing-number (US) checksum validation.",
+  "categories": ["validators"],
+  "exports": ["aba_validate"],
+  "requires": ["scalar"],
+  "wit_contract_version": "4.0.0",
+  "content_digest": "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15",
+  "providers": [
+    {
+      "id": "wasm-component",
+      "kind": "wasm",
+      "abi": "duckdb:extension@4.0.0",
+      "content_digest": "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15",
+      "status": "supported"
+    },
+    {
+      "id": "native-osx-arm64-v1.5.4",
+      "kind": "native",
+      "platform": "osx_arm64",
+      "duckdb_version": "v1.5.4",
+      "content_digest": "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d",
+      "status": "supported"
+    },
+    {
+      "id": "native-linux-amd64-v1.5.4",
+      "kind": "native",
+      "platform": "linux_amd64",
+      "duckdb_version": "v1.5.4",
+      "content_digest": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      "status": "supported"
+    }
+  ]
+}
+```
+
+WASM and native providers are independent: adding a native for one platform
+does not require adding it for the others, and a missing native for the
+host's platform + version simply routes the user to the WASM path.
+
 ## 4. How `ducklink_search` ranking works
 
 `ducklink_search('query')` splits the query on whitespace, lower-cases each

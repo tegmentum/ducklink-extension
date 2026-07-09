@@ -16993,6 +16993,74 @@
           "returns": "BOOLEAN"
         }
       ]
+    },
+    {
+      "name": "ducklink_native",
+      "version": "0.1.0",
+      "description": "Curated native DuckDB extension bundle: perf-sensitive scalars (ABA, IBAN, ISBN, Luhn, credit-card) compiled directly against duckdb-rs. Companion to the WASM-based ducklink loader \u2014 same pure-logic crates as each component's WASM version, native speed, no sandbox. Use for tight-loop scalar work; use ducklink's WASM modules when portability/sandboxing/dynamic-load matter more.",
+      "license": "MIT",
+      "authors": [
+        "Tegmentum"
+      ],
+      "repository": "https://github.com/tegmentum/ducklink-native",
+      "keywords": [
+        "native",
+        "bundle",
+        "aba",
+        "iban",
+        "isbn",
+        "luhn",
+        "credit-card",
+        "validator",
+        "curated"
+      ],
+      "categories": [
+        "curated"
+      ],
+      "source": "native-extension/ducklink-native",
+      "status": "working",
+      "exports": [
+        "aba_validate",
+        "aba_frb_district",
+        "aba_fed_region",
+        "iban_validate",
+        "iban_country",
+        "iban_bban",
+        "isbn_valid",
+        "isbn_normalize",
+        "luhn_validate",
+        "luhn_check_digit",
+        "cc_validate",
+        "cc_network",
+        "cc_type",
+        "cc_mask",
+        "cc_last4",
+        "cc_bin",
+        "cc_normalize"
+      ],
+      "requires": [
+        "scalar"
+      ],
+      "crates": [
+        "aba-core",
+        "iban-core",
+        "isbn-core",
+        "luhn-core",
+        "creditcard-core"
+      ],
+      "min_duckdb_version": "1.5.0",
+      "prefix": "ducklink_native",
+      "expansion": "com.tegmentum.ducklink.ducklink_native",
+      "providers": [
+        {
+          "id": "native-osx-arm64-v1.5.4",
+          "kind": "native",
+          "platform": "osx_arm64",
+          "duckdb_version": "v1.5.4",
+          "content_digest": "0a02e570f7a8b538b88a2e437c66bc190d7f80474b21902e3e6abfbc677f5565",
+          "status": "supported"
+        }
+      ]
     }
   ],
   "dotcmds": [
