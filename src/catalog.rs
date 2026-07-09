@@ -110,12 +110,20 @@ pub struct Provider {
     pub status: Option<String>,
     /// Target platform (DuckDB's convention: `"osx_arm64"`, `"linux_amd64"`,
     /// `"windows_amd64"`, ...). REQUIRED for `kind == "native"`; ignored for wasm.
-    #[serde(default)]
+    ///
+    /// Tolerant of non-string shapes so a legacy/alternate catalog format
+    /// (e.g. `"platform": {"os": "macos", "arch": "arm64"}`, seen in the current
+    /// bundled snapshot's placeholder `native` entries) parses to `None` instead
+    /// of failing the whole catalog. A `None` here disqualifies the provider
+    /// from [`CatalogEntry::select_native_provider`] — the intended outcome for
+    /// an entry lacking a DuckDB-convention platform tag.
+    #[serde(default, deserialize_with = "string_or_none")]
     pub platform: Option<String>,
     /// Target DuckDB version this native artifact was built against (e.g.
     /// `"v1.5.4"`). REQUIRED for `kind == "native"`; native `.duckdb_extension`
-    /// files are tightly coupled to a DuckDB version.
-    #[serde(default)]
+    /// files are tightly coupled to a DuckDB version. Also tolerant of
+    /// non-string shapes (mirrors `platform` above).
+    #[serde(default, deserialize_with = "string_or_none")]
     pub duckdb_version: Option<String>,
     /// Explicit download URL. Optional — when absent, native providers fall
     /// back to a standard `BLOB_BASE`-derived URL from the digest + platform.
@@ -204,6 +212,24 @@ where
     T: Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(de)?.unwrap_or_default())
+}
+
+/// Deserialize a JSON field as `Some(string)` when it is a plain string, and
+/// as `None` for anything else (an object / array / bool / number, or JSON
+/// `null`). Used on `Provider::platform` and `Provider::duckdb_version` so a
+/// legacy/alternate catalog shape (e.g. `"platform": {"os":..., "arch":...}`,
+/// present in the current bundled snapshot's placeholder `native` entries) does
+/// not fail the whole catalog parse — it silently disqualifies that provider
+/// from `select_native_provider` instead, which is the intended behaviour.
+fn string_or_none<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(de)?;
+    Ok(match v {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
 }
 
 impl CatalogEntry {
@@ -653,6 +679,16 @@ fn download_blob(digest: &str, name: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// The DuckDB library version this extension was compiled against, used to pick
+/// the matching native provider from the catalog. Native `.duckdb_extension`
+/// files are tightly coupled to a specific DuckDB version, so a strict-exact
+/// match is required. Kept in lock-step with the `libduckdb-sys` pin in
+/// `Cargo.toml` — the same version the advanced-tier C++ shim gates on. Shared
+/// with the common tier (visible to `ducklink.modules.native_available`) so the
+/// discovery view can decide native availability regardless of whether the
+/// `advanced` feature was built into this artifact.
+pub const HOST_DUCKDB_VERSION: &str = "v1.5.4";
+
 /// DuckDB's platform identifier for this build, using DuckDB's own conventions
 /// (`osx_arm64` / `osx_amd64` / `linux_amd64` / `linux_arm64` / `linux_amd64_musl`
 /// / `windows_amd64`). Used to pick the right `native` provider from the
@@ -953,6 +989,9 @@ mod tests {
             abi: Some(abi.into()),
             content_digest: Some(dig.into()),
             status: None,
+            platform: None,
+            duckdb_version: None,
+            url: None,
         };
         let entry = CatalogEntry {
             name: "multi".into(),
@@ -989,6 +1028,9 @@ mod tests {
             abi: Some(abi.into()),
             content_digest: Some(dig.into()),
             status: None,
+            platform: None,
+            duckdb_version: None,
+            url: None,
         };
         // A gen-2 entry (its wit_contract_version + provider are both gen-2).
         let gen2 = CatalogEntry {
@@ -1055,6 +1097,9 @@ mod tests {
                 abi: None,
                 content_digest: Some("nativedigest".into()),
                 status: None,
+                platform: Some("osx_arm64".into()),
+                duckdb_version: Some("v1.5.4".into()),
+                url: None,
             }],
             functions: vec![],
         };

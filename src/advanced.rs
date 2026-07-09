@@ -855,8 +855,10 @@ fn parse_load_native(sql: &str) -> Option<String> {
 /// The `duckdb_version` string the extension was compiled against. Used to
 /// select the matching native provider from the catalog. Native
 /// `.duckdb_extension` files are tightly coupled to a DuckDB version, so
-/// exact-match is required.
-const HOST_DUCKDB_VERSION: &str = "v1.5.4";
+/// exact-match is required. Re-exported from `crate::catalog` so the common
+/// tier (which decides `ducklink.modules.native_available` at bind time) shares
+/// the same version string as the advanced-tier `LOAD NATIVE` path.
+use crate::catalog::HOST_DUCKDB_VERSION;
 
 /// `LOAD NATIVE` bridge — install a native `.duckdb_extension` for the current
 /// platform + DuckDB version (downloading + sha256-verifying if missing) and

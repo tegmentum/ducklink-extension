@@ -3438,6 +3438,12 @@ struct ModuleRow {
     description: String,
     categories: String,
     loaded: bool,
+    /// `true` when the catalog entry ships a native `.duckdb_extension` provider
+    /// matching THIS host's platform + DuckDB ABI version (i.e. `LOAD NATIVE
+    /// '<name>'` would be resolvable). Independent of `loaded` — a native
+    /// artifact may be available without being loaded, and a module loaded as
+    /// wasm may still have a native provider listed in the catalog.
+    native_available: bool,
     scalars: i32,
     tables: i32,
     aggregates: i32,
@@ -3469,6 +3475,11 @@ impl VTab for WasmModules {
             bind.add_result_column("description", vc());
             bind.add_result_column("categories", vc());
             bind.add_result_column("loaded", boolean());
+            // Positioned after `loaded` so the two host-state columns sit
+            // together at the front of the row (identity -> host state ->
+            // capability details); the trailing `compatible` column stays where
+            // it is to preserve the existing column order.
+            bind.add_result_column("native_available", boolean());
             bind.add_result_column("scalars", int());
             bind.add_result_column("tables", int());
             bind.add_result_column("aggregates", int());
@@ -3483,6 +3494,17 @@ impl VTab for WasmModules {
                 .iter()
                 .map(|e| {
                     let is_loaded = loaded.contains(&e.name);
+                    // A native artifact is available IFF the catalog carries a
+                    // `kind:"native"` provider matching THIS host's platform +
+                    // DuckDB ABI. Uses the same selector `LOAD NATIVE` calls at
+                    // resolve time, so a `true` here means `ducklink_install_native`
+                    // would succeed against the current snapshot.
+                    let native_available = e
+                        .select_native_provider(
+                            crate::catalog::NATIVE_PLATFORM,
+                            crate::catalog::HOST_DUCKDB_VERSION,
+                        )
+                        .is_some();
                     // Loaded modules report EXACT live counts; unloaded ones show
                     // a coarse presence-flag (1/0) inferred from `requires`, since
                     // the catalog carries no per-function counts.
@@ -3500,6 +3522,7 @@ impl VTab for WasmModules {
                         description: e.description.clone().unwrap_or_default(),
                         categories: e.categories.join(", "),
                         loaded: is_loaded,
+                        native_available,
                         scalars,
                         tables,
                         aggregates,
@@ -3531,34 +3554,42 @@ impl VTab for WasmModules {
                 output.set_len(0);
                 return Ok(());
             }
+            // Column layout (matches the bind order):
+            //   0 name, 1 version, 2 description, 3 categories,
+            //   4 loaded, 5 native_available,
+            //   6 scalars, 7 tables, 8 aggregates,
+            //   9 capabilities, 10 compatible
             let c0 = output.flat_vector(0);
             let c1 = output.flat_vector(1);
             let c2 = output.flat_vector(2);
             let c3 = output.flat_vector(3);
-            let c8 = output.flat_vector(8);
+            let c9 = output.flat_vector(9);
             for r in 0..n {
                 let row = &bind.rows[start + r];
                 c0.insert(r, row.name.as_str());
                 c1.insert(r, row.version.as_str());
                 c2.insert(r, row.description.as_str());
                 c3.insert(r, row.categories.as_str());
-                c8.insert(r, row.capabilities.as_str());
+                c9.insert(r, row.capabilities.as_str());
             }
             // Fixed-width columns: fill the typed slices after the string inserts.
             unsafe {
                 let mut lv = output.flat_vector(4);
                 let l = lv.as_mut_slice::<bool>();
-                let mut sv = output.flat_vector(5);
+                let mut nv = output.flat_vector(5);
+                let na = nv.as_mut_slice::<bool>();
+                let mut sv = output.flat_vector(6);
                 let s = sv.as_mut_slice::<i32>();
-                let mut tv = output.flat_vector(6);
+                let mut tv = output.flat_vector(7);
                 let t = tv.as_mut_slice::<i32>();
-                let mut av = output.flat_vector(7);
+                let mut av = output.flat_vector(8);
                 let a = av.as_mut_slice::<i32>();
-                let mut cv = output.flat_vector(9);
+                let mut cv = output.flat_vector(10);
                 let c = cv.as_mut_slice::<bool>();
                 for r in 0..n {
                     let row = &bind.rows[start + r];
                     l[r] = row.loaded;
+                    na[r] = row.native_available;
                     s[r] = row.scalars;
                     t[r] = row.tables;
                     a[r] = row.aggregates;
