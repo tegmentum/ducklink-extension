@@ -612,7 +612,13 @@ fn write_colvec(
     let is_null = |i: usize| input_null(i) || result_null(i);
     // Whether ANY row is masked NULL — lets the primitive arms take the pure
     // memcpy path when the result and the inputs are all-valid.
-    let any_input_null = null_mask.map_or(false, |nm| nm.iter().any(|&b| b));
+    //
+    // Invariant from the caller (WasmScalar::invoke, post-I1): `Some(mask)`
+    // is passed IFF the SCALAR_NULL_MASK_SCRATCH loop set at least one bit to
+    // `true` (has_input_null == true). `None` is passed otherwise. So
+    // `is_some()` is provably equivalent to the `.iter().any(|&b| b)` walk it
+    // replaces — and skips a 2048-byte scan on every NULL-bearing chunk.
+    let any_input_null = null_mask.is_some();
     let has_null = !colvec_validity.is_empty() || any_input_null;
     macro_rules! prim {
         ($ty:ty, $variant:ident) => {{
