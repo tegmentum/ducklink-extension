@@ -1,6 +1,54 @@
-# WIT ABI — zero-copy scalar dispatch result buffer
+# WIT ABI — zero-copy scalar dispatch result buffer — CANCELLED
 
-**Status:** design proposal, not implemented. **Revised projection after measurement — see `perf-ceiling-measurement.md`.**
+**Status:** ⚠ **CANCELLED** — measurement showed the memcpy cost this proposal targeted is <1% of dispatch time. See `perf-ceiling-measurement.md`.
+
+## Definitive measurement
+
+The `memcpy_floor` bench in `benches/scalar_dispatch.rs` measures pure Rust `Vec::copy_from_slice` at the same sizes wasmtime handles per chunk:
+
+| Size | Roundtrip memcpy | Dispatch (real) | Memcpy as % of dispatch |
+|---|---:|---:|---:|
+| 2048 i64s (16 KB) | 822 ns | 87 µs | 0.94% |
+| 1M i64s (8 MB) | 442 µs | 45.7 ms | 0.97% |
+
+**Even if Option B eliminated the wasmtime memcpy entirely (physically impossible — Option B still requires memcpy from host to guest linear memory), the saving on the 48.5ms plus_one_sum_1M bench would be <1%.**
+
+## Where the projection went wrong (again)
+
+Both prior projections in this document were speculation dressed as analysis:
+1. **First estimate (5-7% win):** guessed at a per-chunk memcpy cost of ~2µs. Actual: 0.8µs. Off by 2x.
+2. **Second estimate (27% win):** claimed memcpy was 13ns/row × 1M = 13ms. Actual: 0.42ns/row × 1M = 442µs. Off by 30x.
+
+Both estimates were made before running the memcpy floor bench that gave the definitive answer.
+
+## Where the 43ns/row actually goes
+
+At n=1M, per-row cost is 43.57 ns/row of which memcpy roundtrip is 0.42 ns/row (~1%). The remaining ~43 ns/row is **not memcpy**:
+
+- Wasm bounds checks on linear-memory access (per load/store in the guest)
+- Canonical ABI per-element work (encoding + type-tag reads)
+- Guest computation itself (which for `x+1` also includes wasm sandboxing)
+- Store lock overhead per dispatch (amortized)
+
+Option B addresses none of these. It reshapes the memcpy that's already the smallest cost. There is no meaningful win available here.
+
+## Recommendation
+
+**Do not build Option B.** The 1000+ LOC engineering scope + guest SDK update + additive-minor WIT bump delivers <1% on the target benchmark.
+
+If more scalar throughput is genuinely needed, the leverage is elsewhere:
+- **Guest-side SIMD**: `plus_one` across 2048 i64s could vectorise 8 at a time on aarch64 SVE / x86 AVX-512. That's a per-guest optimisation (not host-side).
+- **Reduce wasm bounds checks**: wasmtime's `Config::static_memory_bound_is_maximum(true)` + a large enough static memory can lift some bounds checks. Worth measuring.
+- **AOT to native (retracted for query-time perf, but worth re-checking for load-time)**: doesn't help query time.
+
+The docs `wit-streaming-scalar-dispatch.md` and this one both propose ABI changes to reduce a cost that turned out to be ~1%. The lesson: **measure the target cost before proposing an ABI change to eliminate it.**
+
+---
+
+<details>
+<summary>Original proposal (retained for archival)</summary>
+
+**Status:** design proposal, not implemented.
 **Motivation:** perf ceiling of the current scalar hot path.
 **Cost:** additive-minor WIT bump; bindgen regen; guest SDK update; ~500-800 lines of engineering work.
 
@@ -131,3 +179,5 @@ If we want a real perf jump, the streaming path is the answer. If we want the in
 - `src/reg_duckdb.rs:1103-1198` — `WasmScalar::invoke` (host side).
 - `src/reg_duckdb.rs:1085-1096` — `SCALAR_ARGS_SCRATCH` (already reuses the host-side buffer; wasmtime still memcpys it).
 - `runtime/src/extension.rs:2413` — `dispatch_scalar_batch_col` (runtime side of the crossing).
+
+</details>

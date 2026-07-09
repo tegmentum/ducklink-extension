@@ -108,9 +108,12 @@ There is *no* interpreter-vs-native gap to close here. The 15ns/row wasm computa
 
 **Retract the v5.0.0 streaming dispatch proposal.** The projection was 20x wrong; the design as spec'd delivers no meaningful win.
 
+**Also cancel Option B (zero-copy shared memory).** A follow-up `memcpy_floor` bench definitively answered the question: pure memcpy at chunk size is <1% of dispatch cost. Option B (or any ABI change targeting memcpy) cannot deliver more than 1% on the target benchmark.
+
 **Reprioritize:**
-1. Return to `wit-shared-memory-result.md` Option B (shared memory) with the corrected 27% projection. **This is the only structural perf lever left.**
-2. Continue small-scope wins per opportunity (I1-style scratch reuse, allocator hygiene) — but recognize the ceiling is ~1-2% each.
+1. Small-scope wins per opportunity (I1-style scratch reuse, allocator hygiene) — recognize the ceiling is ~1-2% each.
+2. Guest-side optimisations if a specific workload is bottleneck: SIMD in the guest, wasmtime `Config::static_memory_bound_is_maximum` for fewer bounds checks. These are per-workload, not architectural.
+3. **The 43ns/row cost is dominated by wasm bounds checks + canonical ABI per-element work + guest computation** — no host-side lever addresses these.
 
 **Lessons for future perf work:**
 1. Always measure the fixed vs per-row breakdown before proposing an ABI change that targets crossing count. The dispatch-count-vs-per-row question is answerable in one bench.

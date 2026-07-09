@@ -204,6 +204,40 @@ fn bench_scalar_dispatch(c: &mut Criterion) {
     group.finish();
 
     // ----------------------------------------------------------------------
+    // Option B floor: pure memcpy at chunk size, no wasmtime involvement.
+    //
+    // This is the LOWER BOUND for what zero-copy WIT could achieve: even
+    // Option B has to memcpy the input data into wasm linear memory and the
+    // result out. If pure memcpy takes X ns for a 16KB block, wasmtime's
+    // canonical ABI can't be much slower than that + some fixed overhead.
+    // Comparing to `plus_one_col_i64_2048` (which includes ONE memcpy in +
+    // ONE memcpy out via canonical ABI), we can bound how much of the 86µs
+    // dispatch cost is memcpy vs canonical-ABI encoding vs guest work.
+    // ----------------------------------------------------------------------
+    let mut floor_group = c.benchmark_group("memcpy_floor");
+    for &n in &[2048usize, 16384, 1048576] {
+        let src: Vec<i64> = (0..n as i64).collect();
+        floor_group.throughput(Throughput::Bytes((n * 8) as u64));
+        floor_group.bench_function(format!("copy_i64_{n}"), |b| {
+            let mut dst = vec![0i64; n];
+            b.iter(|| {
+                dst.copy_from_slice(black_box(&src));
+                black_box(&dst);
+            });
+        });
+        floor_group.bench_function(format!("roundtrip_i64_{n}"), |b| {
+            let mut inter = vec![0i64; n];
+            let mut dst = vec![0i64; n];
+            b.iter(|| {
+                inter.copy_from_slice(black_box(&src));
+                dst.copy_from_slice(black_box(&inter));
+                black_box(&dst);
+            });
+        });
+    }
+    floor_group.finish();
+
+    // ----------------------------------------------------------------------
     // Streaming-dispatch validation (v5.0.0 proposal).
     //
     // Extrapolates the per-crossing overhead by varying the chunk size against
