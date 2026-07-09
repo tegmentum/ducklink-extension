@@ -78,6 +78,12 @@ struct CursorState {
 /// cpp/ducklink_advanced.h.
 const LOAD_WASM_SENTINEL: &str = "\u{1}ducklink:load-wasm\u{1}";
 
+/// Sentinel prefix the parser bridge returns for a `LOAD NATIVE '<arg>'`
+/// statement. The C++ plan path strips this and calls `ducklink_load_native`
+/// with the live `context.db`. Kept in lock-step with
+/// `DUCKLINK_LOAD_NATIVE_SENTINEL` in cpp/ducklink_advanced.h.
+const LOAD_NATIVE_SENTINEL: &str = "\u{1}ducklink:load-native\u{1}";
+
 static ADVANCED: OnceLock<Advanced> = OnceLock::new();
 /// Bridge-local cursor id generator (0 is reserved for "open failed").
 static CURSOR_SEQ: AtomicU32 = AtomicU32::new(1);
@@ -679,6 +685,16 @@ unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
             .unwrap_or(std::ptr::null_mut());
     }
 
+    // `LOAD NATIVE '<name>'` — companion to `LOAD WASM`. Same sentinel
+    // pipeline: return a marker + arg; the C++ plan path recognizes it and
+    // calls `ducklink_load_native` with the live `context.db`.
+    if let Some(arg) = parse_load_native(&query) {
+        let sentinel = format!("{LOAD_NATIVE_SENTINEL}{arg}");
+        return CString::new(sentinel)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+
     let adv = match ADVANCED.get() {
         Some(a) => a,
         None => return std::ptr::null_mut(),
@@ -801,6 +817,197 @@ fn parse_load_wasm(sql: &str) -> Option<String> {
         return None;
     }
     Some(inner.to_string())
+}
+
+/// Recognize `LOAD NATIVE '<name>'` (case-insensitive on the keywords, optional
+/// trailing `;`/whitespace) and return the quoted name. Same shape as
+/// [`parse_load_wasm`]; kept as a separate function so the accepted keyword and
+/// the error strings stay clear.
+fn parse_load_native(sql: &str) -> Option<String> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let rest = s.strip_prefix("LOAD").or_else(|| s.strip_prefix("load")).or_else(|| {
+        if s.len() >= 4 && s[..4].eq_ignore_ascii_case("LOAD") {
+            Some(&s[4..])
+        } else {
+            None
+        }
+    })?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    // `NATIVE` keyword (case-insensitive).
+    if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("NATIVE") {
+        return None;
+    }
+    let after = &rest[6..];
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let arg = after.trim();
+    let inner = arg.strip_prefix('\'')?.strip_suffix('\'')?;
+    if inner.contains('\'') {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
+/// The `duckdb_version` string the extension was compiled against. Used to
+/// select the matching native provider from the catalog. Native
+/// `.duckdb_extension` files are tightly coupled to a DuckDB version, so
+/// exact-match is required.
+const HOST_DUCKDB_VERSION: &str = "v1.5.4";
+
+/// `LOAD NATIVE` bridge — install a native `.duckdb_extension` for the current
+/// platform + DuckDB version (downloading + sha256-verifying if missing) and
+/// then have DuckDB load it. On success writes a summary; on error writes a
+/// human-readable message including remediation for the common
+/// `allow_unsigned_extensions=false` case.
+///
+/// The extension is NOT automatically flipped to allow unsigned loads: this
+/// crosses a session-global security posture change that the user must make
+/// explicitly. On a signature-check failure the returned summary tells the
+/// user exactly what to run (`SET allow_unsigned_extensions=true;`) and points
+/// at the upstream trust-mechanism proposal.
+///
+/// # Safety
+/// `db` must be the valid live `duckdb_database`; `name` a valid C string;
+/// `out_summary` a valid pointer to write one `*mut c_char` into.
+#[no_mangle]
+pub unsafe extern "C" fn ducklink_load_native(
+    db: *mut c_void,
+    name: *const c_char,
+    out_summary: *mut *mut c_char,
+) -> i32 {
+    guard(2, || unsafe { ducklink_load_native_impl(db, name, out_summary) })
+}
+
+unsafe fn ducklink_load_native_impl(
+    db: *mut c_void,
+    name: *const c_char,
+    out_summary: *mut *mut c_char,
+) -> i32 {
+    if name.is_null() || out_summary.is_null() || db.is_null() {
+        return 2;
+    }
+    let name_str = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            *out_summary = CString::new("LOAD NATIVE: argument is not valid UTF-8")
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+    };
+
+    // 1. Resolve + ensure cached (downloads on cache miss). Sha256-verified
+    //    against catalog digest before being cached.
+    use crate::catalog::{resolve_name_to_native, NATIVE_PLATFORM};
+    let path = match resolve_name_to_native(name_str, NATIVE_PLATFORM, HOST_DUCKDB_VERSION) {
+        Ok(p) => p,
+        Err(e) => {
+            *out_summary = CString::new(format!("LOAD NATIVE: {e}"))
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+    };
+
+    // 2. Have DuckDB do the actual LOAD. We open a sibling connection on the
+    //    live database, then run `LOAD '<absolute-path>'`. DuckDB runs the
+    //    extension's init function, wiring functions into the catalog visible
+    //    to every connection.
+    let path_str = path.to_string_lossy().into_owned();
+    let load_result = load_via_duckdb(db.cast(), &path_str);
+
+    match load_result {
+        Ok(()) => {
+            let msg = format!("installed '{name_str}' at {}", path_str);
+            crate::events::emit("load_native_ok", Some(name_str), path_str);
+            *out_summary = CString::new(msg)
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            0
+        }
+        Err(err) => {
+            // Special-case the missing-signature error so the user sees an
+            // actionable "here's what to do" message instead of DuckDB's raw
+            // exception text. We do NOT flip allow_unsigned_extensions
+            // ourselves — that's the user's explicit trust decision.
+            let msg = if err.contains("allow_unsigned_extensions")
+                || err.contains("signature")
+            {
+                format!(
+                    "LOAD NATIVE: '{name_str}' was installed at {path_str} but its signature is \
+                     not trusted by this DuckDB build.\n\
+                     \n\
+                     `allow_unsigned_extensions` can only be set at DuckDB startup, not from a \
+                     running session. To load this extension, restart DuckDB with the -unsigned \
+                     flag (or set it via the command-line/config), then:\n\
+                     \n\
+                     \tduckdb -unsigned\n\
+                     \tLOAD 'path/to/ducklink.duckdb_extension';\n\
+                     \tLOAD NATIVE '{name_str}';\n\
+                     \n\
+                     The friction is intentional: enabling unsigned extensions is a session-wide \
+                     trust posture change and the user needs to make it explicitly. See \
+                     docs/duckdb-upstream-custom-trusted-keys.md for the upstream feature that \
+                     will remove this friction.\n\
+                     \n\
+                     Underlying DuckDB error: {err}"
+                )
+            } else {
+                format!("LOAD NATIVE: DuckDB LOAD failed for '{name_str}': {err}")
+            };
+            crate::events::emit("load_native_error", Some(name_str), err);
+            *out_summary = CString::new(msg)
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            1
+        }
+    }
+}
+
+/// Open a sibling connection on the live database and run
+/// `LOAD '<absolute_path>';`. Returns the DuckDB error string on failure.
+unsafe fn load_via_duckdb(db: ffi::duckdb_database, path: &str) -> Result<(), String> {
+    // Escape single-quotes in the path (extremely unlikely but let's be right).
+    let escaped = path.replace('\'', "''");
+    let sql = format!("LOAD '{escaped}'");
+    let c_sql = CString::new(sql).map_err(|e| format!("path contains NUL: {e}"))?;
+
+    let mut conn: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(db, &mut conn) != ffi::DuckDBSuccess {
+        return Err("duckdb_connect failed".to_string());
+    }
+    struct ConnGuard(ffi::duckdb_connection);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_disconnect(&mut self.0) };
+        }
+    }
+    let _guard = ConnGuard(conn);
+
+    let mut result: ffi::duckdb_result = std::mem::zeroed();
+    let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
+    struct ResGuard<'a>(&'a mut ffi::duckdb_result);
+    impl Drop for ResGuard<'_> {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_destroy_result(self.0) };
+        }
+    }
+    let mut result_guard = ResGuard(&mut result);
+
+    if rc == ffi::DuckDBSuccess {
+        return Ok(());
+    }
+    let err_ptr = ffi::duckdb_result_error(result_guard.0 as *mut _);
+    let msg = if err_ptr.is_null() {
+        "duckdb_query failed with no error message".to_string()
+    } else {
+        CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+    };
+    Err(msg)
 }
 
 /// Free a C string returned by the advanced-tier bridge functions.

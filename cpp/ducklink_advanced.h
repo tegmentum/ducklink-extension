@@ -83,6 +83,20 @@ void ducklink_adv_free(char *ptr);
 // ducklink_adv_free) and returns 0; on error writes the message and returns != 0.
 int32_t ducklink_load_wasm(void *db, const char *path, char **out_summary);
 
+// Sentinel prefix for a `LOAD NATIVE '<name>'` statement. Same pipeline as
+// LOAD WASM but the plan path calls `ducklink_load_native` instead. Lock-step
+// with LOAD_NATIVE_SENTINEL in src/advanced.rs.
+#define DUCKLINK_LOAD_NATIVE_SENTINEL "\001ducklink:load-native\001"
+
+// LOAD NATIVE: install (download + sha256-verify + cache) a native
+// `.duckdb_extension` for the running host's platform + DuckDB version, then
+// invoke DuckDB's LOAD on the resulting absolute path. Does NOT flip
+// allow_unsigned_extensions — the user makes that trust decision themselves.
+// On success writes a malloc'd summary into *out_summary (free via
+// ducklink_adv_free) and returns 0; on error writes a human-readable message
+// (including remediation for the common unsigned-signature case) and returns != 0.
+int32_t ducklink_load_native(void *db, const char *name, char **out_summary);
+
 //===----------------------------------------------------------------------===//
 // table-stream bridge (filter pushdown) — mirrors wasm_table_stream_bridge.h
 //===----------------------------------------------------------------------===//

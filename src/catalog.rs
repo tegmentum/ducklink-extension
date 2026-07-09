@@ -25,6 +25,11 @@ const DEFAULT_CATALOG_URL: &str = "https://ext.ducklink.dev/catalog.json";
 /// Base for component blobs: `<BASE>/<content_digest>/<name>.wasm` (RAW bytes).
 const BLOB_BASE: &str = "https://ext.ducklink.dev/wasm/sha256";
 
+/// Base for native `.duckdb_extension` blobs:
+/// `<BASE>/<platform>/<duckdb_version>/<content_digest>/<name>.duckdb_extension`.
+/// Providers can override this by supplying an explicit `url` in the catalog entry.
+const NATIVE_BLOB_BASE: &str = "https://ext.ducklink.dev/native/sha256";
+
 /// The catalog snapshot embedded at build time — the offline fallback when the
 /// live catalog is unreachable. A copy of `ducklink/registry/index.json`.
 const BUNDLED_SNAPSHOT: &[u8] = include_bytes!("../assets/catalog-snapshot.json");
@@ -89,7 +94,7 @@ pub struct Provider {
     #[serde(default)]
     pub id: Option<String>,
     /// The provider kind — `"wasm"` for a component blob, `"native"` for a
-    /// platform `.duckdb_extension`, etc. Only wasm providers are load candidates.
+    /// platform `.duckdb_extension`, etc.
     #[serde(default)]
     pub kind: Option<String>,
     /// The contract generation this provider was built against, e.g.
@@ -103,12 +108,30 @@ pub struct Provider {
     /// `"eol"`. Absent in the current catalog; rendered as `unknown` then.
     #[serde(default)]
     pub status: Option<String>,
+    /// Target platform (DuckDB's convention: `"osx_arm64"`, `"linux_amd64"`,
+    /// `"windows_amd64"`, ...). REQUIRED for `kind == "native"`; ignored for wasm.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// Target DuckDB version this native artifact was built against (e.g.
+    /// `"v1.5.4"`). REQUIRED for `kind == "native"`; native `.duckdb_extension`
+    /// files are tightly coupled to a DuckDB version.
+    #[serde(default)]
+    pub duckdb_version: Option<String>,
+    /// Explicit download URL. Optional — when absent, native providers fall
+    /// back to a standard `BLOB_BASE`-derived URL from the digest + platform.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 impl Provider {
-    /// True for a wasm-component provider (the only load-candidate kind).
+    /// True for a wasm-component provider.
     pub fn is_wasm(&self) -> bool {
         self.kind.as_deref() == Some("wasm")
+    }
+
+    /// True for a native `.duckdb_extension` provider.
+    pub fn is_native(&self) -> bool {
+        self.kind.as_deref() == Some("native")
     }
 
     /// Parse the contract-generation MAJOR from `abi` (`"duckdb:extension@X.Y.Z"`
@@ -196,6 +219,27 @@ impl CatalogEntry {
     /// All wasm providers of this entry, in catalog order.
     pub fn wasm_providers(&self) -> impl Iterator<Item = &Provider> {
         self.providers.iter().filter(|p| p.is_wasm())
+    }
+
+    /// All native `.duckdb_extension` providers of this entry, in catalog order.
+    pub fn native_providers(&self) -> impl Iterator<Item = &Provider> {
+        self.providers.iter().filter(|p| p.is_native())
+    }
+
+    /// Choose the native provider matching this host's platform + DuckDB
+    /// version. Native `.duckdb_extension` files are tightly coupled to both,
+    /// so the match is strict-exact-both.
+    pub fn select_native_provider(
+        &self,
+        platform: &str,
+        duckdb_version: &str,
+    ) -> Option<&Provider> {
+        self.native_providers()
+            .filter(|p| p.content_digest.is_some())
+            .find(|p| {
+                p.platform.as_deref() == Some(platform)
+                    && p.duckdb_version.as_deref() == Some(duckdb_version)
+            })
     }
 
     /// The entry's own contract generation MAJOR, from `wit_contract_version`
@@ -430,6 +474,19 @@ pub fn blob_cache_path(digest: &str, name: &str) -> Option<PathBuf> {
     )
 }
 
+/// The cache path for a NATIVE `.duckdb_extension` blob:
+/// `<cache>/native/sha256/<digest>/<name>.duckdb_extension`. Digest-keyed so
+/// two providers with the same content share a cache entry.
+pub fn native_cache_path(digest: &str, name: &str) -> Option<PathBuf> {
+    Some(
+        cache_root()?
+            .join("native")
+            .join("sha256")
+            .join(digest)
+            .join(format!("{name}.duckdb_extension")),
+    )
+}
+
 /// Lowercase-hex sha256 of `bytes`. Only used on the download path (offline
 /// builds have nothing to verify), so gated on `network`.
 #[cfg(feature = "network")]
@@ -593,6 +650,171 @@ fn download_blob(digest: &str, name: &str) -> Result<Vec<u8>, String> {
         .as_ref()
         .read_to_end(&mut bytes)
         .map_err(|e| format!("ducklink_load: buffering {url} body failed: {e}"))?;
+    Ok(bytes)
+}
+
+/// DuckDB's platform identifier for this build, using DuckDB's own conventions
+/// (`osx_arm64` / `osx_amd64` / `linux_amd64` / `linux_arm64` / `linux_amd64_musl`
+/// / `windows_amd64`). Used to pick the right `native` provider from the
+/// catalog. Compiled-in — no runtime detection is needed because the extension
+/// itself is platform-specific.
+pub const NATIVE_PLATFORM: &str = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    "osx_arm64"
+} else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    "osx_amd64"
+} else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    "linux_arm64"
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64", target_env = "musl")) {
+    "linux_amd64_musl"
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    "linux_amd64"
+} else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+    "windows_amd64"
+} else {
+    "unknown"
+};
+
+/// Resolve a catalog NAME to a local `.duckdb_extension` path for this host's
+/// platform + DuckDB version, downloading + caching + sha256-verifying if it is
+/// not already cached. Returns the cached path, ready for DuckDB's `LOAD`.
+///
+/// `duckdb_version` is the exact DuckDB build the caller is running against
+/// (e.g. `"v1.5.4"`); native `.duckdb_extension` binaries are tightly coupled
+/// to a specific DuckDB version so the match is strict-exact.
+///
+/// Native providers must exist in the catalog entry with `kind: "native"` +
+/// `platform` + `duckdb_version` + `content_digest` fields. A clear
+/// error names the mismatch when no provider is a fit.
+pub fn resolve_name_to_native(
+    name: &str,
+    platform: &str,
+    duckdb_version: &str,
+) -> Result<PathBuf, String> {
+    let catalog = resolve_catalog();
+    let entry = catalog.find(name).ok_or_else(|| {
+        crate::events::emit("unknown_name_native", Some(name), format!("no catalog entry for '{name}'"));
+        format!("ducklink_install_native: unknown extension '{name}'. Discover names with \
+                 `SELECT name FROM ducklink.modules`.")
+    })?;
+
+    let provider = entry
+        .select_native_provider(platform, duckdb_version)
+        .ok_or_else(|| {
+            crate::events::emit(
+                "no_native_provider",
+                Some(name),
+                format!("no native provider for platform={platform} duckdb_version={duckdb_version}"),
+            );
+            let available: Vec<String> = entry
+                .native_providers()
+                .filter_map(|p| {
+                    let plat = p.platform.as_deref()?;
+                    let ver = p.duckdb_version.as_deref()?;
+                    Some(format!("{plat}/{ver}"))
+                })
+                .collect();
+            if available.is_empty() {
+                format!(
+                    "ducklink_install_native: '{name}' has no native providers (WASM-only). \
+                     Load it via ducklink instead: `ducklink_load('{name}')`."
+                )
+            } else {
+                format!(
+                    "ducklink_install_native: '{name}' has no native provider for {platform}/{duckdb_version}. \
+                     Available: {}. If the native build hasn't shipped yet, load the WASM version: \
+                     `ducklink_load('{name}')`.",
+                    available.join(", ")
+                )
+            }
+        })?;
+    let digest = provider.content_digest.clone().expect("selected native provider has a digest");
+
+    crate::events::emit(
+        "select_native_provider",
+        Some(name),
+        format!("provider for {platform}/{duckdb_version} (digest {digest})"),
+    );
+
+    let cache_path = native_cache_path(&digest, name)
+        .ok_or_else(|| "ducklink_install_native: no cache directory (set HOME or XDG_CACHE_HOME)".to_string())?;
+
+    // Digest-keyed cache hit: the path itself encodes the verified hash.
+    if cache_path.is_file() {
+        crate::events::emit("native_cache_hit", Some(name), cache_path.to_string_lossy().into_owned());
+        return Ok(cache_path);
+    }
+
+    let _guard = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if cache_path.is_file() {
+        crate::events::emit("native_cache_hit", Some(name), cache_path.to_string_lossy().into_owned());
+        return Ok(cache_path);
+    }
+
+    crate::events::emit("native_cache_miss", Some(name), format!("digest {digest}"));
+
+    #[cfg(not(feature = "network"))]
+    {
+        return Err(format!(
+            "ducklink_install_native: '{name}' is not cached and this build was compiled without \
+             network support. Pre-populate the on-disk cache at {} out-of-band, or rebuild ducklink \
+             with `--features network`.",
+            cache_path.display()
+        ));
+    }
+
+    #[cfg(feature = "network")]
+    {
+        // URL: explicit override on the provider, else default from the base + digest + platform.
+        let url = provider.url.clone().unwrap_or_else(|| {
+            format!("{NATIVE_BLOB_BASE}/{digest}/{platform}/{name}.duckdb_extension")
+        });
+        crate::events::emit("native_download", Some(name), url.clone());
+        let bytes = download_native_blob(&url, name)?;
+
+        let got = sha256_hex(&bytes);
+        if got != digest {
+            crate::events::emit(
+                "native_verify_fail",
+                Some(name),
+                format!("expected {digest}, got {got}"),
+            );
+            return Err(format!(
+                "ducklink_install_native: sha256 mismatch for '{name}': catalog says {digest}, \
+                 downloaded bytes hash to {got} (refusing to cache)"
+            ));
+        }
+        crate::events::emit("native_verify_ok", Some(name), digest.clone());
+
+        write_cache(&cache_path, &bytes)?;
+        Ok(cache_path)
+    }
+}
+
+/// Download the RAW native `.duckdb_extension` bytes from an explicit URL.
+/// A separate function from `download_blob` so the event/error strings stay
+/// clear and it's easy to change either path independently later.
+#[cfg(feature = "network")]
+fn download_native_blob(url: &str, name: &str) -> Result<Vec<u8>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("ducklink_install_native: http client init failed: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("ducklink_install_native: download of {url} for '{name}' failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "ducklink_install_native: download of {url} for '{name}' returned HTTP {}",
+            resp.status()
+        ));
+    }
+    let mut bytes = Vec::new();
+    resp.bytes()
+        .map_err(|e| format!("ducklink_install_native: reading {url} body failed: {e}"))?
+        .as_ref()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("ducklink_install_native: buffering {url} body failed: {e}"))?;
     Ok(bytes)
 }
 

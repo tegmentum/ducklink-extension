@@ -84,19 +84,24 @@ static unique_ptr<FunctionData> DucklinkExecBindFn(ClientContext &context, Table
 	auto rewrite = input.inputs[0].GetValue<string>();
 	auto result = make_uniq<DucklinkExecBind>();
 
-	const string sentinel = DUCKLINK_LOAD_WASM_SENTINEL;
-	if (rewrite.rfind(sentinel, 0) == 0) {
-		// LOAD WASM: load into the live context db and report a summary row.
+	const string wasm_sentinel = DUCKLINK_LOAD_WASM_SENTINEL;
+	const string native_sentinel = DUCKLINK_LOAD_NATIVE_SENTINEL;
+	auto matches = [&](const string &prefix) { return rewrite.rfind(prefix, 0) == 0; };
+
+	if (matches(wasm_sentinel) || matches(native_sentinel)) {
+		const bool is_native = matches(native_sentinel);
+		const string &sentinel = is_native ? native_sentinel : wasm_sentinel;
+		const char *tag = is_native ? "LOAD NATIVE" : "LOAD WASM";
 		string arg = rewrite.substr(sentinel.size());
 		// Wrap the parser's own database instance as a stable-C duckdb_database so
 		// the Rust loader registers on the SAME database this statement runs on.
-		// `DuckDB(DatabaseInstance &)` shares the live instance (shared_from_this),
-		// so no new database is created.
 		DatabaseWrapper wrapper;
 		wrapper.database = make_shared_ptr<DuckDB>(*context.db);
 		char *summary = nullptr;
-		int32_t rc = ducklink_load_wasm(reinterpret_cast<void *>(&wrapper), arg.c_str(), &summary);
-		string msg = summary ? string(summary) : string("LOAD WASM: no summary");
+		int32_t rc = is_native
+		                 ? ducklink_load_native(reinterpret_cast<void *>(&wrapper), arg.c_str(), &summary)
+		                 : ducklink_load_wasm(reinterpret_cast<void *>(&wrapper), arg.c_str(), &summary);
+		string msg = summary ? string(summary) : string(tag) + ": no summary";
 		if (summary) {
 			ducklink_adv_free(summary);
 		}
