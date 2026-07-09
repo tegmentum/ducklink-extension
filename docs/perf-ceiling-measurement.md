@@ -84,30 +84,38 @@ Savings: ~13ms of the 48.5ms bench, if we can achieve true zero-copy.
 
 **Worth revisiting.** The engineering scope stays as before (~1000 LOC, guest SDK update), but the win is much larger than I said.
 
-### AOT-compile hot guests (new candidate)
+### AOT precompilation (checked — NOT a query-time perf win)
 
-Wasmtime supports Cranelift ahead-of-time compilation. A native-compiled guest runs ~2x faster than interpreted for tight loops. On `plus_one` that's ~7-8ns/row instead of ~15ns/row.
+`src/engine.rs:32` uses default `wasmtime::Config::new()`, which selects **Cranelift JIT**. Wasm is JIT-compiled to native at load time (and cached to disk for subsequent loads — see F5's Linker cache and the pre-existing `wasmtime::Cache::from_file`). **The guest is already running as native code at query time.**
 
-Savings: ~7ns × 1M = 7ms of the 48.5ms bench.
+AOT precompilation would move the Cranelift step from load time to build time. Load time already amortizes to ~ms via the on-disk cache. Query time is unchanged.
 
-**Worth investigating.** Might already be on by default in newer wasmtime — need to verify.
+There is *no* interpreter-vs-native gap to close here. The 15ns/row wasm computation IS the native-JIT'd cost, not an interpreter cost.
 
-### Combined (zero-copy + AOT)
+**Not a perf win at query time.** Also (worth noting): AOT locks the compiled artifact to a specific CPU architecture + wasmtime version, breaking the portability advantage of shipping `.wasm` files. Even if it did help, the trade would be poor.
 
-If both land, per-row cost drops from 43ns → ~23ns. Query time drops 48.5ms → ~28ms.
+### Summary of levers that survive scrutiny
 
-**Combined win: ~43%.**
+| Path | Real win | Cost |
+|---|---:|---|
+| Streaming scalar dispatch | ~1.3% | 2000+ LOC, semver-major |
+| **Zero-copy shared memory (Option B)** | **~27%** | ~1000 LOC, additive minor |
+| AOT precompilation | ~0% at query time | Also breaks portability |
+
+**Zero-copy WIT is the only remaining real perf lever.**
 
 ## Recommendation
 
 **Retract the v5.0.0 streaming dispatch proposal.** The projection was 20x wrong; the design as spec'd delivers no meaningful win.
 
 **Reprioritize:**
-1. Verify wasmtime AOT is enabled. If not, enable it and re-measure.
-2. Return to `wit-shared-memory-result.md` Option B (shared memory) with the corrected 27% projection.
-3. Investigate whether Wasmtime tail calls / async / other guest-execution optimizations exist that we're not using.
+1. Return to `wit-shared-memory-result.md` Option B (shared memory) with the corrected 27% projection. **This is the only structural perf lever left.**
+2. Continue small-scope wins per opportunity (I1-style scratch reuse, allocator hygiene) — but recognize the ceiling is ~1-2% each.
 
-**Lesson:** always measure the fixed vs per-row breakdown before proposing an ABI change that targets crossing count. The dispatch-count-vs-per-row question is answerable in one bench.
+**Lessons for future perf work:**
+1. Always measure the fixed vs per-row breakdown before proposing an ABI change that targets crossing count. The dispatch-count-vs-per-row question is answerable in one bench.
+2. Verify baseline assumptions before quoting projections. I claimed "AOT for ~17% win" — but wasmtime is already Cranelift-JIT'ing to native. There is no interpreter to eliminate.
+3. State projections with error bars. My streaming projection was single-point; it was 20x off with no admission of uncertainty.
 
 ## Raw numbers
 
