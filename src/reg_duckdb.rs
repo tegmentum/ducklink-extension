@@ -524,9 +524,52 @@ unsafe fn refill_colvec(
             reuse_prim!(v, i64);
             true
         }
-        // TEXT / BLOB / COMPLEX / DECIMAL / INTERVAL / UUID and any
-        // variant-mismatch (different function on the same thread) fall
-        // through to allocate fresh via read_col_to_colvec.
+        // TEXT / BLOB reuse: keep the outer `Vec<String>` / `Vec<Vec<u8>>` and
+        // every element's inner buffer. Resize the outer Vec to `len` (usually
+        // no-op after warmup — DuckDB chunks are 2048 rows), then per row
+        // clear+push_str (TEXT) or clear+extend_from_slice (BLOB) into the
+        // existing buffer. So the ~2048-entry Vec + per-row String/Vec<u8>
+        // allocations from the pre-G2 read_col_to_colvec path collapse to
+        // ZERO on the steady-state hot path. NULL rows clear the buffer to
+        // empty (the validity mask says NULL; the slot's byte content is
+        // never observed by the guest).
+        (ColvecColumn::Text(v), T_TEXT) => {
+            let s = vec.as_slice_with_len::<duckdb_string_t>(len);
+            if v.len() < len {
+                v.resize_with(len, String::new);
+            } else if v.len() > len {
+                v.truncate(len);
+            }
+            for i in 0..len {
+                let dst = &mut v[i];
+                dst.clear();
+                if validity.is_null() || row_valid(validity, i) {
+                    let mut t = s[i];
+                    dst.push_str(&DuckString::new(&mut t).as_str());
+                }
+            }
+            true
+        }
+        (ColvecColumn::Blob(v), T_BLOB) => {
+            let s = vec.as_slice_with_len::<duckdb_string_t>(len);
+            if v.len() < len {
+                v.resize_with(len, Vec::new);
+            } else if v.len() > len {
+                v.truncate(len);
+            }
+            for i in 0..len {
+                let dst = &mut v[i];
+                dst.clear();
+                if validity.is_null() || row_valid(validity, i) {
+                    let mut t = s[i];
+                    dst.extend_from_slice(DuckString::new(&mut t).as_bytes());
+                }
+            }
+            true
+        }
+        // COMPLEX / DECIMAL / INTERVAL / UUID and any variant-mismatch
+        // (different function on the same thread) fall through to allocate
+        // fresh via read_col_to_colvec.
         _ => false,
     };
     if !reused {
