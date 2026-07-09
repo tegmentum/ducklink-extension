@@ -32,6 +32,16 @@ fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.wasm_exceptions(true);
+    // K1: forbid runtime relocation of guest linear memory. When the guest's
+    // memory can move, Cranelift must re-read the base pointer on every load
+    // and store (it can be invalidated by `memory.grow`). With this pinned,
+    // Cranelift can hoist the base pointer out of hot loops (loop-invariant
+    // code motion), which matters for scalars that read a `list<colvec>` in
+    // a tight per-row loop. Trade-off: memory cannot exceed the reserved
+    // amount at runtime — for ducklink's use case (2048-row chunks × a
+    // handful of args) the default 4GiB reservation is orders of magnitude
+    // more than any component will ever use, so this is free.
+    config.memory_may_move(false);
     // Cache compiled artifacts on disk. Cranelift-compiling a component dominates
     // load time; with the cache a repeated load of the same component deserializes
     // in ~ms instead of recompiling. Fall back silently if the cache is
