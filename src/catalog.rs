@@ -307,11 +307,19 @@ fn bundled_catalog() -> Catalog {
     serde_json::from_slice(BUNDLED_SNAPSHOT).expect("bundled catalog snapshot must parse")
 }
 
+/// HTTP fetch timeout for the live catalog. Was 15s originally; dropped to 3s
+/// because the graceful fallback (the bundled snapshot) is already loaded in
+/// the binary — waiting 15s on hotel WiFi before falling back is user-hostile
+/// when a 3s attempt is enough to succeed on any working network and quickly
+/// give up otherwise. Composable with [`prewarm_catalog`] below so an offline
+/// user pays at worst 3s once, in the background, before the first query.
+const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Try to fetch + parse the live catalog. Best-effort: returns `None` on any
 /// network / status / parse failure so the caller falls back to the snapshot.
 fn fetch_live_catalog(url: &str) -> Option<Catalog> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(CATALOG_FETCH_TIMEOUT)
         .build()
         .ok()?;
     let resp = client.get(url).send().ok()?;
@@ -325,27 +333,66 @@ fn fetch_live_catalog(url: &str) -> Option<Catalog> {
 /// Resolve the session catalog: live fetch if reachable, else the bundled
 /// snapshot. Cached for the process after the first resolution.
 pub fn resolve_catalog() -> &'static Catalog {
-    CATALOG.get_or_init(|| {
-        let url =
-            std::env::var("DUCKLINK_CATALOG_URL").unwrap_or_else(|_| DEFAULT_CATALOG_URL.to_string());
-        match fetch_live_catalog(&url) {
-            Some(cat) => {
-                crate::events::emit("catalog_fetch", None, url.clone());
-                cat
-            }
-            None => {
-                eprintln!(
-                    "[ducklink] live catalog at {url} unreachable; using bundled snapshot"
-                );
-                crate::events::emit(
-                    "catalog_fallback",
-                    None,
-                    format!("live catalog at {url} unreachable; using bundled snapshot"),
-                );
-                bundled_catalog()
-            }
+    CATALOG.get_or_init(populate_catalog)
+}
+
+/// The `OnceLock` init function — factored out so [`prewarm_catalog`] and
+/// [`resolve_catalog`] share the same fetch + fallback path. Runs on
+/// whichever thread wins the race to initialise `CATALOG`.
+fn populate_catalog() -> Catalog {
+    let url = std::env::var("DUCKLINK_CATALOG_URL")
+        .unwrap_or_else(|_| DEFAULT_CATALOG_URL.to_string());
+    match fetch_live_catalog(&url) {
+        Some(cat) => {
+            crate::events::emit("catalog_fetch", None, url.clone());
+            cat
         }
-    })
+        None => {
+            eprintln!("[ducklink] live catalog at {url} unreachable; using bundled snapshot");
+            crate::events::emit(
+                "catalog_fallback",
+                None,
+                format!("live catalog at {url} unreachable; using bundled snapshot"),
+            );
+            bundled_catalog()
+        }
+    }
+}
+
+/// Kick off a background thread that populates the catalog `OnceLock` before
+/// any user query hits it. Called from `Engine2::new()` so the fetch happens
+/// while DuckDB is still finishing extension setup — by the time the first
+/// query arrives, the catalog is usually ready and `resolve_catalog()` returns
+/// instantly.
+///
+/// The prewarm is best-effort. If the user's first query races the fetch,
+/// they block on `OnceLock::get_or_init`'s internal barrier for the remaining
+/// wall-clock time of the fetch (which is now capped at
+/// [`CATALOG_FETCH_TIMEOUT`], down from 15s). If the fetch completes first,
+/// the query pays zero.
+///
+/// Idempotent: repeated calls no-op once `CATALOG` is populated (that's the
+/// same invariant [`resolve_catalog`] relies on).
+pub fn prewarm_catalog() {
+    // Cheap early-out: if the catalog is already resolved (e.g. a second
+    // Engine2::new() in the same process), don't spawn a thread just to
+    // find OnceLock is full.
+    if CATALOG.get().is_some() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("ducklink-catalog-prewarm".to_string())
+        .spawn(|| {
+            // `get_or_init` blocks any concurrent caller until this completes,
+            // so a race with the first user query is resolved to a single
+            // fetch (never two).
+            let _ = CATALOG.get_or_init(populate_catalog);
+        })
+        // If the thread fails to spawn (very rare — usually only on system
+        // FD/thread-count exhaustion), fall silently through. `resolve_catalog`
+        // will still do the synchronous fetch on the caller's thread when the
+        // first query arrives.
+        .ok();
 }
 
 /// The on-disk cache root for downloaded component blobs:

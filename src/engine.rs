@@ -170,6 +170,14 @@ pub struct Engine2 {
 
 impl Engine2 {
     pub fn new() -> Result<Self> {
+        // Kick off the catalog HTTP fetch in the background so it overlaps
+        // with the rest of the extension's cold-start work (wasmtime engine
+        // setup below, DuckDB extension registration in loadable.rs). By the
+        // time the user's first `SELECT * FROM ducklink.modules` arrives the
+        // OnceLock is usually already populated. Best-effort — see
+        // `catalog::prewarm_catalog` doc for the race semantics.
+        #[cfg(feature = "duckdb-api")]
+        crate::catalog::prewarm_catalog();
         Ok(Self {
             engine: build_engine()?,
             callbacks: Arc::new(RwLock::new(CallbackRegistry::new())),
