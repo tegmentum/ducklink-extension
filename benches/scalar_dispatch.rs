@@ -202,6 +202,44 @@ fn bench_scalar_dispatch(c: &mut Criterion) {
     });
 
     group.finish();
+
+    // ----------------------------------------------------------------------
+    // Streaming-dispatch validation (v5.0.0 proposal).
+    //
+    // Extrapolates the per-crossing overhead by varying the chunk size against
+    // the same col-native scalar path. If a 1M-row single call is cheaper than
+    // 488 × 2048-row calls, the difference IS what streaming dispatch would
+    // save. Fit `t(n) = fixed_dispatch + per_row * n` to two data points and
+    // extract both.
+    //
+    // See docs/wit-streaming-scalar-dispatch.md for the full design context.
+    // ----------------------------------------------------------------------
+    let mut stream_group = c.benchmark_group("streaming_validation");
+    for &n in &[128usize, 2048, 16384, 65536, 262144, 1048576] {
+        stream_group.throughput(Throughput::Elements(n as u64));
+        stream_group.bench_function(format!("plus_one_col_i64_{n}"), |b| {
+            b.iter_batched(
+                || {
+                    // A single Int64 argument colvec of n values, all-valid.
+                    let data = (0..n as i64).collect::<Vec<_>>();
+                    vec![Colvec {
+                        data: ColvecColumn::Int64(data),
+                        validity: Vec::new(),
+                        rows: n as u32,
+                    }]
+                },
+                |args| {
+                    let args = black_box(args);
+                    let out = engine
+                        .dispatch_scalar_batch_col(handle, 0, &args)
+                        .expect("dispatch col");
+                    black_box(out);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    stream_group.finish();
 }
 
 criterion_group!(benches, bench_scalar_dispatch);

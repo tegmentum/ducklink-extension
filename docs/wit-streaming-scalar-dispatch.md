@@ -1,9 +1,24 @@
-# WIT ABI — streaming scalar dispatch (v5.0.0 proposal)
+# WIT ABI — streaming scalar dispatch (v5.0.0 proposal) — RETRACTED
+
+**Status:** ⚠ **RETRACTED** — projection was measured to be ~20x off. See `perf-ceiling-measurement.md`.
+
+**What the measurement showed:** Fixed per-crossing overhead is ~1.3µs, not ~20µs. Streaming saves only ~0.63ms on the 48.5ms benchmark (**~1.3%**), not the 30% originally projected.
+
+**Reason for the miss:** the original projection listed "~20µs dispatch machinery per crossing" as a component of the 85µs per-chunk cost. That number was speculation — never measured. When benchmarked against varying chunk sizes (128 → 1M) the fixed cost cleanly resolves to ~1.3µs.
+
+**Where to look instead:** per-row cost is 43ns and dominated by memcpy (13ns) + wasm computation (15ns) + canonical ABI encoding (10ns). Cutting per-row cost (via zero-copy WIT or AOT compilation) is where the real perf lever is. See `perf-ceiling-measurement.md` for the revised recommendations.
+
+**Do not implement this proposal as spec'd. Kept below for archival value / lessons learned.**
+
+---
+
+<details>
+<summary>Original proposal (retracted)</summary>
 
 **Status:** design conversation, not implemented.
 **Motivation:** the 48ms `scalar_query/plus_one_sum_1M` benchmark ceiling.
 **Scope:** WIT semver-major bump; new dispatch world; guest SDK redesign; ~2000+ LOC; migration path required for every existing component.
-**Projected win:** ~30% on typical scalar-composed queries; ~10-15% on cases where guest work already dominates.
+**Projected win:** ~30% on typical scalar-composed queries; ~10-15% on cases where guest work already dominates. ⚠ **Measurement showed this was ~20x optimistic.**
 
 ## The core insight
 
@@ -186,3 +201,5 @@ If perf is genuinely the roadmap priority, **this is the next quarter's engineer
 - `runtime/wit-canonical/duckdb-extension/aggregate-incr-dispatch.wit` — existing incremental pattern (row-major); prior art for pull/push shape.
 - `runtime/wit-canonical/duckdb-extension/table-stream-dispatch.wit` — existing streaming pattern for table functions; also prior art.
 - Benchmark numbers: `scalar_query/plus_one_sum_1M` = 48.5ms (post-F/G/H/I); `scalar_dispatch/plus_one_col_i64_2048` = 86µs.
+
+</details>

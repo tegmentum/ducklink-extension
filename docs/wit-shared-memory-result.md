@@ -1,8 +1,18 @@
 # WIT ABI — zero-copy scalar dispatch result buffer
 
-**Status:** design proposal, not implemented.
+**Status:** design proposal, not implemented. **Revised projection after measurement — see `perf-ceiling-measurement.md`.**
 **Motivation:** perf ceiling of the current scalar hot path.
-**Cost:** additive-minor WIT bump; bindgen regen; guest SDK update; ~500-800 lines of engineering work; ~7% projected win on scalar throughput.
+**Cost:** additive-minor WIT bump; bindgen regen; guest SDK update; ~500-800 lines of engineering work.
+
+## Revised win estimate
+
+Original doc said Option B was worth ~5-7% — this was based on underestimating the per-row memcpy cost. The `streaming_validation` bench shows per-row cost is 43ns of which **~13ns is memcpy** (16 bytes per i64 row × ~2 crossings). Eliminating that with zero-copy shared memory saves:
+
+- **13ns × 1M rows = 13ms of the 48.5ms scalar_query/plus_one_sum_1M bench = ~27% win.**
+
+Much bigger than the 5-7% originally projected. Option B jumped from "not worth it" to "worth serious investment."
+
+Note: this is separately confirmed by the retraction of the streaming-dispatch proposal (see `perf-ceiling-measurement.md`). Fixed dispatch cost is ~1.3µs, not the ~20µs previously assumed; the memcpy overhead was hiding in the "per-row" bucket instead.
 
 ## The problem
 
