@@ -754,6 +754,32 @@ impl VTab for WasmTable {
     }
 }
 
+/// #79 STUB — log the logical-type aliases a component wants to register.
+/// Follow-up C-API impl will replace the eprintln with:
+///   let handle = ffi::duckdb_create_logical_type(duckdb_type_of_physical(&lt.physical));
+///   ffi::duckdb_logical_type_set_alias(handle, CString::new(&lt.name)?);
+///   // stash the handle so the CastReg pass can reference it for
+///   // duckdb_register_cast(source_handle, target_handle, callback).
+/// Currently a no-op so builds pass and the plumbing stays live.
+pub fn register_logical_types_stub(logical_types: &[super::engine::LogicalTypeAlias]) {
+    for lt in logical_types {
+        eprintln!(
+            "[reg_duckdb] logical_type: ext='{}' name='{}' physical='{}' -- STUB (C-API follow-up #79)",
+            lt.extension, lt.name, lt.physical
+        );
+    }
+}
+
+/// #79 STUB — companion to register_logical_types_stub. Currently a no-op.
+pub fn register_casts_stub(casts: &[super::engine::CastReg]) {
+    for c in casts {
+        eprintln!(
+            "[reg_duckdb] cast: ext='{}' source='{}' target='{}' callback={} -- STUB (C-API follow-up #79)",
+            c.extension, c.source, c.target, c.callback_handle
+        );
+    }
+}
+
 /// Register every component table function on `con`. Returns the count
 /// registered. Parameter and column types use the same `reg` logical-type set as
 /// scalars.

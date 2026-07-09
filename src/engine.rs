@@ -134,6 +134,30 @@ pub struct AggregateFunc {
     pub callback_handle: u32,
 }
 
+/// A logical-type registration a component requested during load().
+/// #79 scaffold: drain path carries these through; the DuckDB sink currently
+/// logs but does not yet invoke `duckdb_create_logical_type` + alias — that's
+/// a follow-up C-API impl. Once wired, GEOMETRY/GEOGRAPHY etc. become
+/// bind-time aliases over BLOB, closing the "st_astext(BLOB) no-match" gap.
+#[derive(Clone, Debug)]
+pub struct LogicalTypeAlias {
+    pub extension: String,
+    pub name: String,
+    pub physical: String,
+}
+
+/// A cast registration a component requested during load(). #79 scaffold —
+/// paired with `LogicalTypeAlias` for the eventual DuckDB C-API implicit-cast
+/// wiring. `callback_handle` refers to the guest-side identity/marshal fn
+/// (currently ignored by the stub sink).
+#[derive(Clone, Debug)]
+pub struct CastReg {
+    pub extension: String,
+    pub source: String,
+    pub target: String,
+    pub callback_handle: u32,
+}
+
 /// What a component registered: the functions a direction-specific sink bridges
 /// into the database.
 #[derive(Clone, Debug, Default)]
@@ -141,6 +165,10 @@ pub struct LoadedComponent {
     pub scalars: Vec<ScalarFunc>,
     pub tables: Vec<TableFunc>,
     pub aggregates: Vec<AggregateFunc>,
+    /// #79 scaffold — see `LogicalTypeAlias`.
+    pub logical_types: Vec<LogicalTypeAlias>,
+    /// #79 scaffold — see `CastReg`.
+    pub casts: Vec<CastReg>,
 }
 
 /// Process-wide Direction-2 engine: loads components and dispatches DuckDB
@@ -218,11 +246,39 @@ impl Engine2 {
                 callback_handle: a.callback_handle,
             })
             .collect();
+        // #79 scaffold — drain logical_types + casts so a follow-up sink can
+        // wire them into DuckDB's C-API. Currently the direction-2 sink (see
+        // reg_duckdb::register_logical_types_stub) logs but does not create
+        // aliases; every GEOMETRY-typed scalar therefore still surfaces to
+        // the binder as BLOB. When the C-API impl lands (duckdb_create_logical_type
+        // + duckdb_logical_type_set_alias + duckdb_register_cast), the binder
+        // resolves GEOMETRY → BLOB at bind time.
+        let logical_types = pending
+            .logical_types
+            .into_iter()
+            .map(|lt| LogicalTypeAlias {
+                extension: lt.extension,
+                name: lt.name,
+                physical: lt.physical,
+            })
+            .collect();
+        let casts = pending
+            .casts
+            .into_iter()
+            .map(|c| CastReg {
+                extension: c.extension,
+                source: c.source,
+                target: c.target,
+                callback_handle: c.callback_handle,
+            })
+            .collect();
         self.instances.insert(extension.to_string(), instance);
         Ok(LoadedComponent {
             scalars,
             tables,
             aggregates,
+            logical_types,
+            casts,
         })
     }
 
@@ -243,7 +299,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
@@ -282,7 +338,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
@@ -309,7 +365,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let wit_args: Vec<extension_types::Duckvalue> =
             args.into_iter().map(neutral_to_wit).collect();
@@ -339,7 +395,7 @@ impl Engine2 {
         };
         let instance = self
             .instances
-            .get_mut(&entry.extension)
+            .get_mut(&*entry.extension)
             .ok_or_else(|| anyhow!("extension '{}' is not loaded", entry.extension))?;
         let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
             .into_iter()
