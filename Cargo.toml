@@ -21,7 +21,11 @@ name = "ducklink"
 # `advanced` ships the internal-C++-ABI tier (the `LOAD WASM` statement);
 # it auto-compiles out on Windows (build.rs) and community-extensions
 # rebuilds per DuckDB version, so the exact-version gate self-aligns.
-default = ["loadable", "advanced"]
+# `network` pulls in reqwest + rustls + sha2 for HTTPS catalog fetch and
+# blob download-and-verify; without it, the extension serves only the
+# bundled snapshot and refuses to download uncached blobs (~5-8 MB smaller
+# binary, for air-gapped / minimal-distribution use).
+default = ["loadable", "advanced", "network"]
 # Code that talks to the duckdb crate: the Direction-2 registration + dispatch
 # bridge (reg_duckdb.rs).
 duckdb-api = ["dep:duckdb", "duckdb/vscalar"]
@@ -46,6 +50,13 @@ bundled = ["duckdb-api", "duckdb/bundled"]
 # Windows PE/COFF equivalent, so it is compiled out on Windows regardless (see
 # build.rs).
 advanced = ["dep:cc", "duckdb-api"]
+# HTTPS catalog fetch + on-demand blob download. Pulls in reqwest + rustls +
+# webpki-roots + sha2. Enabled by default; disable for air-gapped or
+# minimum-binary-size builds (`cargo build --release --no-default-features
+# --features loadable,advanced`). Without `network`, ducklink resolves only
+# names in the bundled snapshot AND refuses to load anything not already in
+# the on-disk cache.
+network = ["dep:reqwest", "dep:sha2"]
 
 [dependencies]
 # The shared engine: the duckdb:extension bindgen, the neutral reg::* capture
@@ -68,10 +79,10 @@ serde = { version = "1", features = ["derive"] }
 # by catalog NAME. Mirrors the host crate: blocking, rustls + bundled webpki
 # roots (no system TLS), http2. Network failures fall back to the bundled
 # snapshot, so this is best-effort.
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "http2"], optional = true }
 # Verify a downloaded component blob's bytes against the catalog entry's
 # content_digest (sha256) before caching/loading it.
-sha2 = "0.10"
+sha2 = { version = "0.10", optional = true }
 
 # DuckDB C Extension API (loadable-extension build). Pinned to the DuckDB version
 # the community-extensions CI builds against (v1.5.4); bumped per release.

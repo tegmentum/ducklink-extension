@@ -317,6 +317,11 @@ const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Try to fetch + parse the live catalog. Best-effort: returns `None` on any
 /// network / status / parse failure so the caller falls back to the snapshot.
+///
+/// Gated on the `network` feature. In an offline build (`--no-default-features
+/// --features loadable,advanced`) this always returns `None` and the caller
+/// silently falls back to the bundled snapshot.
+#[cfg(feature = "network")]
 fn fetch_live_catalog(url: &str) -> Option<Catalog> {
     let client = reqwest::blocking::Client::builder()
         .timeout(CATALOG_FETCH_TIMEOUT)
@@ -328,6 +333,14 @@ fn fetch_live_catalog(url: &str) -> Option<Catalog> {
     }
     let bytes = resp.bytes().ok()?;
     serde_json::from_slice::<Catalog>(&bytes).ok()
+}
+
+/// Offline-build stub: no network, always fall back to the bundled snapshot.
+/// Kept as a plain `_ = url;` so the caller shape (a `match` on the option)
+/// doesn't need `#[cfg]` at every call site.
+#[cfg(not(feature = "network"))]
+fn fetch_live_catalog(_url: &str) -> Option<Catalog> {
+    None
 }
 
 /// Resolve the session catalog: live fetch if reachable, else the bundled
@@ -417,7 +430,9 @@ pub fn blob_cache_path(digest: &str, name: &str) -> Option<PathBuf> {
     )
 }
 
-/// Lowercase-hex sha256 of `bytes`.
+/// Lowercase-hex sha256 of `bytes`. Only used on the download path (offline
+/// builds have nothing to verify), so gated on `network`.
+#[cfg(feature = "network")]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -513,31 +528,49 @@ pub fn resolve_name_to_blob(name: &str, host_major: u64) -> Result<PathBuf, Stri
 
     crate::events::emit("cache_miss", Some(name), format!("not cached (digest {digest})"));
 
-    let url = format!("{BLOB_BASE}/{digest}/{name}.wasm");
-    crate::events::emit("download", Some(name), url);
-    let bytes = download_blob(&digest, name)?;
-
-    // VERIFY: the downloaded bytes' sha256 must equal the catalog digest. A
-    // mismatch means a corrupt or tampered blob — fail loudly, never cache it.
-    let got = sha256_hex(&bytes);
-    if got != digest {
-        crate::events::emit(
-            "verify_fail",
-            Some(name),
-            format!("expected {digest}, got {got}"),
-        );
+    // Offline build: never download. Refuse cleanly rather than silently
+    // returning a stale/wrong path. The user gets an actionable error and
+    // knows to pre-populate the on-disk cache out-of-band.
+    #[cfg(not(feature = "network"))]
+    {
         return Err(format!(
-            "ducklink_load: sha256 mismatch for '{name}': catalog says {digest}, downloaded bytes hash to {got} (refusing to cache)"
+            "ducklink_load: '{name}' is not cached (digest {digest}) and this build was compiled without network support. \
+             Pre-populate the on-disk cache at {} out-of-band, or rebuild ducklink with `--features network`.",
+            cache_path.display()
         ));
     }
-    crate::events::emit("verify_ok", Some(name), digest.clone());
 
-    write_cache(&cache_path, &bytes)?;
-    Ok(cache_path)
+    #[cfg(feature = "network")]
+    {
+        let url = format!("{BLOB_BASE}/{digest}/{name}.wasm");
+        crate::events::emit("download", Some(name), url);
+        let bytes = download_blob(&digest, name)?;
+
+        // VERIFY: the downloaded bytes' sha256 must equal the catalog digest. A
+        // mismatch means a corrupt or tampered blob — fail loudly, never cache it.
+        let got = sha256_hex(&bytes);
+        if got != digest {
+            crate::events::emit(
+                "verify_fail",
+                Some(name),
+                format!("expected {digest}, got {got}"),
+            );
+            return Err(format!(
+                "ducklink_load: sha256 mismatch for '{name}': catalog says {digest}, downloaded bytes hash to {got} (refusing to cache)"
+            ));
+        }
+        crate::events::emit("verify_ok", Some(name), digest.clone());
+
+        write_cache(&cache_path, &bytes)?;
+        Ok(cache_path)
+    }
 }
 
 /// Download the RAW component blob for `digest`/`name`. Network errors and
-/// non-200 statuses become a clear `Err`.
+/// non-200 statuses become a clear `Err`. Only compiled when the `network`
+/// feature is enabled; offline builds error out with a "pre-populate the
+/// cache" message at the call site.
+#[cfg(feature = "network")]
 fn download_blob(digest: &str, name: &str) -> Result<Vec<u8>, String> {
     let url = format!("{BLOB_BASE}/{digest}/{name}.wasm");
     let client = reqwest::blocking::Client::builder()
@@ -605,6 +638,7 @@ mod tests {
         assert!(aba.exports.iter().any(|e| e == "aba_validate"));
     }
 
+    #[cfg(feature = "network")]
     #[test]
     fn sha256_hex_matches_known_vector() {
         // sha256("") well-known vector.
@@ -805,6 +839,7 @@ mod tests {
         assert!(entry.select_provider(4).is_none());
     }
 
+    #[cfg(feature = "network")]
     #[test]
     fn sha256_verification_rejects_mismatch() {
         // White-box: bytes that don't hash to the claimed digest must be
