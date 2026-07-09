@@ -12,7 +12,7 @@
 //! `callback-dispatch` export for each DuckDB-side invocation.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime::{AsContextMut, Engine, Store};
@@ -4508,6 +4508,35 @@ mod tests {
     }
 }
 
+/// Process-global cache for the base [`Linker`] template — the one populated
+/// by [`add_extension_interfaces_to_linker`]. Built lazily on the first load
+/// and cloned on every subsequent load, so the ~25 `add_to_linker` calls the
+/// linker construction requires run ONCE per process instead of once per
+/// component load. Guarded by an [`Engine`] identity check so a hypothetical
+/// second Engine gets its own fresh linker rather than incorrectly reusing
+/// one bound to a different engine.
+static BASE_LINKER_CACHE: OnceLock<Mutex<Option<(Engine, Linker<ExtensionStoreState>)>>> =
+    OnceLock::new();
+
+/// Return a `Linker<ExtensionStoreState>` populated with the base extension
+/// interfaces for `engine`. First call runs
+/// [`add_extension_interfaces_to_linker`]; subsequent calls (with the same
+/// engine) clone the cached template. A different engine falls back to a
+/// fresh build.
+fn base_linker(engine: &Engine) -> wasmtime::Result<Linker<ExtensionStoreState>> {
+    let cell = BASE_LINKER_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_engine, cached_linker)) = guard.as_ref() {
+        if Engine::same(cached_engine, engine) {
+            return Ok(cached_linker.clone());
+        }
+    }
+    let mut linker = Linker::<ExtensionStoreState>::new(engine);
+    add_extension_interfaces_to_linker(&mut linker)?;
+    *guard = Some((engine.clone(), linker.clone()));
+    Ok(linker)
+}
+
 /// Add the full `duckdb:extension` capability surface to `linker`: the wasip2
 /// preview interfaces (so the component's WASI imports resolve) plus all six
 /// extension interfaces (types, runtime, config, logging, catalog, files), each
@@ -4600,8 +4629,15 @@ pub fn load_component_with_dynlink(
     // so a mismatched component never silently marshals corrupted values.
     crate::check_component_contract(engine, component, &extension_name)?;
 
-    let mut linker = Linker::<ExtensionStoreState>::new(engine);
-    add_extension_interfaces_to_linker(&mut linker)?;
+    // H4: cache the fully-built base Linker (wasip2 + 24 duckdb:extension
+    // interfaces) in a process-global OnceLock, keyed by Engine identity.
+    // Every subsequent load clones the cached linker instead of running
+    // ~25 `add_to_linker` calls. `Linker` is Clone and cheap.
+    //
+    // Different Engines are rejected: `Engine::same` compares refcounted
+    // ids. In practice ducklink runs one Engine per process (Engine2::new
+    // creates it once); a second Engine would hit the else arm and rebuild.
+    let mut linker = base_linker(engine)?;
 
     // compose:dynlink/linker: conditionally satisfy a guest-driven provider
     // import. ONLY a component that actually imports the linker gets the host
