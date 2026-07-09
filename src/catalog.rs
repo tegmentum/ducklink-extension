@@ -26,8 +26,10 @@ const DEFAULT_CATALOG_URL: &str = "https://ext.ducklink.dev/catalog.json";
 const BLOB_BASE: &str = "https://ext.ducklink.dev/wasm/sha256";
 
 /// Base for native `.duckdb_extension` blobs:
-/// `<BASE>/<platform>/<duckdb_version>/<content_digest>/<name>.duckdb_extension`.
-/// Providers can override this by supplying an explicit `url` in the catalog entry.
+/// `<BASE>/<content_digest>/<platform>/<name>.duckdb_extension`. Digest-keyed so
+/// two builds with the same bytes share one URL, and the platform folder keeps
+/// visually related builds grouped when browsing. Providers can override this
+/// by supplying an explicit `url` on the catalog entry.
 const NATIVE_BLOB_BASE: &str = "https://ext.ducklink.dev/native/sha256";
 
 /// The catalog snapshot embedded at build time — the offline fallback when the
