@@ -8,6 +8,7 @@ use duckdb:extension/catalog@2.0.0;
 use duckdb:extension/files@2.0.0;
 use duckdb:extension/storage@2.0.0;
 use duckdb:extension/storage-dispatch@2.0.0;
+use duckdb:extension/storage-write-dispatch@2.0.0;
 use duckdb:extension/index@2.0.0;
 use duckdb:extension/index-dispatch@2.0.0;
 use duckdb:extension/collation@2.0.0;
@@ -74,6 +75,26 @@ world duckdb-extension-index {
   export duckdb:extension/guest@2.0.0;
   export callback-dispatch;
   export index-dispatch;
+}
+
+// Writable-storage world (additive, 2.1.0 within contract-major 2): additionally
+// exports storage-write-dispatch on top of the read-only storage-dispatch. Only
+// storage backends that can write through satisfy this; the runtime instantiates
+// its bindings lazily from an already-loaded ExtensionInstance. Existing @2.0.0
+// components do NOT export storage-write-dispatch and keep loading un-rebuilt.
+world duckdb-extension-storage-write {
+  import duckdb:extension/runtime@2.0.0;
+  import duckdb:extension/config@2.0.0;
+  import duckdb:extension/logging@2.0.0;
+  import duckdb:extension/catalog@2.0.0;
+  import duckdb:extension/files@2.0.0;
+  import duckdb:extension/storage@2.0.0;
+  import duckdb:extension/index@2.0.0;
+  import duckdb:extension/collation@2.0.0;
+  export duckdb:extension/guest@2.0.0;
+  export callback-dispatch;
+  export storage-dispatch;
+  export storage-write-dispatch;
 }
 
 // Files-capable world: additionally exports file-dispatch. Only files backend

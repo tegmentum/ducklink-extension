@@ -167,6 +167,29 @@ pub mod duckdb_extension_storage_bindings {
     });
 }
 
+/// Bindings for the writable-storage world (`duckdb-extension-storage-write`,
+/// additive within contract-major 2), which additionally exports
+/// `storage-write-dispatch` on top of the read-only `storage-dispatch`. Only
+/// writable storage backends satisfy this; the runtime builds these bindings
+/// lazily from an already-loaded component instance so non-writable storage
+/// backends (which don't export storage-write-dispatch) still load against the
+/// read-only storage world above.
+///
+/// Types (`duckerror`, `duckvalue`, `columndef`) are remapped to the BASE
+/// bindings' generated types via `with:`, so the write trampolines exchange
+/// the same `extension_types::*` the rest of the runtime uses -- no per-world
+/// conversion on either the argument or the return path.
+pub mod duckdb_extension_storage_write_bindings {
+    wasmtime::component::bindgen!({
+        path: "./wit",
+        world: "duckdb:extension-host/duckdb-extension-storage-write",
+        require_store_data_send: true,
+        with: {
+            "duckdb:extension/types@2.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+        },
+    });
+}
+
 /// Bindings for the index-capable world (`duckdb-extension-index`), which
 /// additionally exports `index-dispatch` (Item 3 / M2a custom index). Only
 /// custom-index backend components (e.g. hnswfns) satisfy this; the runtime

@@ -1409,6 +1409,12 @@ pub struct ExtensionInstance {
     // Lazily-built storage bindings (None until first storage-dispatch call or
     // for non-storage extensions).
     storage_bindings: Option<crate::duckdb_extension_storage_bindings::DuckdbExtensionStorage>,
+    // 2.1.0 additive: lazily-built writable-storage bindings (None until first
+    // storage-write-dispatch call or for read-only storage backends). The types
+    // are remapped via `with:` to the storage bindings' generated types, so the
+    // existing `storage_*_to_ext` helpers apply on the return path.
+    storage_write_bindings:
+        Option<crate::duckdb_extension_storage_write_bindings::DuckdbExtensionStorageWrite>,
     // Item 3 / M2a: lazily-built index bindings (None until first index-dispatch
     // call or for non-index extensions).
     index_bindings: Option<crate::duckdb_extension_index_bindings::DuckdbExtensionIndex>,
@@ -1561,6 +1567,7 @@ impl ExtensionInstance {
             bindings,
             instance,
             storage_bindings: None,
+            storage_write_bindings: None,
             index_bindings: None,
             files_bindings: None,
         }
@@ -1822,6 +1829,143 @@ impl ExtensionInstance {
             .call_storage_scan_close(store.as_context_mut(), handle, scan)
             .map_err(map_extension_trap)?
             .map_err(storage_duckerror_to_ext)
+    }
+
+    // --- 2.1.0 (additive): storage-write-dispatch re-entry ---
+    //
+    // Mirrors the storage-dispatch trampolines above but drives the WRITABLE
+    // half (transactions + DDL + DML) of a storage backend. Types are remapped
+    // via `with:` in the lib-level bindings module to the SAME
+    // `extension_types::*` the rest of the runtime uses, so no per-world
+    // conversion is needed on either the argument or the return path.
+
+    /// Builds (once) the writable-storage bindings from the raw instance.
+    /// Errors if this component does not export storage-write-dispatch (i.e.
+    /// is not a writable storage backend).
+    fn storage_write_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_storage_write_bindings::DuckdbExtensionStorageWrite,
+        extension_types::Duckerror,
+    > {
+        if self.storage_write_bindings.is_none() {
+            let built =
+                crate::duckdb_extension_storage_write_bindings::DuckdbExtensionStorageWrite::new(
+                    self.store.as_context_mut(),
+                    &self.instance,
+                )
+                .map_err(map_extension_trap)?;
+            self.storage_write_bindings = Some(built);
+        }
+        Ok(self.storage_write_bindings.as_ref().unwrap())
+    }
+
+    /// Begin a write transaction on `catalog`; returns a transaction handle.
+    pub fn storage_begin_transaction(
+        &mut self,
+        handle: u32,
+        catalog: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_begin_transaction(store.as_context_mut(), handle, catalog)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_commit_transaction(
+        &mut self,
+        handle: u32,
+        txn: u32,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_commit_transaction(store.as_context_mut(), handle, txn)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_rollback_transaction(
+        &mut self,
+        handle: u32,
+        txn: u32,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_rollback_transaction(store.as_context_mut(), handle, txn)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_create_table(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        columns: &[extension_types::Columndef],
+    ) -> Result<(), extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_create_table(store.as_context_mut(), handle, txn, table, columns)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_insert_rows(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        rows: &[Vec<extension_types::Duckvalue>],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_insert_rows(store.as_context_mut(), handle, txn, table, rows)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_delete_rows(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        rowids: &[i64],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_delete_rows(store.as_context_mut(), handle, txn, table, rowids)
+            .map_err(map_extension_trap)?
+    }
+
+    pub fn storage_update_rows(
+        &mut self,
+        handle: u32,
+        txn: u32,
+        table: &str,
+        rowids: &[i64],
+        rows: &[Vec<extension_types::Duckvalue>],
+    ) -> Result<u64, extension_types::Duckerror> {
+        self.storage_write_bindings()?;
+        let bindings = self.storage_write_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_storage_write_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_update_rows(store.as_context_mut(), handle, txn, table, rowids, rows)
+            .map_err(map_extension_trap)?
     }
 
     // --- Item 3 / M2a: index-dispatch (custom index build + search) re-entry ---
