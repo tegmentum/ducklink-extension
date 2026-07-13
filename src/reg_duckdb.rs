@@ -3236,19 +3236,24 @@ impl VTab for WasmLoad {
             //   * "wasm" (default) — resolve as a wasm component and load via
             //     the embedded wasmtime engine, registering functions on the
             //     runtime's persistent connection.
-            //   * "native"        — resolve a matching-platform / matching-
-            //     duckdb-version native provider, download + sha256-verify
-            //     into ducklink's native cache, and invoke DuckDB's own LOAD
-            //     on the cached path. The user must have started DuckDB with
-            //     `-unsigned` (or the equivalent SET) — we do NOT flip that
-            //     flag automatically. See docs/duckdb-upstream-custom-trusted-keys.md.
+            //   * "native"        — pick the best native backing:
+            //     1. If a community-native provider is available, INSTALL +
+            //        LOAD from `duckdb/community-extensions`. Signed by the
+            //        community key so no `-unsigned` required.
+            //     2. Else, download our own native provider matching this
+            //        host's platform + DuckDB version and invoke DuckDB's
+            //        LOAD on the cached path. Requires `-unsigned` because
+            //        our signing key isn't in DuckDB's trust chain.
+            //     3. Else, error clearly — no native backing available.
+            //     The user's SQL doesn't change either way; ducklink is the
+            //     routing layer over WASM and native backings.
             let kind = bind
                 .get_named_parameter("kind")
                 .map(|v| v.to_string().to_ascii_lowercase())
                 .unwrap_or_else(|| "wasm".to_string());
             match kind.as_str() {
                 "wasm" => {}
-                "native" => return native_load(rt, bind, &arg_str),
+                "native" => return native_load_dispatch(rt, bind, &arg_str),
                 other => {
                     return Err(format!(
                         "ducklink_load: kind must be 'wasm' or 'native', got '{other}'"
@@ -3427,7 +3432,108 @@ impl VTab for WasmLoad {
     }
 }
 
-/// Native branch of `ducklink_load(name, kind => 'native')`.
+/// Native dispatch for `ducklink_load(name, kind => 'native')`. Prefers a
+/// community-native provider (community-signed, best trust posture); falls
+/// back to a ducklink-native provider (our own build; requires `-unsigned`);
+/// errors clearly if neither is available.
+///
+/// This is the "smart" native selection — the user says "give me the native
+/// version" and ducklink picks the best backing. The user's SQL doesn't
+/// change; ducklink is the routing layer.
+fn native_load_dispatch(
+    rt: &DucklinkRuntime,
+    bind: &BindInfo,
+    name_arg: &str,
+) -> Result<WasmLoadBind, Box<dyn std::error::Error>> {
+    // 1. Prefer community-native — community-signed, no `-unsigned` needed.
+    if let Ok(ext_name) = crate::catalog::resolve_name_to_community_native(name_arg) {
+        return community_native_load(rt, bind, name_arg, &ext_name);
+    }
+    // 2. Fall back to our own native build for this host.
+    native_load(rt, bind, name_arg)
+}
+
+/// Community-native branch — INSTALL + LOAD an existing extension from
+/// `duckdb/community-extensions`. Ducklink is the router; the community
+/// extension is the actual implementation. The community-signed key is in
+/// DuckDB's trust chain already, so no `-unsigned` is needed.
+fn community_native_load(
+    rt: &DucklinkRuntime,
+    bind: &BindInfo,
+    name_arg: &str,
+    community_ext_name: &str,
+) -> Result<WasmLoadBind, Box<dyn std::error::Error>> {
+    // Belt-and-braces: reject extension names that don't fit DuckDB's identifier
+    // rules so an accidentally-crafted catalog entry can't inject arbitrary SQL.
+    // Community extension names are the same identifier shape DuckDB uses
+    // elsewhere: ASCII letters, digits, and underscores.
+    if !community_ext_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "ducklink_load(kind='native'): community-native provider names '{community_ext_name}', \
+             which contains characters outside the allowed [A-Za-z0-9_] identifier set. \
+             Refusing to run INSTALL/LOAD."
+        )
+        .into());
+    }
+
+    crate::events::emit(
+        "load_community_native_start",
+        Some(name_arg),
+        community_ext_name.to_string(),
+    );
+
+    // Two statements on the persistent connection: install from community
+    // (idempotent — DuckDB no-ops if already installed at the right version),
+    // then load.
+    let install_sql = format!("INSTALL {community_ext_name} FROM community");
+    let load_sql = format!("LOAD {community_ext_name}");
+    let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(err) = con.execute(&install_sql, []) {
+        let err_msg = err.to_string();
+        crate::events::emit("load_community_native_error", Some(name_arg), err_msg.clone());
+        return Err(format!(
+            "ducklink_load(kind='native'): INSTALL {community_ext_name} FROM community failed: {err_msg}"
+        )
+        .into());
+    }
+    if let Err(err) = con.execute(&load_sql, []) {
+        let err_msg = err.to_string();
+        crate::events::emit("load_community_native_error", Some(name_arg), err_msg.clone());
+        return Err(format!(
+            "ducklink_load(kind='native'): LOAD {community_ext_name} failed after successful INSTALL: {err_msg}"
+        )
+        .into());
+    }
+    crate::events::emit(
+        "load_community_native_ok",
+        Some(name_arg),
+        community_ext_name.to_string(),
+    );
+
+    bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+    bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+    bind.add_result_column("scalars", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+    bind.add_result_column("tables", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+    bind.add_result_column("aggregates", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+    Ok(WasmLoadBind {
+        name: name_arg.to_string(),
+        // `path` for a community-native load is a description, not a filesystem
+        // path — DuckDB manages its own extension directory and we don't know
+        // where it dropped the file. Making this obvious keeps the summary
+        // useful when a user pipes it into scripting.
+        path: format!("community-extensions:{community_ext_name}"),
+        scalars: usize::MAX, // sentinel: "n/a" (same shape as the ducklink-native branch)
+        tables: usize::MAX,
+        aggregates: usize::MAX,
+    })
+}
+
+/// Fallback native path — download a ducklink-hosted native provider matching
+/// this host's platform + DuckDB version, cache-and-verify, then LOAD via
+/// DuckDB's own extension mechanism.
 ///
 /// Resolves the catalog entry's native provider matching this platform +
 /// DuckDB version, downloads + sha256-verifies into ducklink's native cache

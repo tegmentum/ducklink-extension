@@ -297,6 +297,102 @@ WASM and native providers are independent: adding a native for one platform
 does not require adding it for the others, and a missing native for the
 host's platform + version simply routes the user to the WASM path.
 
+## 3b. Community-native providers (`kind: "community-native"`)
+
+Sometimes the capability already exists as a published `duckdb/community-extensions`
+extension. Rather than rebundle it, a catalog entry can advertise a **community-native
+provider** — a pointer at the community-published extension. Ducklink then dispatches
+`INSTALL <extension_name> FROM community; LOAD <extension_name>;` on the user's
+behalf when they ask for the native path.
+
+Provider shape:
+
+```json
+{
+  "id": "cn-official",
+  "kind": "community-native",
+  "extension_name": "shellfs"
+}
+```
+
+Fields:
+
+- `kind: "community-native"` (required).
+- `extension_name` (required) — the **exact** name registered in
+  `duckdb/community-extensions`. Must match `[A-Za-z0-9_]+` (identifier-shape).
+  Ducklink refuses to run INSTALL / LOAD if the name contains anything else,
+  so a bad catalog entry can't inject SQL.
+
+No `content_digest`, `platform`, `duckdb_version`, or `url` — DuckDB's
+`INSTALL … FROM community` machinery handles all of that (per-platform
+resolution, per-DuckDB-version resolution, signature verification against
+the community key).
+
+### Function-name parity is a hard requirement
+
+The community extension **must** expose the same SQL function names as
+ducklink's WASM version. That's the whole point: the user's query works
+whether the WASM sandbox is running or the community extension is loaded;
+ducklink is the routing layer, not a mapping layer.
+
+If names diverge, don't add a community-native provider — leave users on
+the WASM path (or their explicit `INSTALL <ext> FROM community` outside
+ducklink). Silent function-name mismatches are worse than the small perf
+gain from routing.
+
+### Selection order when `kind: "native"` is requested
+
+`DUCKLINK LOAD 'name' NATIVE` and `FROM ducklink_load('name', kind => 'native')`
+consult providers in this order:
+
+1. **community-native** if the entry has one — best trust posture (signed
+   by the community key; no `-unsigned` needed); best perf (real native).
+2. **ducklink-native** matching this host's platform + DuckDB version —
+   our own build, requires `-unsigned` because our signing key isn't in
+   DuckDB's trust chain today.
+3. **Error** — no native backing available. The user should either use
+   the WASM path (`DUCKLINK LOAD 'name' WASM`, the default) or wait for
+   a native provider to land.
+
+### Example: a WASM entry with a community-native routing target
+
+```json
+{
+  "name": "shellfs_test",
+  "version": "0.1.0",
+  "description": "Test entry: ducklink WASM implementation with a community-native routing target",
+  "exports": ["shellfs_read", "shellfs_glob"],
+  "providers": [
+    {
+      "id": "wasm-primary",
+      "kind": "wasm",
+      "abi": "duckdb:extension@4.0.0",
+      "content_digest": "aa1122...",
+      "status": "supported"
+    },
+    {
+      "id": "cn-shellfs",
+      "kind": "community-native",
+      "extension_name": "shellfs"
+    }
+  ]
+}
+```
+
+Behaviour:
+
+- `DUCKLINK LOAD 'shellfs_test';` → WASM (the safe default).
+- `DUCKLINK LOAD 'shellfs_test' WASM;` → WASM (explicit).
+- `DUCKLINK LOAD 'shellfs_test' NATIVE;` → routes to `INSTALL shellfs FROM community; LOAD shellfs;`. The user's `SELECT shellfs_read(...)` calls work either way.
+
+### When to use each provider kind
+
+| Kind | Ships in ducklink infra? | Trust source | Best when |
+|---|---|---|---|
+| `wasm` | Yes (WASM blob on our CDN) | Sandboxed; no signing setup | Default; always safe; portable |
+| `native` | Yes (`.duckdb_extension` on our CDN) | Our signing key (needs `-unsigned` today) | User has explicitly opted into unsigned + perf-critical hot path + no community equivalent |
+| `community-native` | No (we just point at community-extensions) | Community-extensions signing key | An equivalent extension already exists there — never re-ship it |
+
 ## 4. How `ducklink_search` ranking works
 
 `ducklink_search('query')` splits the query on whitespace, lower-cases each

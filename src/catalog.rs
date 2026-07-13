@@ -95,8 +95,23 @@ pub struct FunctionSig {
 pub struct Provider {
     #[serde(default)]
     pub id: Option<String>,
-    /// The provider kind — `"wasm"` for a component blob, `"native"` for a
-    /// platform `.duckdb_extension`, etc.
+    /// The provider kind — how this capability is delivered:
+    ///
+    /// * `"wasm"`             — a wasm component blob served from ducklink's
+    ///                          own catalog + CDN. Loaded through wasmtime.
+    /// * `"native"`           — a platform `.duckdb_extension` built by
+    ///                          tegmentum, served from ducklink's CDN. Loaded
+    ///                          via DuckDB's own LOAD; requires `-unsigned`
+    ///                          because our signing key isn't in DuckDB's
+    ///                          trust chain today.
+    /// * `"community-native"` — the capability is already published as a
+    ///                          community-extensions extension by someone
+    ///                          else. Ducklink dispatches to
+    ///                          `INSTALL <extension_name> FROM community;
+    ///                          LOAD <extension_name>;`, so the user gets the
+    ///                          community-signed build (no `-unsigned`
+    ///                          needed). Ducklink is the routing layer;
+    ///                          the community extension is the implementation.
     #[serde(default)]
     pub kind: Option<String>,
     /// The contract generation this provider was built against, e.g.
@@ -131,12 +146,30 @@ pub struct Provider {
     /// back to a standard `BLOB_BASE`-derived URL from the digest + platform.
     #[serde(default)]
     pub url: Option<String>,
+    /// The community-extensions extension name to install + load, for
+    /// `kind == "community-native"`. Must match the exact extension name
+    /// registered in `duckdb/community-extensions`. Ducklink runs
+    /// `INSTALL <extension_name> FROM community; LOAD <extension_name>;`
+    /// via the persistent connection.
+    ///
+    /// Function-name parity is a HARD requirement: the community extension
+    /// must expose the same SQL function names as ducklink's wasm version,
+    /// so the user's query doesn't change when we dispatch to the community
+    /// build instead of loading our wasm module.
+    #[serde(default)]
+    pub extension_name: Option<String>,
 }
 
 impl Provider {
     /// True for a wasm-component provider.
     pub fn is_wasm(&self) -> bool {
         self.kind.as_deref() == Some("wasm")
+    }
+
+    /// True for a community-native provider (a pointer at an existing
+    /// duckdb/community-extensions extension). See [`Provider::kind`].
+    pub fn is_community_native(&self) -> bool {
+        self.kind.as_deref() == Some("community-native")
     }
 
     /// True for a native `.duckdb_extension` provider.
@@ -268,6 +301,20 @@ impl CatalogEntry {
                 p.platform.as_deref() == Some(platform)
                     && p.duckdb_version.as_deref() == Some(duckdb_version)
             })
+    }
+
+    /// All community-native providers of this entry, in catalog order.
+    pub fn community_native_providers(&self) -> impl Iterator<Item = &Provider> {
+        self.providers.iter().filter(|p| p.is_community_native())
+    }
+
+    /// Choose the community-native provider — the first one in catalog order
+    /// that carries an `extension_name`. Community-native providers don't need
+    /// per-platform selection because DuckDB's `INSTALL … FROM community`
+    /// handles the platform match itself.
+    pub fn select_community_native_provider(&self) -> Option<&Provider> {
+        self.community_native_providers()
+            .find(|p| p.extension_name.is_some())
     }
 
     /// The entry's own contract generation MAJOR, from `wit_contract_version`
@@ -723,6 +770,54 @@ pub const NATIVE_PLATFORM: &str = if cfg!(all(target_os = "macos", target_arch =
 /// Native providers must exist in the catalog entry with `kind: "native"` +
 /// `platform` + `duckdb_version` + `content_digest` fields. A clear
 /// error names the mismatch when no provider is a fit.
+/// Resolve a catalog NAME to the community-extensions extension name that
+/// ducklink should `INSTALL … FROM community; LOAD …;` on behalf of the user.
+/// A one-look-up: the entry either has a `community-native` provider or it
+/// doesn't. No download, no cache — DuckDB's own extension-install machinery
+/// handles the rest.
+///
+/// Returns the `extension_name` field from the community-native provider,
+/// which is the exact name registered in `duckdb/community-extensions`.
+pub fn resolve_name_to_community_native(name: &str) -> Result<String, String> {
+    let catalog = resolve_catalog();
+    let entry = catalog.find(name).ok_or_else(|| {
+        crate::events::emit(
+            "unknown_name_community_native",
+            Some(name),
+            format!("no catalog entry for '{name}'"),
+        );
+        format!(
+            "ducklink_load(kind='native'): unknown extension '{name}'. Discover names \
+             with `SELECT name FROM ducklink.modules`."
+        )
+    })?;
+
+    let provider = entry.select_community_native_provider().ok_or_else(|| {
+        crate::events::emit(
+            "no_community_native_provider",
+            Some(name),
+            "entry has no community-native provider".to_string(),
+        );
+        format!(
+            "ducklink_load(kind='native'): '{name}' has no community-native provider. \
+             (A community-native provider records that the capability exists as an \
+             extension in `duckdb/community-extensions`; ducklink would `INSTALL … FROM \
+             community; LOAD …;` in that case.)"
+        )
+    })?;
+
+    let ext_name = provider
+        .extension_name
+        .clone()
+        .expect("select_community_native_provider filtered to Some(extension_name)");
+    crate::events::emit(
+        "select_community_native_provider",
+        Some(name),
+        format!("community extension '{ext_name}'"),
+    );
+    Ok(ext_name)
+}
+
 pub fn resolve_name_to_native(
     name: &str,
     platform: &str,

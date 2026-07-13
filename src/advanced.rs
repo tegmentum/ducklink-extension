@@ -900,13 +900,67 @@ unsafe fn ducklink_load_native_impl(
         }
     };
 
-    // 1. Resolve + ensure cached (downloads on cache miss). Sha256-verified
-    //    against catalog digest before being cached.
-    use crate::catalog::{resolve_name_to_native, NATIVE_PLATFORM};
+    // 1. Prefer a community-native provider — INSTALL + LOAD from
+    //    `duckdb/community-extensions`. Signed by community's key so no
+    //    `-unsigned` needed. This is the routing-layer story: ducklink
+    //    delegates to an existing native implementation when one is
+    //    published, rather than shipping a competing native build.
+    use crate::catalog::{resolve_name_to_community_native, resolve_name_to_native, NATIVE_PLATFORM};
+    if let Ok(community_ext) = resolve_name_to_community_native(name_str) {
+        // Belt-and-braces: identifier check on the extension name so a bad
+        // catalog entry can't inject SQL into INSTALL / LOAD.
+        if !community_ext
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            *out_summary = CString::new(format!(
+                "DUCKLINK LOAD NATIVE: community-native provider for '{name_str}' names \
+                 '{community_ext}', which contains characters outside [A-Za-z0-9_]. \
+                 Refusing to run INSTALL / LOAD."
+            ))
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+        let install_sql = format!("INSTALL {community_ext} FROM community");
+        let load_sql = format!("LOAD {community_ext}");
+        if let Err(e) = load_via_duckdb_query(db.cast(), &install_sql) {
+            *out_summary = CString::new(format!(
+                "DUCKLINK LOAD NATIVE: INSTALL {community_ext} FROM community failed: {e}"
+            ))
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+        if let Err(e) = load_via_duckdb_query(db.cast(), &load_sql) {
+            *out_summary = CString::new(format!(
+                "DUCKLINK LOAD NATIVE: LOAD {community_ext} failed after INSTALL: {e}"
+            ))
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+        crate::events::emit(
+            "load_community_native_ok",
+            Some(name_str),
+            community_ext.clone(),
+        );
+        *out_summary = CString::new(format!(
+            "installed '{name_str}' via community-extensions:{community_ext}"
+        ))
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut());
+        return 0;
+    }
+
+    // 2. Fall back to a ducklink-hosted native provider matching this
+    //    host's platform + DuckDB version. Downloads + sha256-verifies
+    //    against catalog digest before caching. LOAD via DuckDB's native
+    //    machinery on the cached path.
     let path = match resolve_name_to_native(name_str, NATIVE_PLATFORM, HOST_DUCKDB_VERSION) {
         Ok(p) => p,
         Err(e) => {
-            *out_summary = CString::new(format!("LOAD NATIVE: {e}"))
+            *out_summary = CString::new(format!("DUCKLINK LOAD NATIVE: {e}"))
                 .map(|c| c.into_raw())
                 .unwrap_or(std::ptr::null_mut());
             return 1;
@@ -974,7 +1028,22 @@ unsafe fn load_via_duckdb(db: ffi::duckdb_database, path: &str) -> Result<(), St
     // Escape single-quotes in the path (extremely unlikely but let's be right).
     let escaped = path.replace('\'', "''");
     let sql = format!("LOAD '{escaped}'");
-    let c_sql = CString::new(sql).map_err(|e| format!("path contains NUL: {e}"))?;
+    load_via_duckdb_query(db, &sql)
+}
+
+/// Open a sibling connection on the live database and run an arbitrary SQL
+/// statement (used for the community-native `INSTALL <ext> FROM community` +
+/// `LOAD <ext>` pair). Returns the DuckDB error string on failure.
+///
+/// # Safety
+/// `db` must be a valid live `duckdb_database`. Callers are responsible for
+/// validating any user-controlled data spliced into `sql` — see the identifier
+/// check on `extension_name` in the community-native branch.
+unsafe fn load_via_duckdb_query(
+    db: ffi::duckdb_database,
+    sql: &str,
+) -> Result<(), String> {
+    let c_sql = CString::new(sql).map_err(|e| format!("query contains NUL: {e}"))?;
 
     let mut conn: ffi::duckdb_connection = std::ptr::null_mut();
     if ffi::duckdb_connect(db, &mut conn) != ffi::DuckDBSuccess {
