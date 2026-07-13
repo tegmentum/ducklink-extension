@@ -3678,11 +3678,14 @@ struct ModuleRow {
     description: String,
     categories: String,
     loaded: bool,
-    /// `true` when the catalog entry ships a native `.duckdb_extension` provider
-    /// matching THIS host's platform + DuckDB ABI version (i.e. `LOAD NATIVE
-    /// '<name>'` would be resolvable). Independent of `loaded` — a native
-    /// artifact may be available without being loaded, and a module loaded as
-    /// wasm may still have a native provider listed in the catalog.
+    /// `true` when the catalog entry has ANY native backing that resolves on
+    /// THIS host — either a `kind:"native"` provider matching this host's
+    /// platform + DuckDB ABI, or a `kind:"community-native"` provider (routed
+    /// to `INSTALL ... FROM community`). From the user's perspective the two
+    /// are equivalent: `DUCKLINK LOAD '<name>' NATIVE` will succeed either way.
+    /// Independent of `loaded` — a native artifact may be available without
+    /// being loaded, and a module loaded as wasm may still have a native
+    /// backing listed in the catalog.
     native_available: bool,
     scalars: i32,
     tables: i32,
@@ -3734,17 +3737,21 @@ impl VTab for WasmModules {
                 .iter()
                 .map(|e| {
                     let is_loaded = loaded.contains(&e.name);
-                    // A native artifact is available IFF the catalog carries a
-                    // `kind:"native"` provider matching THIS host's platform +
-                    // DuckDB ABI. Uses the same selector `LOAD NATIVE` calls at
-                    // resolve time, so a `true` here means `ducklink_install_native`
-                    // would succeed against the current snapshot.
+                    // A native backing is available IFF the catalog carries
+                    // EITHER a `kind:"native"` provider matching THIS host's
+                    // platform + DuckDB ABI, OR a `kind:"community-native"`
+                    // provider (dispatched via `INSTALL ... FROM community`).
+                    // Mirrors the resolution order in `DUCKLINK LOAD ... NATIVE`
+                    // (community-native preferred, ducklink-native fallback) —
+                    // from the user's perspective both mean "if I ask for
+                    // NATIVE, ducklink can deliver".
                     let native_available = e
                         .select_native_provider(
                             crate::catalog::NATIVE_PLATFORM,
                             crate::catalog::HOST_DUCKDB_VERSION,
                         )
-                        .is_some();
+                        .is_some()
+                        || e.select_community_native_provider().is_some();
                     // Loaded modules report EXACT live counts; unloaded ones show
                     // a coarse presence-flag (1/0) inferred from `requires`, since
                     // the catalog carries no per-function counts.
