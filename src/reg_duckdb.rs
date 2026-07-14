@@ -6263,4 +6263,109 @@ mod tests {
             assert!(err.contains("no scalar/aggregate/table function"), "got: {err}");
         }
     }
+
+    /// Live-network smoke that aliases functions from a REAL community
+    /// extension (not user-CREATE-MACRO stand-ins) and asserts the
+    /// aggregate transparency contract on both a scalar and an aggregate
+    /// path. Complements `tests/live_community_alias_smoke.rs`, which
+    /// exercises the full `ducklink_load()` entry pipeline with a
+    /// synthetic catalog fixture; this one calls `catalog_alias` directly,
+    /// so a regression that lives above the shim (parser, resolver,
+    /// runtime handle) surfaces there while a regression IN the shim
+    /// surfaces here.
+    ///
+    /// Ignored by default — needs outbound HTTPS to
+    /// `community-extensions.duckdb.org`. Run with:
+    ///   cargo test --release --no-default-features \
+    ///     --features bundled,advanced,network --lib -- \
+    ///     shim_alias_over_real_community_aggregate --ignored --nocapture
+    #[cfg(all(advanced_tier, feature = "network"))]
+    #[test]
+    #[ignore]
+    fn shim_alias_over_real_community_aggregate() {
+        use duckdb::ffi;
+        // Isolate the INSTALL cache to a fresh HOME.
+        let scratch = std::env::temp_dir().join(format!("dl_cn_shim_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        unsafe {
+            std::env::set_var("HOME", &scratch);
+            std::env::set_var("XDG_CACHE_HOME", scratch.join(".cache"));
+        }
+
+        let (raw, shim_con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let shim_con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, shim_con)
+        };
+
+        shim_con
+            .execute("INSTALL crypto FROM community", [])
+            .expect("INSTALL crypto");
+        shim_con.execute("LOAD crypto", []).expect("LOAD crypto");
+
+        // Scalar path: crypto_hash -> hash.
+        let kind_scalar = unsafe {
+            crate::advanced::catalog_alias(raw, "crypto_hash", "hash")
+                .expect("alias crypto_hash")
+        };
+        assert_eq!(kind_scalar, crate::advanced::AliasKind::Scalar);
+        let s: Vec<u8> = shim_con
+            .query_row("SELECT hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("scalar alias hash()");
+        assert_eq!(s.len(), 32, "sha2-256 -> 32 bytes");
+
+        // Aggregate path: crypto_hash_agg -> hash_agg. The aggregate is
+        // ORDER_DEPENDENT in crypto's C++ (requires an ORDER BY), and the
+        // whole point of the shim is that the alias inherits ALL modifier
+        // support because it's a real AggregateFunctionCatalogEntry —
+        // basic ORDER BY / DISTINCT / FILTER must produce byte-identical
+        // BLOB output against community's own name.
+        let kind = unsafe {
+            crate::advanced::catalog_alias(raw, "crypto_hash_agg", "hash_agg")
+                .expect("alias crypto_hash_agg")
+        };
+        assert_eq!(kind, crate::advanced::AliasKind::Aggregate);
+
+        shim_con
+            .execute_batch(
+                "CREATE TABLE t(s VARCHAR, ok BOOL); \
+                 INSERT INTO t VALUES ('a', true), ('a', false), ('b', true), ('c', true);",
+            )
+            .expect("seed");
+        for (label, alias_sql, orig_sql) in [
+            (
+                "basic ORDER BY",
+                "SELECT hash_agg('sha2-256', s ORDER BY s) FROM t",
+                "SELECT crypto_hash_agg('sha2-256', s ORDER BY s) FROM t",
+            ),
+            (
+                "DISTINCT + ORDER BY",
+                "SELECT hash_agg(DISTINCT 'sha2-256', s ORDER BY s) FROM t",
+                "SELECT crypto_hash_agg(DISTINCT 'sha2-256', s ORDER BY s) FROM t",
+            ),
+            (
+                "FILTER + ORDER BY",
+                "SELECT hash_agg('sha2-256', s ORDER BY s) FILTER (WHERE ok) FROM t",
+                "SELECT crypto_hash_agg('sha2-256', s ORDER BY s) FILTER (WHERE ok) FROM t",
+            ),
+        ] {
+            let a: Vec<u8> = shim_con
+                .query_row(alias_sql, [], |r| r.get(0))
+                .expect(alias_sql);
+            let b: Vec<u8> = shim_con
+                .query_row(orig_sql, [], |r| r.get(0))
+                .expect(orig_sql);
+            assert_eq!(a, b, "{label} mismatch");
+            assert!(!a.is_empty(), "{label} returned empty");
+        }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }

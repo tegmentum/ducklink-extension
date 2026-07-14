@@ -35,6 +35,7 @@
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/enums/on_create_conflict.hpp"
 #include "duckdb/common/enums/on_entry_not_found.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
@@ -133,9 +134,33 @@ extern "C" int32_t ducklink_alias_function(
 		// name lives in.
 		int32_t rc = 0;
 		try {
-			if (auto entry = catalog.GetEntry(context, CatalogType::AGGREGATE_FUNCTION_ENTRY,
-			                                  schema, ex_name, OnEntryNotFound::RETURN_NULL)) {
-				auto &afe = entry->Cast<AggregateFunctionCatalogEntry>();
+			// DuckDB's `Catalog::GetEntry(context, CatalogType, schema, name,
+			// RETURN_NULL)` is NOT strict on the type filter in the "main"
+			// schema: probing `AGGREGATE_FUNCTION_ENTRY` for a scalar-registered
+			// name (e.g. `crypto_hash`) still returns the scalar entry, and
+			// `Cast<AggregateFunctionCatalogEntry>` on that is a
+			// `reinterpret_cast` that SIGSEGVs the moment aggregate-only
+			// fields are touched. Probe each kind but only accept the entry
+			// when its actual `type` matches the kind we asked for; treat any
+			// mismatched-type return like a null.
+			auto probe = [&](CatalogType want) -> optional_ptr<CatalogEntry> {
+				try {
+					auto e = catalog.GetEntry(context, want, schema, ex_name,
+					                          OnEntryNotFound::RETURN_NULL);
+					return (e && e->type == want) ? e : nullptr;
+				} catch (...) {
+					return nullptr;
+				}
+			};
+			auto agg_entry = probe(CatalogType::AGGREGATE_FUNCTION_ENTRY);
+			auto sc_entry  = agg_entry ? optional_ptr<CatalogEntry>(nullptr)
+			                           : probe(CatalogType::SCALAR_FUNCTION_ENTRY);
+			auto tbl_entry = (agg_entry || sc_entry)
+			                     ? optional_ptr<CatalogEntry>(nullptr)
+			                     : probe(CatalogType::TABLE_FUNCTION_ENTRY);
+
+			if (agg_entry) {
+				auto &afe = agg_entry->Cast<AggregateFunctionCatalogEntry>();
 				CreateAggregateFunctionInfo info(
 				    rename_set<AggregateFunctionSet, AggregateFunction>(afe.functions, new_nm));
 				info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
@@ -143,9 +168,8 @@ extern "C" int32_t ducklink_alias_function(
 				info.name = new_nm;
 				catalog.CreateFunction(context, info);
 				rc = 1;
-			} else if (auto entry = catalog.GetEntry(context, CatalogType::SCALAR_FUNCTION_ENTRY,
-			                                         schema, ex_name, OnEntryNotFound::RETURN_NULL)) {
-				auto &sfe = entry->Cast<ScalarFunctionCatalogEntry>();
+			} else if (sc_entry) {
+				auto &sfe = sc_entry->Cast<ScalarFunctionCatalogEntry>();
 				CreateScalarFunctionInfo info(
 				    rename_set<ScalarFunctionSet, ScalarFunction>(sfe.functions, new_nm));
 				info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
@@ -153,9 +177,8 @@ extern "C" int32_t ducklink_alias_function(
 				info.name = new_nm;
 				catalog.CreateFunction(context, info);
 				rc = 2;
-			} else if (auto entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY,
-			                                        schema, ex_name, OnEntryNotFound::RETURN_NULL)) {
-				auto &tfe = entry->Cast<TableFunctionCatalogEntry>();
+			} else if (tbl_entry) {
+				auto &tfe = tbl_entry->Cast<TableFunctionCatalogEntry>();
 				CreateTableFunctionInfo info(
 				    rename_set<TableFunctionSet, TableFunction>(tfe.functions, new_nm));
 				info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
