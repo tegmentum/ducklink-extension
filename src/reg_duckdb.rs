@@ -6280,6 +6280,87 @@ mod tests {
         assert_eq!(bare, 3);
     }
 
+    /// Slice-4a acceptance: `DUCKLINK PREFIX c: stats;` — declare a session
+    /// alias `c` for schema `stats` and prove every function in `stats`
+    /// becomes callable as `c.<fn>`. Uses the built-in `sum` aggregate
+    /// double-registered under `stats.total` (Slice 3), then aliases the
+    /// whole schema. Requires the parser hook + full ducklink runtime, so
+    /// we use `register_load_function` to set up ducklink_load first.
+    #[cfg(advanced_tier)]
+    #[test]
+    fn ducklink_prefix_aliases_whole_namespace_schema() {
+        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::engine::Engine2;
+        use duckdb::ffi;
+        let (db, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            (db, con)
+        };
+        let engine = Arc::new(Engine2::new().expect("engine"));
+        register_load_function(&con, db, engine).expect("register ducklink_load");
+        // RUNTIME can only be bound to one db per process. If a prior test
+        // has claimed it against a different db, skip cleanly rather than
+        // registering onto the wrong catalog.
+        if !runtime_is_ours(db) {
+            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
+            return;
+        }
+        // The C++ ParserExtension teaches DuckDB's parser about `DUCKLINK`.
+        // Real loads (loadable init) install it automatically; bundled
+        // tests need to do it explicitly.
+        extern "C" {
+            fn ducklink_register_parser(db: *mut std::ffi::c_void) -> i32;
+        }
+        let prc = unsafe { ducklink_register_parser(db.cast()) };
+        assert_eq!(prc, 0, "ducklink_register_parser rc={prc}");
+
+        // Set up schema `stats` with a function (`stats.total` = `sum`).
+        // Use the shim directly to avoid needing an INSTALL FROM community.
+        let raw = RUNTIME.get().unwrap().raw_con.0;
+        assert!(!raw.is_null());
+        unsafe {
+            crate::advanced::catalog_alias(raw, None, "sum", Some("stats"), "total")
+                .expect("alias sum -> stats.total");
+        }
+
+        // The statement under test: `DUCKLINK PREFIX c: stats;`.
+        let summary: String = con
+            .query_row(
+                "DUCKLINK PREFIX c: stats",
+                [],
+                |r| r.get(0),
+            )
+            .expect("DUCKLINK PREFIX");
+        assert!(
+            summary.contains("aliased") && summary.contains("stats"),
+            "unexpected summary: {summary}"
+        );
+
+        // Both qualifiers now resolve to the same underlying aggregate.
+        con.execute_batch(
+            "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2),(3);",
+        )
+        .expect("seed");
+        let via_ns: i64 = con
+            .query_row("SELECT stats.total(x) FROM t", [], |r| r.get(0))
+            .expect("stats.total");
+        let via_alias: i64 = con
+            .query_row("SELECT c.total(x) FROM t", [], |r| r.get(0))
+            .expect("c.total");
+        assert_eq!(via_ns, 6);
+        assert_eq!(via_alias, 6);
+
+        // The parser rejects malformed shapes cleanly rather than binding
+        // garbage aliases.
+        let bad = con.execute("DUCKLINK PREFIX c! : stats", []);
+        assert!(bad.is_err(), "malformed prefix must error");
+    }
+
     // --- Advanced-tier catalog-alias smoke: real aggregate transparency ----
     //
     // The C++ shim registers `existing` under `new_name` as a real

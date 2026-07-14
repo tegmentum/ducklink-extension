@@ -86,7 +86,42 @@ static unique_ptr<FunctionData> DucklinkExecBindFn(ClientContext &context, Table
 
 	const string wasm_sentinel = DUCKLINK_LOAD_WASM_SENTINEL;
 	const string native_sentinel = DUCKLINK_LOAD_NATIVE_SENTINEL;
+	const string prefix_sentinel = DUCKLINK_PREFIX_SENTINEL;
 	auto matches = [&](const string &prefix) { return rewrite.rfind(prefix, 0) == 0; };
+
+	if (matches(prefix_sentinel)) {
+		// DUCKLINK PREFIX payload is `{alias}\t{namespace}` — the tab is
+		// illegal in identifiers so a split is unambiguous.
+		string payload = rewrite.substr(prefix_sentinel.size());
+		auto tab = payload.find('\t');
+		if (tab == string::npos) {
+			throw InvalidInputException("DUCKLINK PREFIX: malformed payload");
+		}
+		string alias = payload.substr(0, tab);
+		string ns = payload.substr(tab + 1);
+		DatabaseWrapper wrapper;
+		wrapper.database = make_shared_ptr<DuckDB>(*context.db);
+		char *summary = nullptr;
+		int32_t rc = ducklink_prefix(reinterpret_cast<void *>(&wrapper), alias.c_str(),
+		                             ns.c_str(), &summary);
+		string msg = summary ? string(summary) : string("DUCKLINK PREFIX: no summary");
+		if (summary) {
+			ducklink_adv_free(summary);
+		}
+		if (rc != 0) {
+			throw InvalidInputException("%s", msg);
+		}
+		result->types = {LogicalType::VARCHAR};
+		result->names = {"summary"};
+		auto chunk = make_uniq<DataChunk>();
+		chunk->Initialize(Allocator::DefaultAllocator(), result->types);
+		chunk->SetValue(0, 0, Value(msg));
+		chunk->SetCardinality(1);
+		result->chunks.push_back(std::move(chunk));
+		return_types = result->types;
+		names = result->names;
+		return std::move(result);
+	}
 
 	if (matches(wasm_sentinel) || matches(native_sentinel)) {
 		const bool is_native = matches(native_sentinel);

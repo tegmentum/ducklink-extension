@@ -97,6 +97,22 @@ int32_t ducklink_load_wasm(void *db, const char *path, char **out_summary);
 // (including remediation for the common unsigned-signature case) and returns != 0.
 int32_t ducklink_load_native(void *db, const char *name, char **out_summary);
 
+// Sentinel prefix for `DUCKLINK PREFIX <alias>: <namespace>[;]`. The parser
+// bridge returns this + `<alias>\t<namespace>`; the plan path recognises
+// it and calls `ducklink_prefix` with the live context db. Lock-step with
+// PREFIX_SENTINEL in src/advanced.rs.
+#define DUCKLINK_PREFIX_SENTINEL "\001ducklink:prefix\001"
+
+// DUCKLINK PREFIX: register every function in schema `namespace` (in the
+// live database) as an alias under schema `alias`. Both schema arguments
+// must be `[A-Za-z0-9_]+` identifiers. Non-fatal per-function: a mapping
+// that fails for one function still lets the rest through, with a summary
+// noting how many succeeded. On success writes a malloc'd summary (free via
+// ducklink_adv_free) and returns 0; on error writes a human-readable
+// message and returns != 0.
+int32_t ducklink_prefix(void *db, const char *alias, const char *namespace_,
+                        char **out_summary);
+
 //===----------------------------------------------------------------------===//
 // catalog-alias shim (cpp/ducklink_alias.cpp) — community-native transparency
 //===----------------------------------------------------------------------===//

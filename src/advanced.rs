@@ -84,6 +84,14 @@ const LOAD_WASM_SENTINEL: &str = "\u{1}ducklink:load-wasm\u{1}";
 /// `DUCKLINK_LOAD_NATIVE_SENTINEL` in cpp/ducklink_advanced.h.
 const LOAD_NATIVE_SENTINEL: &str = "\u{1}ducklink:load-native\u{1}";
 
+/// Sentinel prefix the parser bridge returns for a `DUCKLINK PREFIX
+/// <alias>: <namespace>;` statement. Payload is `{alias}\t{namespace}` —
+/// the tab is illegal inside SQL identifiers, so it never collides with
+/// a real name. The C++ plan path strips this and calls
+/// [`ducklink_prefix`] with the parser's LIVE database. Kept in lock-step
+/// with `DUCKLINK_PREFIX_SENTINEL` in cpp/ducklink_advanced.h.
+const PREFIX_SENTINEL: &str = "\u{1}ducklink:prefix\u{1}";
+
 static ADVANCED: OnceLock<Advanced> = OnceLock::new();
 /// Bridge-local cursor id generator (0 is reserved for "open failed").
 static CURSOR_SEQ: AtomicU32 = AtomicU32::new(1);
@@ -779,6 +787,16 @@ unsafe fn ducklink_parser_try_rewrite_impl(sql: *const c_char) -> *mut c_char {
             .unwrap_or(std::ptr::null_mut());
     }
 
+    // `DUCKLINK PREFIX <alias>: <namespace>;` — declare a session-scoped
+    // schema alias. The C++ plan path strips the sentinel and invokes
+    // `ducklink_prefix` with the live db.
+    if let Some((alias, namespace)) = parse_ducklink_prefix(&query) {
+        let sentinel = format!("{PREFIX_SENTINEL}{alias}\t{namespace}");
+        return CString::new(sentinel)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+
     let adv = match ADVANCED.get() {
         Some(a) => a,
         None => return std::ptr::null_mut(),
@@ -936,6 +954,41 @@ fn parse_ducklink_load(sql: &str) -> Option<(String, LoadKind)> {
     };
 
     Some((name.to_string(), kind))
+}
+
+/// Recognize `DUCKLINK PREFIX <alias>: <namespace>[;]` (case-insensitive on
+/// the keywords, optional trailing whitespace / semicolon) and return the
+/// two identifiers. Both must be plain SQL identifiers (`[A-Za-z0-9_]+`);
+/// anything else means "not our statement" and returns `None` so the parser
+/// hook falls through unchanged.
+fn parse_ducklink_prefix(sql: &str) -> Option<(String, String)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let rest = strip_keyword(s, "DUCKLINK")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = strip_keyword(rest, "PREFIX")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+
+    // The alias is an identifier up to the `:` separator (allowing spaces
+    // before the colon).
+    let colon_idx = rest.find(':')?;
+    let alias = rest[..colon_idx].trim();
+    let after_colon = rest[colon_idx + 1..].trim();
+    let namespace = after_colon;
+    if alias.is_empty() || namespace.is_empty() {
+        return None;
+    }
+    if !crate::catalog::is_safe_identifier(alias)
+        || !crate::catalog::is_safe_identifier(namespace)
+    {
+        return None;
+    }
+    Some((alias.to_string(), namespace.to_string()))
 }
 
 /// The `duckdb_version` string the extension was compiled against. Used to
@@ -1124,6 +1177,153 @@ unsafe fn ducklink_load_native_impl(
             1
         }
     }
+}
+
+/// `DUCKLINK PREFIX <alias>: <namespace>;` — declare a schema alias.
+///
+/// Enumerates every function currently registered in the `<namespace>`
+/// schema (in the default catalog, where community-native double-
+/// registration lands via [`catalog_alias`]) and re-registers each of
+/// them under the `<alias>` schema. The result: `alias.foo(x)` and
+/// `namespace.foo(x)` bind to the same underlying function set.
+///
+/// # Safety
+/// `db` must be the valid live `duckdb_database`; `alias` and `namespace`
+/// valid C strings; `out_summary` a valid pointer to write one
+/// `*mut c_char` into. Callers of the ABI free the summary via
+/// [`ducklink_adv_free`].
+#[no_mangle]
+pub unsafe extern "C" fn ducklink_prefix(
+    db: *mut c_void,
+    alias: *const c_char,
+    namespace: *const c_char,
+    out_summary: *mut *mut c_char,
+) -> i32 {
+    guard(2, || unsafe { ducklink_prefix_impl(db, alias, namespace, out_summary) })
+}
+
+unsafe fn ducklink_prefix_impl(
+    db: *mut c_void,
+    alias_c: *const c_char,
+    namespace_c: *const c_char,
+    out_summary: *mut *mut c_char,
+) -> i32 {
+    if db.is_null() || alias_c.is_null() || namespace_c.is_null() || out_summary.is_null() {
+        return 2;
+    }
+    let alias = match CStr::from_ptr(alias_c).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            *out_summary = CString::new("DUCKLINK PREFIX: alias is not valid UTF-8")
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+    };
+    let namespace = match CStr::from_ptr(namespace_c).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            *out_summary = CString::new("DUCKLINK PREFIX: namespace is not valid UTF-8")
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+    };
+    // Belt-and-braces identifier gate — the parser already validated both
+    // as `[A-Za-z0-9_]+` before returning the sentinel, but re-check so a
+    // caller reaching us through a different path can't inject SQL through
+    // the `schema_name = '...'` splice below.
+    if !crate::catalog::is_safe_identifier(&alias)
+        || !crate::catalog::is_safe_identifier(&namespace)
+    {
+        *out_summary = CString::new(format!(
+            "DUCKLINK PREFIX: alias / namespace must match [A-Za-z0-9_]+ \
+             (got alias='{alias}', namespace='{namespace}')"
+        ))
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut());
+        return 1;
+    }
+
+    // Enumerate functions in the source schema. Community-native
+    // double-registration (see reg_duckdb.rs::create_community_aliases +
+    // advanced.rs::create_community_aliases_advanced) puts aliases in the
+    // default catalog's `<namespace>` schema, so this is the schema
+    // `duckdb_functions()` reports for them.
+    let scan_sql = format!(
+        "SELECT function_name FROM duckdb_functions() \
+         WHERE schema_name = '{namespace}' \
+         AND function_type IN ('scalar','aggregate','table_macro','scalar_macro','macro','table') \
+         GROUP BY function_name"
+    );
+    let db_h: ffi::duckdb_database = db.cast();
+    let rows = match query_rows_via_duckdb(db_h, &scan_sql) {
+        Ok(r) => r,
+        Err(e) => {
+            *out_summary = CString::new(format!("DUCKLINK PREFIX: scan failed: {e}"))
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            return 1;
+        }
+    };
+    let fns: Vec<String> = rows
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .filter(|n| crate::catalog::is_safe_identifier(n))
+        .collect();
+    if fns.is_empty() {
+        *out_summary = CString::new(format!(
+            "DUCKLINK PREFIX: namespace '{namespace}' has no functions to alias — \
+             is the module loaded?"
+        ))
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut());
+        return 1;
+    }
+
+    // Open a sibling raw connection for the alias pass.
+    let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(db_h, &mut raw) != ffi::DuckDBSuccess {
+        *out_summary = CString::new("DUCKLINK PREFIX: duckdb_connect failed")
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+        return 1;
+    }
+    struct ConnGuard(ffi::duckdb_connection);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_disconnect(&mut self.0) };
+        }
+    }
+    let _guard = ConnGuard(raw);
+
+    let mut aliased = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for fn_name in &fns {
+        // Re-register `namespace.fn_name` under `alias.fn_name` — same name
+        // in both schemas, just a different qualifier prefix.
+        match catalog_alias(raw, Some(&namespace), fn_name, Some(&alias), fn_name) {
+            Ok(_) => aliased += 1,
+            Err(e) => {
+                if errors.len() < 3 {
+                    errors.push(format!("{fn_name}: {e}"));
+                }
+            }
+        }
+    }
+
+    let mut summary = format!(
+        "DUCKLINK PREFIX {alias}: {namespace} — aliased {aliased} of {} function(s)",
+        fns.len()
+    );
+    if !errors.is_empty() {
+        summary.push_str("; errors: ");
+        summary.push_str(&errors.join(", "));
+    }
+    *out_summary = CString::new(summary)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut());
+    0
 }
 
 /// Open a sibling connection on the live database and run
