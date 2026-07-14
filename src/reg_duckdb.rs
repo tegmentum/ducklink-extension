@@ -5445,14 +5445,45 @@ mod tests {
     use crate::engine::Engine2;
     use std::path::PathBuf;
 
-    fn sample_component() -> PathBuf {
-        // Defaults to the monorepo layout; overridable with `DUCKLINK_CORPUS_DIR`
-        // so the bundled tests run from the standalone repo checkout too.
+    /// Path to the prebuilt `sample_extension.wasm` component if it exists on
+    /// disk. Looks first at `DUCKLINK_CORPUS_DIR/sample_extension.wasm`, then
+    /// falls back to the monorepo checkout layout (`../../artifacts/extensions`
+    /// relative to this crate). Returns `None` when neither yields a real
+    /// file — the standalone repo has no built-in corpus, so tests that need
+    /// the sample wasm early-skip on that outcome instead of failing.
+    fn sample_component() -> Option<PathBuf> {
         let dir = match std::env::var_os("DUCKLINK_CORPUS_DIR") {
             Some(dir) => PathBuf::from(dir),
             None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/extensions"),
         };
-        dir.join("sample_extension.wasm")
+        let path = dir.join("sample_extension.wasm");
+        if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve `sample_component()` or early-return from the calling test
+    /// with a skip message. Used by end-to-end tests that need the wasm
+    /// corpus — treats missing/empty corpus as "not applicable to this
+    /// checkout" rather than a failure. Set `DUCKLINK_CORPUS_DIR` to point
+    /// at a directory containing `sample_extension.wasm` to run them.
+    macro_rules! require_sample_component {
+        ($test:literal) => {
+            match sample_component() {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "[skip] {}: sample_extension.wasm not found. \
+                         Point DUCKLINK_CORPUS_DIR at a directory containing it \
+                         (monorepo default: <workspace>/artifacts/extensions).",
+                        $test
+                    );
+                    return;
+                }
+            }
+        };
     }
 
     /// End-to-end: load the sample wasm component, register its
@@ -5460,9 +5491,10 @@ mod tests {
     /// and confirm the +1 is computed inside the wasm component.
     #[test]
     fn sample_plus_one_dispatches_into_wasm() {
+        let path = require_sample_component!("sample_plus_one_dispatches_into_wasm");
         let mut engine = Engine2::new().expect("engine");
         let loaded = engine
-            .load("sample_extension", &sample_component())
+            .load("sample_extension", &path)
             .expect("load component");
         let engine = Arc::new(engine);
 
@@ -5493,10 +5525,11 @@ mod tests {
     /// component by spec and registers its scalars.
     #[test]
     fn register_components_exposes_scalar() {
+        let path = require_sample_component!("register_components_exposes_scalar");
         let engine = Arc::new(Engine2::new().expect("engine"));
         let specs = vec![ComponentSpec {
             name: "sample_extension".to_string(),
-            path: sample_component(),
+            path,
         }];
         let con = Connection::open_in_memory().expect("open duckdb");
         let n =
@@ -5514,10 +5547,11 @@ mod tests {
     /// bridge.
     #[test]
     fn sample_emit_sequence_streams_from_wasm() {
+        let path = require_sample_component!("sample_emit_sequence_streams_from_wasm");
         let engine = Arc::new(Engine2::new().expect("engine"));
         let specs = vec![ComponentSpec {
             name: "sample_extension".to_string(),
-            path: sample_component(),
+            path,
         }];
         let con = Connection::open_in_memory().expect("open duckdb");
         register_components(&con, None, None, engine, &specs).expect("register components");
@@ -5563,6 +5597,7 @@ mod tests {
     /// in a LATER `query_row`, call the freshly-registered `sample_plus_one`.
     #[test]
     fn ducklink_load_registers_at_runtime_for_later_statements() {
+        let path = require_sample_component!("ducklink_load_registers_at_runtime_for_later_statements");
         let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             // Raw database, exactly as DuckDB hands the loadable entry point one.
@@ -5594,7 +5629,6 @@ mod tests {
             );
 
             // STATEMENT 1: load the component at runtime from SQL.
-            let path = sample_component();
             let path_str = path.to_str().expect("utf8 path").to_string();
             let (got_name, n_scalars): (String, i64) = con
                 .query_row(
@@ -5879,9 +5913,10 @@ mod tests {
     /// the same db and rely on db-wide visibility.)
     #[test]
     fn registered_function_visible_across_connections() {
+        let path = require_sample_component!("registered_function_visible_across_connections");
         let mut engine = Engine2::new().expect("engine");
         let loaded = engine
-            .load("sample_extension", &sample_component())
+            .load("sample_extension", &path)
             .expect("load");
         let engine = Arc::new(engine);
         let con = Connection::open_in_memory().expect("open");

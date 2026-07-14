@@ -11,9 +11,14 @@
 //! concurrency.
 //!
 //! Only pure-compute, deterministic components are used (no dns/http), so the
-//! suite is reproducible. The whole file is a no-op without the `bundled`
-//! feature (which provides the in-process DuckDB to register into).
-#![cfg(feature = "bundled")]
+//! suite is reproducible. The whole file is a no-op unless BOTH the `bundled`
+//! feature is on (provides the in-process DuckDB to register into) AND the
+//! wasm corpus was discovered at build time (`have_corpus`, emitted by
+//! build.rs when it finds `sample_extension.wasm` in `DUCKLINK_CORPUS_DIR` or
+//! the monorepo default). The standalone repo checkout and the community-
+//! extensions CI both lack the corpus, so the entire file compiles out there
+//! and no tests fail for a setup they can't satisfy.
+#![cfg(all(feature = "bundled", have_corpus))]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -7,9 +7,11 @@
 //!
 //! It reuses the same corpus the standalone wasm host (Scenario 2) runs, so the
 //! two scenarios are checked against one set of golden expectations. The whole
-//! file is a no-op without the `bundled` feature (which provides an in-process
-//! DuckDB to register into).
-#![cfg(feature = "bundled")]
+//! file is a no-op unless BOTH the `bundled` feature is on (in-process DuckDB
+//! to register into) AND the wasm corpus was discovered at build time
+//! (`have_corpus`, emitted by build.rs — see [`bridge_coverage`] for the same
+//! gate).
+#![cfg(all(feature = "bundled", have_corpus))]
 
 use std::collections::HashSet;
 use std::fs;
