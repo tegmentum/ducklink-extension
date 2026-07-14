@@ -98,6 +98,33 @@ int32_t ducklink_load_wasm(void *db, const char *path, char **out_summary);
 int32_t ducklink_load_native(void *db, const char *name, char **out_summary);
 
 //===----------------------------------------------------------------------===//
+// catalog-alias shim (cpp/ducklink_alias.cpp) — community-native transparency
+//===----------------------------------------------------------------------===//
+
+// Register `existing_name` (a scalar / aggregate / table function already in
+// the system catalog) under `new_name`, so DuckDB's binder resolves both to
+// the same underlying function set. Ducklink's community-native branch calls
+// this after `INSTALL <ext> FROM community; LOAD <ext>;` to present community's
+// functions under ducklink's chosen names — aggregate delegation stays
+// transparent under DISTINCT / FILTER / ORDER BY / window because the alias
+// IS a real AggregateFunctionCatalogEntry, not a scalar-macro wrap.
+//
+// `conn` is a raw `duckdb_connection` (the shim casts it to the internal
+// `ConnectionWrapper` to reach ClientContext). Returns:
+//    1 = aggregate aliased
+//    2 = scalar aliased
+//    3 = table function aliased
+//   -1 = null argument
+//   -2 = invalid connection handle
+//   -3 = no function of any kind found under `existing_name`
+//   -4 = C++ exception (message in *out_err)
+//   -5 = unknown exception (message in *out_err)
+// On error, `*out_err` receives a malloc'd C string (free via
+// ducklink_adv_free); on success, `*out_err` is left NULL.
+int32_t ducklink_alias_function(void *conn, const char *existing_name,
+                                const char *new_name, char **out_err);
+
+//===----------------------------------------------------------------------===//
 // table-stream bridge (filter pushdown) — mirrors wasm_table_stream_bridge.h
 //===----------------------------------------------------------------------===//
 

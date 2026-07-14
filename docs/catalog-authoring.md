@@ -351,24 +351,38 @@ implementation, so no signal is lost. A user who happens to know community
 uses `t_sma` can still call it directly; a user reading ducklink's docs
 sees `sma` and calls that.
 
-### Which SQL macro shape ducklink emits, per function kind
+### How ducklink registers the alias, per build
 
-After `LOAD <extension_name>` succeeds, ducklink introspects
-`duckdb_functions()` for each community function in the mapping and picks
-the macro shape:
+After `LOAD <extension_name>` succeeds, ducklink discovers community's
+functions via `duckdb_functions()` and registers ducklink's chosen name
+per pair. The exact mechanism depends on which ducklink build is in use:
 
-| Community kind | Macro emitted by ducklink | Overhead |
-|---|---|---|
-| `scalar` | `CREATE OR REPLACE MACRO our(args) AS their(args);` | Inlined at plan time — zero |
-| `table` / `table_macro` | `CREATE OR REPLACE MACRO our(args) AS TABLE SELECT * FROM their(args);` | Inlined at plan time — zero |
-| `aggregate` (single-arg) | `CREATE OR REPLACE MACRO our(x) AS list_aggregate(list(x), 'their');` | One `list()` build per group + `list_aggregate` dispatch |
+* **Advanced-tier build (default in our distribution)** — the C++ shim
+  in `cpp/ducklink_alias.cpp` copies community's
+  `AggregateFunctionCatalogEntry` / `ScalarFunctionCatalogEntry` /
+  `TableFunctionCatalogEntry` into a fresh CatalogEntry under ducklink's
+  name. DuckDB's binder sees a real entry at the alias, so aggregate
+  `DISTINCT`, `FILTER (WHERE …)`, `ORDER BY`, and window-context
+  (`OVER (…)`) all work transparently through the alias. Zero per-row
+  overhead — same code path as calling community's original name.
 
-**Aggregate caveat.** The `list_aggregate` trick works for the common
-`SELECT agg(x) FROM t GROUP BY g;` shape, but does NOT propagate SQL
-aggregate modifiers (`DISTINCT`, `FILTER (WHERE …)`, `ORDER BY`) or
-work as a window function. Multi-argument aggregates are also skipped.
-Users who need any of those call community's name directly — it stays
-callable.
+* **Loadable-only build (the community-extensions CI ships this form —
+  `advanced` is stripped there)** — the shim isn't compiled in, so
+  ducklink falls back to `CREATE OR REPLACE MACRO`:
+
+  | Community kind | Macro emitted | Overhead |
+  |---|---|---|
+  | `scalar` | `CREATE OR REPLACE MACRO our(args) AS their(args);` | Inlined at plan time — zero |
+  | `table` / `table_macro` | `CREATE OR REPLACE MACRO our(args) AS TABLE SELECT * FROM their(args);` | Inlined at plan time — zero |
+  | `aggregate` (single-arg only) | `CREATE OR REPLACE MACRO our(x) AS list_aggregate(list(x), 'their');` | One `list()` build per group + `list_aggregate` dispatch |
+
+  In this build only, aggregate aliases do NOT propagate `DISTINCT` /
+  `FILTER` / `ORDER BY` / window modifiers, and multi-argument
+  aggregates are skipped. Community's original names remain callable —
+  a user who needs those modifiers writes `SELECT their_name(x)`.
+
+Same catalog authoring works for both builds — the aliasing story is
+build-transparent; only the mechanism differs.
 
 ### Function-name parity is a soft preference
 

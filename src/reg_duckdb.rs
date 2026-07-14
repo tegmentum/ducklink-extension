@@ -3503,10 +3503,15 @@ fn community_native_load(
         .into());
     }
 
-    // Generate SQL aliases so both names — community's own and ducklink's
-    // chosen — are callable. Non-fatal per-alias: a mismapping doesn't block
-    // the rest of the load. The alias summary rolls up into an event.
-    let alias_count = create_community_aliases(&con, &spec)
+    // Generate aliases so both names — community's own and ducklink's
+    // chosen — are callable. On builds where the advanced tier is compiled
+    // in, we use the C++ catalog-alias shim (real CatalogEntry per pair,
+    // full aggregate modifier support). Otherwise we fall back to
+    // CREATE OR REPLACE MACRO with the documented aggregate caveat. Both
+    // paths surface a rolled-up count in the summary; per-pair errors are
+    // non-fatal so a mismapping doesn't block the rest of the load.
+    let raw_conn = rt.raw_con.0;
+    let alias_count = create_community_aliases(&con, raw_conn, &spec)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     crate::events::emit(
@@ -3531,7 +3536,7 @@ fn community_native_load(
     })
 }
 
-/// After a community extension is INSTALLed and LOADed, generate the SQL
+/// After a community extension is INSTALLed and LOADed, generate the
 /// aliases the catalog author asked for. Returns the number of aliases
 /// created (across all kinds).
 ///
@@ -3545,14 +3550,30 @@ fn community_native_load(
 ///   ducklink discovers matching community names via `duckdb_functions()`
 ///   and creates aliases with the prefix stripped.
 ///
-/// The macro shapes themselves are built in
-/// [`crate::catalog::build_alias_macro`]; the pair-selection logic is in
-/// [`crate::catalog::compute_alias_pairs`]. This function is just the
-/// duckdb-crate flavour of the row-iteration + statement-execute plumbing
-/// around those helpers. The advanced-tier callsite in `advanced.rs` uses
-/// the C-API flavour but the same helpers.
+/// # Aliasing mechanism, by build
+///
+/// * **Advanced tier compiled in** (`cfg(advanced_tier)`): calls the C++
+///   `ducklink_alias_function` shim per pair — a real
+///   `CreateAggregateFunctionInfo` / `CreateScalarFunctionInfo` /
+///   `CreateTableFunctionInfo` gets registered under ducklink's name. The
+///   alias IS a full CatalogEntry, so aggregate DISTINCT / FILTER /
+///   ORDER BY / window all propagate transparently. If the shim rejects a
+///   pair (e.g. name not found in the catalog), that pair falls through to
+///   the macro path so the caller still gets partial coverage.
+/// * **Loadable-only tier** (community-extensions CI build with `advanced`
+///   stripped): emits `CREATE OR REPLACE MACRO` per (pair, arity). Scalar
+///   and table macros are planner-inlined (zero overhead); the aggregate
+///   fallback uses the `list_aggregate` scalar-macro trick, which works for
+///   basic `GROUP BY` but does NOT propagate aggregate modifiers.
+///
+/// Pair-selection is shared in [`crate::catalog::compute_alias_pairs`];
+/// macro-shape building is shared in [`crate::catalog::build_alias_macro`].
+/// `raw_conn` may be null on hosts where the runtime's raw C-API connect
+/// failed at init — in that case the shim path is skipped and every alias
+/// falls through to the macro path.
 fn create_community_aliases(
     con: &duckdb::Connection,
+    raw_conn: ffi::duckdb_connection,
     spec: &crate::catalog::CommunityNativeSpec,
 ) -> Result<usize, String> {
     // 1. Discover community-registered function names for the prefix (if any).
@@ -3581,11 +3602,35 @@ fn create_community_aliases(
     // 2. Fold explicit mapping + discovered prefix hits into a stable pair list.
     let pairs = crate::catalog::compute_alias_pairs(spec, &discovered);
 
-    // 3. Emit CREATE MACRO per pair per arity. `duckdb_functions()` can report
-    //    multiple rows (one per overload); we produce one macro per distinct
-    //    arity (macros support arity-overloading with the same name).
     let mut created = 0usize;
     for (ours, theirs) in &pairs {
+        // 3a. Advanced-tier catalog alias (transparent for aggregates). If
+        //     the shim finds the entry, register the pair as a real
+        //     CatalogEntry and skip the macro path entirely. If the shim
+        //     rejects (name not found, version drift, etc.), fall through.
+        #[cfg(advanced_tier)]
+        if !raw_conn.is_null() {
+            match unsafe { crate::advanced::catalog_alias(raw_conn, theirs, ours) } {
+                Ok(_) => {
+                    created += 1;
+                    continue;
+                }
+                Err(err) => {
+                    crate::events::emit(
+                        "community_alias_shim_fallback",
+                        Some(ours),
+                        format!("{theirs}: {err}"),
+                    );
+                    // fall through to the macro path
+                }
+            }
+        }
+        #[cfg(not(advanced_tier))]
+        let _ = raw_conn; // silence unused-variable warning on loadable-only builds
+
+        // 3b. Macro fallback. `duckdb_functions()` can report multiple rows
+        //     (one per overload); produce one macro per distinct arity
+        //     (macros support arity-overloading with the same name).
         let info_sql = format!(
             "SELECT function_type, array_to_string(parameters, ',') AS param_csv \
              FROM duckdb_functions() WHERE function_name = '{theirs}'"
@@ -5994,7 +6039,10 @@ mod tests {
         // Simulate a community-registered scalar under community's name.
         con.execute("CREATE MACRO t_add_one(x) AS x + 1", [])
             .expect("create t_add_one");
-        let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
+        // Pass null raw_conn — these tests exercise the macro fallback
+        // path uniformly (the C++ shim would only fire when advanced_tier
+        // is compiled AND raw_conn is live).
+        let n = create_community_aliases(&con, std::ptr::null_mut(), &spec_with(Some("t_"), &[]))
             .expect("alias gen");
         assert!(n >= 1, "expected >=1 alias, got {n}");
         // Both names work.
@@ -6019,6 +6067,7 @@ mod tests {
         .expect("create t_gen_range");
         let n = create_community_aliases(
             &con,
+            std::ptr::null_mut(),
             &spec_with(None, &[("gen_range", "t_gen_range")]),
         )
         .expect("alias gen");
@@ -6040,7 +6089,10 @@ mod tests {
         let con = Connection::open_in_memory().expect("open");
         con.execute("CREATE MACRO t_double(x) AS x * 2", [])
             .expect("create t_double");
-        let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
+        // Pass null raw_conn — these tests exercise the macro fallback
+        // path uniformly (the C++ shim would only fire when advanced_tier
+        // is compiled AND raw_conn is live).
+        let n = create_community_aliases(&con, std::ptr::null_mut(), &spec_with(Some("t_"), &[]))
             .expect("alias gen");
         assert!(n >= 1);
         let out: i64 = con
@@ -6060,6 +6112,7 @@ mod tests {
         // `t_add` to `plus100` and lets prefix handle `sub` normally.
         let n = create_community_aliases(
             &con,
+            std::ptr::null_mut(),
             &spec_with(Some("t_"), &[("plus100", "t_add")]),
         )
         .expect("alias gen");
@@ -6072,5 +6125,107 @@ mod tests {
             .query_row("SELECT sub(200)", [], |r| r.get(0))
             .expect("sub");
         assert_eq!(s, 100);
+    }
+
+    // --- Advanced-tier catalog-alias smoke: real aggregate transparency ----
+    //
+    // The C++ shim registers `existing` under `new_name` as a real
+    // `AggregateFunctionCatalogEntry`, so every SQL aggregate modifier
+    // (DISTINCT / FILTER / ORDER BY / OVER) propagates through the alias
+    // unchanged. We use a built-in aggregate (`sum`) as the "community"
+    // function to keep the test hermetic. The shim is only compiled in with
+    // `advanced_tier`; on loadable-only builds these tests are absent.
+
+    #[cfg(advanced_tier)]
+    #[test]
+    fn shim_aggregate_alias_supports_full_modifier_set() {
+        use duckdb::ffi;
+        // One database with two views on it: the raw C-API `duckdb_connection`
+        // we hand the shim, and a duckdb-rs Connection we run test queries
+        // through. Both see the same catalog, so a shim-registered alias is
+        // visible on the duckdb-rs side.
+        let (raw, shim_con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            let r = ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
+            assert_eq!(r, ffi::DuckDBSuccess, "duckdb_open failed");
+            let shim_con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, shim_con)
+        };
+        shim_con
+            .execute_batch(
+                "CREATE TABLE t(g INTEGER, x INTEGER, ok BOOLEAN); \
+                 INSERT INTO t VALUES (1,1,true),(1,1,true),(1,2,false),(2,3,true),(2,4,true);",
+            )
+            .expect("seed");
+
+        // Alias built-in `sum` under `total`. Because the shim registers a
+        // real AggregateFunctionCatalogEntry, DISTINCT / FILTER / ORDER BY /
+        // OVER all work through `total(x)` unchanged.
+        unsafe {
+            let kind = crate::advanced::catalog_alias(raw, "sum", "total")
+                .expect("catalog_alias sum -> total");
+            assert_eq!(kind, crate::advanced::AliasKind::Aggregate);
+        }
+
+        // Basic GROUP BY: total(x) == sum(x).
+        let sum_alias: i64 = shim_con
+            .query_row("SELECT total(x) FROM t", [], |r| r.get(0))
+            .expect("alias sum");
+        assert_eq!(sum_alias, 1 + 1 + 2 + 3 + 4);
+
+        // DISTINCT modifier — this is the modifier list_aggregate() fails.
+        let sum_distinct: i64 = shim_con
+            .query_row("SELECT total(DISTINCT x) FROM t", [], |r| r.get(0))
+            .expect("alias DISTINCT");
+        assert_eq!(sum_distinct, 1 + 2 + 3 + 4);
+
+        // FILTER modifier.
+        let sum_filter: i64 = shim_con
+            .query_row("SELECT total(x) FILTER (WHERE ok) FROM t", [], |r| r.get(0))
+            .expect("alias FILTER");
+        assert_eq!(sum_filter, 1 + 1 + 3 + 4);
+
+        // ORDER BY inside the aggregate — for sum() the result is
+        // order-independent, but the parser has to accept it, which it only
+        // does when the callee is a REAL aggregate.
+        let sum_ordered: i64 = shim_con
+            .query_row(
+                "SELECT total(x ORDER BY x DESC) FROM t",
+                [],
+                |r| r.get(0),
+            )
+            .expect("alias ORDER BY");
+        assert_eq!(sum_ordered, 1 + 1 + 2 + 3 + 4);
+
+        // Window context — running total per group.
+        let last_run: i64 = shim_con
+            .query_row(
+                "SELECT total(x) OVER (PARTITION BY g ORDER BY x) \
+                 FROM t ORDER BY g DESC, x DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("alias OVER");
+        assert_eq!(last_run, 3 + 4);
+    }
+
+    #[cfg(advanced_tier)]
+    #[test]
+    fn shim_missing_entry_reports_not_found() {
+        use duckdb::ffi;
+        unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(std::ptr::null(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            let err = crate::advanced::catalog_alias(raw, "definitely_not_a_function", "x")
+                .expect_err("missing entry must error");
+            assert!(err.contains("no scalar/aggregate/table function"), "got: {err}");
+        }
     }
 }

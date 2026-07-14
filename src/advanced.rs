@@ -142,6 +142,78 @@ extern "C" {
         arg_type_codes: *const c_char,
         cols_spec: *const c_char,
     ) -> i32;
+    /// Register `existing_name` (scalar / aggregate / table) under `new_name`
+    /// in the system catalog. Returns 1/2/3 for aggregate/scalar/table on
+    /// success; -1..-5 on failure with `*out_err` set to a malloc'd message
+    /// (free via `ducklink_adv_free`). See `cpp/ducklink_alias.cpp`.
+    fn ducklink_alias_function(
+        conn: *mut c_void,
+        existing_name: *const c_char,
+        new_name: *const c_char,
+        out_err: *mut *mut c_char,
+    ) -> i32;
+}
+
+/// Kind of function ducklink aliased into its own namespace, reported by
+/// `ducklink_alias_function`. Ordering matches the shim's return codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasKind {
+    Aggregate,
+    Scalar,
+    Table,
+}
+
+/// Safe wrapper over the C++ `ducklink_alias_function` shim: alias the
+/// community-registered function `existing` under ducklink's chosen name
+/// `new_name` in the system catalog. Returns `Ok(kind)` when the alias
+/// landed, `Err(msg)` with the shim's message otherwise. Both names remain
+/// callable — DuckDB's binder resolves each to the same underlying function
+/// set, so aggregates keep their DISTINCT/FILTER/ORDER BY/window support
+/// through the alias.
+///
+/// # Safety
+/// `raw_conn` must be a live `duckdb_connection`. Ducklink obtains it via the
+/// same C API code path used by aggregate registration (see `RawConnHandle`
+/// in reg_duckdb.rs) or by opening a sibling connection on the raw database
+/// handle (see `advanced.rs` community-native branch).
+pub unsafe fn catalog_alias(
+    raw_conn: ffi::duckdb_connection,
+    existing: &str,
+    new_name: &str,
+) -> Result<AliasKind, String> {
+    if raw_conn.is_null() {
+        return Err("null raw connection".to_string());
+    }
+    let c_existing =
+        CString::new(existing).map_err(|e| format!("existing name contains NUL: {e}"))?;
+    let c_new = CString::new(new_name).map_err(|e| format!("new name contains NUL: {e}"))?;
+    let mut err_ptr: *mut c_char = std::ptr::null_mut();
+    let rc = ducklink_alias_function(
+        raw_conn as *mut c_void,
+        c_existing.as_ptr(),
+        c_new.as_ptr(),
+        &mut err_ptr,
+    );
+    if rc > 0 {
+        // Success — a stray *out_err (shouldn't happen) still needs freeing.
+        if !err_ptr.is_null() {
+            drop(CString::from_raw(err_ptr));
+        }
+        return match rc {
+            1 => Ok(AliasKind::Aggregate),
+            2 => Ok(AliasKind::Scalar),
+            3 => Ok(AliasKind::Table),
+            _ => Err(format!("unknown alias-kind code {rc}")),
+        };
+    }
+    let msg = if err_ptr.is_null() {
+        format!("catalog alias failed (rc={rc})")
+    } else {
+        let s = CStr::from_ptr(err_ptr).to_string_lossy().into_owned();
+        drop(CString::from_raw(err_ptr));
+        s
+    };
+    Err(msg)
 }
 
 /// Wire a freshly loaded component's advanced-tier declarations into DuckDB.
@@ -1129,13 +1201,48 @@ unsafe fn create_community_aliases_advanced(
 
     // 2. Fold explicit mapping + prefix hits into a stable pair list.
     let pairs = crate::catalog::compute_alias_pairs(spec, &discovered);
+    if pairs.is_empty() {
+        return Ok(0);
+    }
 
-    // 3. Emit CREATE MACRO per pair per arity. `parameters` on
-    //    `duckdb_functions()` is `VARCHAR[]`; `array_to_string` renders it
-    //    into a CSV we can split — the C API's `duckdb_value_varchar` would
-    //    otherwise return a bracketed list literal.
+    // 3. Open a sibling connection once for the whole alias pass — we use the
+    //    C++ catalog-alias shim per pair (transparent for aggregates), and
+    //    fall back to per-arity CREATE MACRO on kinds the shim can't handle.
+    let mut conn: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(db, &mut conn) != ffi::DuckDBSuccess {
+        return Err("duckdb_connect failed for alias pass".to_string());
+    }
+    struct ConnGuard(ffi::duckdb_connection);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_disconnect(&mut self.0) };
+        }
+    }
+    let _guard = ConnGuard(conn);
+
     let mut created = 0usize;
     for (ours, theirs) in &pairs {
+        // Try the C++ catalog-alias first — it gives real transparency:
+        // aggregate DISTINCT/FILTER/ORDER BY/window all work through the
+        // alias because the alias IS an AggregateFunctionCatalogEntry.
+        match catalog_alias(conn, theirs, ours) {
+            Ok(_kind) => {
+                created += 1;
+                continue;
+            }
+            Err(err) => {
+                crate::events::emit(
+                    "community_alias_shim_fallback",
+                    Some(ours.as_str()),
+                    format!("{theirs}: {err}"),
+                );
+                // Fall through to the macro fallback below.
+            }
+        }
+
+        // Macro fallback (rare — only if the shim couldn't find the entry
+        // or version-drifted). Same shapes as the loadable-only build uses,
+        // with the documented aggregate caveat.
         let info_sql = format!(
             "SELECT function_type, array_to_string(parameters, ',') AS param_csv \
              FROM duckdb_functions() WHERE function_name = '{theirs}'"

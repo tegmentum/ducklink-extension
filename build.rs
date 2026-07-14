@@ -120,6 +120,7 @@ mod advanced_build {
         "ducklink_parser.cpp",
         "ducklink_optimizer.cpp",
         "ducklink_table_stream.cpp",
+        "ducklink_alias.cpp",
     ];
 
 /// Resolve the DuckDB v1.5.4 source tree (header root) we compile the shim
