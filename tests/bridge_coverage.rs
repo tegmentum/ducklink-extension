@@ -21,7 +21,7 @@
 #![cfg(all(feature = "bundled", have_corpus))]
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use duckdb::Connection;
 
@@ -97,7 +97,7 @@ impl Drop for Db {
 /// function count registered.
 fn setup_with(names: &[&str]) -> (Db, usize) {
     let db = Db::new();
-    let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+    let engine = Arc::new(Engine2::new().expect("engine"));
     let specs: Vec<ComponentSpec> = names
         .iter()
         .map(|n| ComponentSpec {
@@ -537,7 +537,7 @@ fn no_raw_connection_skips_aggregates_registers_rest() {
     // scalars/tables) and does NOT panic, and the function is absent from the
     // catalog so calling it errors.
     let db = Db::new();
-    let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+    let engine = Arc::new(Engine2::new().expect("engine"));
     let agg_only = vec![ComponentSpec {
         name: "aggstat".to_string(),
         path: artifact("aggstat"),
@@ -557,7 +557,7 @@ fn no_raw_connection_skips_aggregates_registers_rest() {
     // aggregate is skipped, so sample_sum is NOT callable while sample_plus_one
     // IS. This proves the skip is surgical, not all-or-nothing.
     let db2 = Db::new();
-    let engine2 = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+    let engine2 = Arc::new(Engine2::new().expect("engine"));
     let mixed = vec![ComponentSpec {
         name: "sample_extension".to_string(),
         path: artifact("sample_extension"),
@@ -588,7 +588,7 @@ fn register_scalars_tables_counts_directly() {
     let loaded = engine
         .load("sample_extension", &artifact("sample_extension"))
         .expect("load");
-    let engine = Arc::new(Mutex::new(engine));
+    let engine = Arc::new(engine);
     let con = Connection::open_in_memory().expect("open");
 
     let scalars = register_scalars(&con, engine.clone(), &loaded.scalars).expect("scalars");
@@ -635,7 +635,7 @@ fn concurrent_scalar_under_threads() {
     db.con.execute_batch("SET threads=4;").expect("set threads");
 
     // A large scalar query so DuckDB schedules the per-row dispatch across
-    // worker threads (validates Mutex<Engine2> under parallelism).
+    // worker threads (validates the shared Arc<Engine2> under parallelism).
     let sum: i64 = db
         .con
         .query_row(
@@ -1000,7 +1000,7 @@ fn scalar_float_multichunk_exact() {
 #[test]
 fn register_components_rejects_non_component_artifact() {
     let db = Db::new();
-    let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+    let engine = Arc::new(Engine2::new().expect("engine"));
     let mut path = std::env::temp_dir();
     path.push(format!("ducklink_bad_artifact_{}.wasm", std::process::id()));
     std::fs::write(&path, b"definitely not a wasm component").expect("write");
@@ -1016,7 +1016,7 @@ fn register_components_rejects_non_component_artifact() {
 #[test]
 fn register_components_missing_artifact_errs() {
     let db = Db::new();
-    let engine = Arc::new(Mutex::new(Engine2::new().expect("engine")));
+    let engine = Arc::new(Engine2::new().expect("engine"));
     let specs = vec![ComponentSpec {
         name: "ghost".to_string(),
         path: PathBuf::from("/no/such/ducklink/component.wasm"),

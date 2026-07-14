@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use duckdb::types::Value;
 use duckdb::Connection;
@@ -255,9 +255,7 @@ enum Outcome {
 
 /// `Ok(None)` = pass, `Ok(Some)` = ran but mismatched, `Err` = hard error.
 fn run_inner(case: &Case) -> Result<Option<String>, String> {
-    let engine = Arc::new(Mutex::new(
-        Engine2::new().map_err(|e| format!("engine: {e}"))?,
-    ));
+    let engine = Arc::new(Engine2::new().map_err(|e| format!("engine: {e}"))?);
 
     // Create the database directly so we have a raw connection for aggregate
     // registration (the duckdb-rs `Connection` doesn't expose its raw handle).
