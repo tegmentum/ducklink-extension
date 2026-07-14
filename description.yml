@@ -3,7 +3,7 @@
 extension:
   name: ducklink
   description: Load portable WebAssembly extension modules into DuckDB from SQL
-  version: 4.4.0
+  version: 4.5.0
   language: Rust
   build: cargo
   license: MIT
@@ -19,7 +19,7 @@ extension:
 
 repo:
   github: tegmentum/ducklink-extension
-  ref: v4.4.0
+  ref: v4.5.0
 
 docs:
   hello_world: |
@@ -89,6 +89,13 @@ docs:
     WebAssembly sandbox for ~20x the throughput on tight-loop workloads.
     `ducklink.modules.native_available` is `true` whenever ANY native backing
     resolves for the running host.
+
+    When a native backing is a community extension, ducklink can re-expose its functions
+    under its own chosen names via community-native aliases, keeping downstream SQL stable
+    across backing swaps. On the advanced tier the aliases are real catalog entries, so
+    DISTINCT, FILTER, ORDER BY, and window OVER clauses all propagate transparently through
+    aggregate aliases. On the loadable-only community-extensions build they are CREATE OR
+    REPLACE MACRO shapes: scalar and table zero-overhead, aggregate limited to plain GROUP BY.
 
     A built-in `ducklink_version()` scalar is always available, so the
     extension is usable and testable before any module is loaded. For
