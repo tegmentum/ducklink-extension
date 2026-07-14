@@ -501,6 +501,173 @@ rest.
 | `native` | Yes (`.duckdb_extension` on our CDN) | Our signing key (needs `-unsigned` today) | User has explicitly opted into unsigned + perf-critical hot path + no community equivalent |
 | `community-native` | No (we just point at community-extensions) | Community-extensions signing key | An equivalent extension already exists there — never re-ship it |
 
+## 3c. Namespaces and prefixes (SPARQL-flavored)
+
+Entries can declare a canonical **namespace** so their functions are
+callable both under DuckDB's `main` schema (bare) and under a
+schema-qualified form (`<namespace>.<fn>`). Users can layer session
+aliases on top with `DUCKLINK PREFIX`, and colon-syntax sugar
+(`<alias>:<fn>(x)`) rewrites to dot-syntax at parse time. All five
+call shapes bind the exact same underlying function set, so aggregate
+modifiers (`DISTINCT`, `FILTER`, `ORDER BY`, `OVER`) propagate through
+every one of them.
+
+### Catalog fields
+
+Add two optional fields to a catalog entry (both alongside the
+existing `providers[]`, not inside a provider):
+
+```json
+{
+  "name": "crypto",
+  "namespace": "crypto",
+  "prefix": "c",
+  "providers": [
+    {
+      "kind": "community-native",
+      "extension_name": "crypto",
+      "function_mapping": {
+        "hash": "crypto_hash",
+        "hash_agg": "crypto_hash_agg"
+      }
+    }
+  ]
+}
+```
+
+- **`namespace`** (optional) — canonical schema name. When set, every
+  function ducklink aliases is DOUBLE-registered: once in `main`
+  (backcompat: bare `hash(x)` and community's original bare
+  `crypto_hash(x)` both keep working), and once in a schema of this
+  name (`crypto.hash(x)` becomes bindable). Absent → today's
+  behaviour, `main` only.
+- **`prefix`** (optional) — a short-alias hint for tools. Ducklink
+  does NOT auto-declare it; it's a discovery signal so an IDE or
+  `ducklink.modules` view can suggest `DUCKLINK PREFIX c: crypto;`
+  to users.
+
+### Load-time behaviour
+
+`DUCKLINK LOAD 'crypto' NATIVE` (or `ducklink_load('crypto', kind =>
+'native')`) INSTALLs the community extension, LOADs it, then:
+
+- **Without a `namespace`**: registers `hash` / `hash_agg` in `main`
+  (existing behaviour).
+- **With a `namespace`**: registers each function TWICE — in `main`
+  AND in the declared namespace schema — sharing the same underlying
+  `AggregateFunctionSet` / `ScalarFunctionSet` / `TableFunctionSet`.
+  DuckDB's binder sees a real catalog entry at each qualifier, so
+  aggregate modifiers propagate transparently through both forms.
+  The schema is created on-demand — no manual `CREATE SCHEMA`.
+
+Two loaded modules that declare the same `namespace` **merge** into
+that schema (same rule DuckDB already uses for extensions all sharing
+`main`). Functions with overlapping signatures across the merged
+modules will error at registration with a clear "already exists"
+message.
+
+### User-side session aliases: `DUCKLINK PREFIX`
+
+Users add their own short aliases with a bespoke statement:
+
+```sql
+DUCKLINK PREFIX c: crypto;
+```
+
+That creates an alias schema `c` and re-registers every function in
+schema `crypto` under `c.<fn>`. Both alias and namespace forms bind
+the same catalog entry.
+
+Persistence: the declaration is stored in a `ducklink.prefixes(alias,
+namespace)` table inside the user's default catalog. On file-backed
+databases, `DUCKLINK LOAD 'crypto' NATIVE` after a reconnect
+automatically replays the persisted alias (no need to redeclare). On
+:memory: databases, prefixes die with the connection — the user's
+mental model matches DuckDB's own :memory: semantics.
+
+Redeclaring the same alias is idempotent (`INSERT OR REPLACE` on the
+persisted row, `CREATE OR REPLACE` on the alias schema entries).
+Malformed shapes are rejected at parse time (`DUCKLINK PREFIX c! :
+crypto` errors cleanly).
+
+### Colon-syntax sugar (`c:hash(x)`)
+
+Enabled automatically when ducklink loads. The parser hook
+rewrites `<ident>:<ident>(…)` to `<ident>.<ident>(…)` BEFORE
+DuckDB's parser sees it, so the SPARQL-flavored form binds like the
+schema-qualified one:
+
+```sql
+SELECT c:hash('sha2-256', 'ping');           -- rewrites to c.hash(...)
+SELECT c:hash_agg('sha2-256', s ORDER BY s)  -- aggregate modifiers work
+  FROM t;
+```
+
+Deliberately conservative — the rewrite leaves alone:
+
+- `::` casts (`SELECT c:hash(x)::VARCHAR` — the outer `::` cast survives)
+- `:name` bind parameters (`SELECT * FROM t WHERE x = :p`)
+- Colons inside single-quoted string literals (`'has:colon'`)
+- Colons inside double-quoted identifiers (`"weird:name"`)
+- Colons inside line comments (`-- c:hash(x)`) or block comments
+  (`/* c:hash(x) */`)
+
+Anything ambiguous (e.g. `c:hash` NOT followed by `(`) is left alone
+too — the rewrite only fires when the shape is unambiguously a
+function call.
+
+### The five call shapes
+
+For an entry with `namespace: "crypto"` and after `DUCKLINK PREFIX
+c: crypto;`, ALL FIVE of these are equivalent — same
+`AggregateFunctionSet`, same modifier support, same result:
+
+```sql
+SELECT crypto_hash(x)     FROM t;   -- 1. community's original bare name (main)
+SELECT hash(x)            FROM t;   -- 2. ducklink's alias bare name (main)
+SELECT crypto.hash(x)     FROM t;   -- 3. namespace-qualified
+SELECT c.hash(x)          FROM t;   -- 4. alias-qualified (dot form)
+SELECT c:hash(x)          FROM t;   -- 5. alias-qualified (SPARQL colon form)
+```
+
+Bare short names (`hash(x)`) do NOT auto-resolve if their function
+lives only in a non-main schema — users opt in via `SET search_path
+= 'main,crypto'` themselves. Auto-prepending would silently change
+resolution for existing bare-name queries in the session, which is
+worse than requiring an explicit opt-in.
+
+### Complete worked example
+
+```json
+{
+  "name": "crypto",
+  "description": "Cryptographic hashes and HMAC via query-farm/crypto",
+  "exports": ["hash", "hmac", "hash_agg"],
+  "namespace": "crypto",
+  "prefix": "c",
+  "providers": [
+    {
+      "id": "cn-crypto",
+      "kind": "community-native",
+      "extension_name": "crypto",
+      "function_mapping": {
+        "hash":     "crypto_hash",
+        "hmac":     "crypto_hmac",
+        "hash_agg": "crypto_hash_agg"
+      }
+    }
+  ]
+}
+```
+
+After `DUCKLINK LOAD 'crypto' NATIVE`, users have `crypto_hash(x)`
+(community's own), `hash(x)` (ducklink's alias), and `crypto.hash(x)`
+(namespace-qualified) all working. Any user can layer `DUCKLINK
+PREFIX c: crypto;` to add `c.hash(x)` and `c:hash(x)`, persisted for
+their next reconnect. The `prefix: "c"` hint tells tools which
+alias to suggest; if two users pick different aliases (`DUCKLINK
+PREFIX crypt: crypto;`) that works fine too — the hint is advisory.
+
 ## 4. How `ducklink_search` ranking works
 
 `ducklink_search('query')` splits the query on whitespace, lower-cases each

@@ -97,6 +97,15 @@ docs:
     aggregate aliases. On the loadable-only community-extensions build they are CREATE OR
     REPLACE MACRO shapes: scalar and table zero-overhead, aggregate limited to plain GROUP BY.
 
+    Catalog entries can further declare an optional `namespace` so their functions bind
+    under both DuckDB's `main` schema (bare) and a schema-qualified form (`crypto.hash(x)`
+    for `namespace: "crypto"`). Users layer session-scoped short aliases on top with
+    `DUCKLINK PREFIX c: crypto;` (persisted in `ducklink.prefixes` and replayed on the
+    next LOAD), and a parser-override hook rewrites SPARQL-flavored `c:hash(x)` to
+    `c.hash(x)` at parse time. All five forms — bare, ducklink-alias bare, namespace-
+    qualified, alias-qualified dot, alias-qualified colon — bind the same underlying
+    function set, so aggregate modifiers propagate through every one of them.
+
     A built-in `ducklink_version()` scalar is always available, so the
     extension is usable and testable before any module is loaded. For
     deployments, the `DUCKLINK_COMPONENTS` environment variable can preload a
