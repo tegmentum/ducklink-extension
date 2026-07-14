@@ -151,13 +151,31 @@ pub struct Provider {
     /// registered in `duckdb/community-extensions`. Ducklink runs
     /// `INSTALL <extension_name> FROM community; LOAD <extension_name>;`
     /// via the persistent connection.
-    ///
-    /// Function-name parity is a HARD requirement: the community extension
-    /// must expose the same SQL function names as ducklink's wasm version,
-    /// so the user's query doesn't change when we dispatch to the community
-    /// build instead of loading our wasm module.
     #[serde(default)]
     pub extension_name: Option<String>,
+
+    /// Optional prefix on the community extension's function names that
+    /// ducklink should strip when aliasing them into our namespace.
+    /// Example: `community_prefix: "t_"` means community exports `t_sma`,
+    /// `t_ema`, ...; ducklink aliases them as `sma`, `ema`, ...
+    ///
+    /// Use when the community author scoped every export with a consistent
+    /// prefix. Aliasing happens after INSTALL + LOAD by iterating
+    /// `duckdb_functions()` for names starting with the prefix and emitting
+    /// `CREATE OR REPLACE MACRO <stripped>(args) AS <full>(args);` per
+    /// signature. Both names remain callable — community's under theirs,
+    /// ours under ours.
+    #[serde(default)]
+    pub community_prefix: Option<String>,
+
+    /// Optional explicit per-function name mapping, for community authors
+    /// who don't use a consistent prefix. Ducklink emits one macro per
+    /// pair. Takes precedence over `community_prefix` when both are set —
+    /// explicit mapping wins.
+    ///
+    /// Shape: `{"our_name": "their_name"}`.
+    #[serde(default)]
+    pub function_mapping: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Provider {
@@ -776,9 +794,29 @@ pub const NATIVE_PLATFORM: &str = if cfg!(all(target_os = "macos", target_arch =
 /// doesn't. No download, no cache — DuckDB's own extension-install machinery
 /// handles the rest.
 ///
-/// Returns the `extension_name` field from the community-native provider,
-/// which is the exact name registered in `duckdb/community-extensions`.
-pub fn resolve_name_to_community_native(name: &str) -> Result<String, String> {
+/// Resolved community-native routing spec: everything ducklink needs to run
+/// `INSTALL <extension_name> FROM community; LOAD <extension_name>;` and then
+/// generate the SQL aliases that expose community's functions under ducklink's
+/// names.
+#[derive(Debug, Clone)]
+pub struct CommunityNativeSpec {
+    /// Community extension name — safe identifier ([A-Za-z0-9_]+).
+    pub extension_name: String,
+    /// Prefix on community's function names to strip when aliasing. `None` when
+    /// the catalog didn't set one (either explicit `function_mapping` is used,
+    /// or the community extension's names are what ducklink's catalog already
+    /// advertises so no aliasing is needed).
+    pub community_prefix: Option<String>,
+    /// Explicit per-function mapping (our name → their name). Takes precedence
+    /// over `community_prefix` — an author who sets both is stating "prefer
+    /// this table; use the prefix as a fallback for anything not listed."
+    pub function_mapping: std::collections::HashMap<String, String>,
+}
+
+/// Returns the community-native routing spec for `name`, which is the exact
+/// name registered in `duckdb/community-extensions` plus any function-alias
+/// metadata (prefix / explicit mapping) the catalog provides.
+pub fn resolve_name_to_community_native(name: &str) -> Result<CommunityNativeSpec, String> {
     let catalog = resolve_catalog();
     let entry = catalog.find(name).ok_or_else(|| {
         crate::events::emit(
@@ -815,7 +853,131 @@ pub fn resolve_name_to_community_native(name: &str) -> Result<String, String> {
         Some(name),
         format!("community extension '{ext_name}'"),
     );
-    Ok(ext_name)
+    Ok(CommunityNativeSpec {
+        extension_name: ext_name,
+        community_prefix: provider.community_prefix.clone(),
+        function_mapping: provider.function_mapping.clone().unwrap_or_default(),
+    })
+}
+
+/// `true` iff `s` is a non-empty ASCII identifier ([A-Za-z0-9_]+). Used as
+/// the belt-and-braces gate before splicing catalog-sourced names into
+/// `INSTALL`, `LOAD`, or `CREATE OR REPLACE MACRO` DDL. Both the ducklink
+/// (dispatch) and advanced (parser-hook) entry paths go through this before
+/// touching SQL execution.
+pub fn is_safe_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Build the SQL statement that aliases community function `theirs` under
+/// ducklink's chosen name `ours`. Returns `None` for function types we can't
+/// alias:
+/// * `scalar`    → `CREATE OR REPLACE MACRO ours(args) AS theirs(args);`
+/// * `table`     → `CREATE OR REPLACE MACRO ours(args) AS TABLE
+///                    SELECT * FROM theirs(args);`
+/// * `aggregate` (single-arg only) → `CREATE OR REPLACE MACRO ours(x) AS
+///                    list_aggregate(list(x), 'theirs');` — a scalar-macro
+///                    wrap that works for basic `GROUP BY`; DISTINCT / FILTER
+///                    / ORDER BY modifiers are lost. Multi-arg aggregates are
+///                    skipped (users call community's name directly).
+///
+/// Callers must first pass `ours`, `theirs`, and every param through
+/// [`is_safe_identifier`] — this function assumes they've already been
+/// validated.
+pub fn build_alias_macro(
+    ftype: &str,
+    ours: &str,
+    theirs: &str,
+    params: &[String],
+) -> Option<String> {
+    let arg_names: Vec<String> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if is_safe_identifier(p) {
+                p.clone()
+            } else {
+                format!("_a{i}")
+            }
+        })
+        .collect();
+    let arg_list = arg_names.join(", ");
+    match ftype {
+        // DuckDB reports:
+        //   `scalar`        — C-API scalar (community extensions register here)
+        //   `scalar_macro`  — legacy synonym seen in some versions
+        //   `macro`         — user-created `CREATE MACRO ... AS <expr>` shape
+        "scalar" | "scalar_macro" | "macro" => Some(format!(
+            "CREATE OR REPLACE MACRO {ours}({arg_list}) AS {theirs}({arg_list})"
+        )),
+        "table" | "table_macro" => Some(format!(
+            "CREATE OR REPLACE MACRO {ours}({arg_list}) AS TABLE \
+             SELECT * FROM {theirs}({arg_list})"
+        )),
+        "aggregate" => {
+            if arg_names.len() != 1 {
+                None
+            } else {
+                let arg = &arg_names[0];
+                Some(format!(
+                    "CREATE OR REPLACE MACRO {ours}({arg}) AS \
+                     list_aggregate(list({arg}), '{theirs}')"
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Given the community-native spec plus the list of community-registered
+/// function names that ducklink discovered via `duckdb_functions()`, compute
+/// the `(our_name, their_name)` pairs the caller should alias.
+///
+/// Logic (both fields are optional):
+/// * `function_mapping` — explicit; always applied.
+/// * `community_prefix` — systematic; applied to `discovered` names,
+///   skipping anything already handled by `function_mapping`.
+///
+/// Invalid identifiers on either side are dropped. Order is stable: explicit
+/// mappings first, then prefix-derived pairs sorted by name.
+pub fn compute_alias_pairs(
+    spec: &CommunityNativeSpec,
+    discovered: &[String],
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut mapped_their: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Explicit mapping first.
+    let mut explicit: Vec<(&String, &String)> = spec.function_mapping.iter().collect();
+    explicit.sort_by(|a, b| a.0.cmp(b.0));
+    for (ours, theirs) in explicit {
+        if !is_safe_identifier(ours) || !is_safe_identifier(theirs) {
+            continue;
+        }
+        pairs.push((ours.clone(), theirs.clone()));
+        mapped_their.insert(theirs.as_str());
+    }
+    // Prefix-derived pairs.
+    if let Some(prefix) = spec.community_prefix.as_deref() {
+        if !prefix.is_empty() {
+            let mut prefix_pairs: Vec<(String, String)> = Vec::new();
+            for their in discovered {
+                if mapped_their.contains(their.as_str()) {
+                    continue;
+                }
+                if !their.starts_with(prefix) {
+                    continue;
+                }
+                let ours = their[prefix.len()..].to_string();
+                if !is_safe_identifier(&ours) || !is_safe_identifier(their) {
+                    continue;
+                }
+                prefix_pairs.push((ours, their.clone()));
+            }
+            prefix_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs.extend(prefix_pairs);
+        }
+    }
+    pairs
 }
 
 pub fn resolve_name_to_native(
@@ -1089,6 +1251,9 @@ mod tests {
             platform: None,
             duckdb_version: None,
             url: None,
+            extension_name: None,
+            community_prefix: None,
+            function_mapping: None,
         };
         let entry = CatalogEntry {
             name: "multi".into(),
@@ -1128,6 +1293,9 @@ mod tests {
             platform: None,
             duckdb_version: None,
             url: None,
+            extension_name: None,
+            community_prefix: None,
+            function_mapping: None,
         };
         // A gen-2 entry (its wit_contract_version + provider are both gen-2).
         let gen2 = CatalogEntry {
@@ -1197,6 +1365,9 @@ mod tests {
                 platform: Some("osx_arm64".into()),
                 duckdb_version: Some("v1.5.4".into()),
                 url: None,
+                extension_name: None,
+                community_prefix: None,
+                function_mapping: None,
             }],
             functions: vec![],
         };
@@ -1212,5 +1383,114 @@ mod tests {
         let claimed = "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15";
         let got = sha256_hex(bytes);
         assert_ne!(got, claimed, "test bytes must not match the real digest");
+    }
+
+    #[test]
+    fn is_safe_identifier_gates_ddl_splicing() {
+        assert!(is_safe_identifier("sma"));
+        assert!(is_safe_identifier("t_sma"));
+        assert!(is_safe_identifier("_x9"));
+        assert!(!is_safe_identifier(""));
+        assert!(!is_safe_identifier("has space"));
+        assert!(!is_safe_identifier("drop; --"));
+        assert!(!is_safe_identifier("dash-name"));
+        assert!(!is_safe_identifier("naïve"));
+    }
+
+    #[test]
+    fn build_alias_macro_shapes() {
+        // Scalar.
+        let s = build_alias_macro("scalar", "sma", "t_sma", &["price".into(), "n".into()])
+            .expect("scalar shape");
+        assert_eq!(
+            s,
+            "CREATE OR REPLACE MACRO sma(price, n) AS t_sma(price, n)"
+        );
+        // Table function.
+        let t = build_alias_macro("table", "csv", "read_csv_auto", &["path".into()])
+            .expect("table shape");
+        assert_eq!(
+            t,
+            "CREATE OR REPLACE MACRO csv(path) AS TABLE SELECT * FROM read_csv_auto(path)"
+        );
+        // Aggregate — single arg is aliased.
+        let a = build_alias_macro("aggregate", "geomean", "t_geomean", &["x".into()])
+            .expect("aggregate single-arg shape");
+        assert_eq!(
+            a,
+            "CREATE OR REPLACE MACRO geomean(x) AS list_aggregate(list(x), 't_geomean')"
+        );
+        // Aggregate — multi-arg is skipped.
+        assert!(
+            build_alias_macro(
+                "aggregate",
+                "corr",
+                "t_corr",
+                &["x".into(), "y".into()]
+            )
+            .is_none()
+        );
+        // Unknown function_type: skipped.
+        assert!(build_alias_macro("pragma", "x", "y", &["a".into()]).is_none());
+        // Odd parameter name gets sanitized to a fallback.
+        let s = build_alias_macro("scalar", "f", "g", &["ok".into(), "not ok".into()])
+            .expect("scalar sanitize");
+        assert!(s.contains("f(ok, _a1)"), "unexpected: {s}");
+    }
+
+    #[test]
+    fn compute_alias_pairs_prefix_and_mapping() {
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert("override_me".to_string(), "t_override".to_string());
+        mapping.insert("distance".to_string(), "st_distance".to_string());
+        let spec = CommunityNativeSpec {
+            extension_name: "example".into(),
+            community_prefix: Some("t_".into()),
+            function_mapping: mapping,
+        };
+        let discovered = vec![
+            "t_sma".to_string(),
+            "t_ema".to_string(),
+            "t_override".to_string(), // Should be skipped — already in explicit map.
+            "unrelated".to_string(),  // No prefix match.
+        ];
+        let pairs = compute_alias_pairs(&spec, &discovered);
+        // Explicit come first (sorted), then prefix-derived (sorted).
+        let names: Vec<&str> = pairs.iter().map(|(o, _)| o.as_str()).collect();
+        assert_eq!(names, vec!["distance", "override_me", "ema", "sma"]);
+        // Explicit mapping preserves the exact target.
+        assert_eq!(pairs[0], ("distance".into(), "st_distance".into()));
+        // Prefix derivation strips the prefix.
+        assert_eq!(pairs[3], ("sma".into(), "t_sma".into()));
+    }
+
+    #[test]
+    fn compute_alias_pairs_rejects_unsafe_identifiers() {
+        let mut mapping = std::collections::HashMap::new();
+        // Invalid `ours` name — must be dropped.
+        mapping.insert("drop; --".to_string(), "t_bad".to_string());
+        // Invalid `theirs` name — must be dropped.
+        mapping.insert("ok_name".to_string(), "has space".to_string());
+        // Fully valid entry passes through.
+        mapping.insert("keep".to_string(), "t_keep".to_string());
+        let spec = CommunityNativeSpec {
+            extension_name: "e".into(),
+            community_prefix: None,
+            function_mapping: mapping,
+        };
+        let pairs = compute_alias_pairs(&spec, &[]);
+        assert_eq!(pairs, vec![("keep".into(), "t_keep".into())]);
+    }
+
+    #[test]
+    fn compute_alias_pairs_empty_prefix_is_ignored() {
+        let spec = CommunityNativeSpec {
+            extension_name: "e".into(),
+            community_prefix: Some(String::new()),
+            function_mapping: std::collections::HashMap::new(),
+        };
+        // No pairs — empty prefix must not alias every function under the same name.
+        let pairs = compute_alias_pairs(&spec, &["sma".into(), "ema".into()]);
+        assert!(pairs.is_empty());
     }
 }

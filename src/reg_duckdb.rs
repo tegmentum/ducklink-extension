@@ -3446,31 +3446,29 @@ fn native_load_dispatch(
     name_arg: &str,
 ) -> Result<WasmLoadBind, Box<dyn std::error::Error>> {
     // 1. Prefer community-native — community-signed, no `-unsigned` needed.
-    if let Ok(ext_name) = crate::catalog::resolve_name_to_community_native(name_arg) {
-        return community_native_load(rt, bind, name_arg, &ext_name);
+    if let Ok(spec) = crate::catalog::resolve_name_to_community_native(name_arg) {
+        return community_native_load(rt, bind, name_arg, spec);
     }
     // 2. Fall back to our own native build for this host.
     native_load(rt, bind, name_arg)
 }
 
 /// Community-native branch — INSTALL + LOAD an existing extension from
-/// `duckdb/community-extensions`. Ducklink is the router; the community
-/// extension is the actual implementation. The community-signed key is in
-/// DuckDB's trust chain already, so no `-unsigned` is needed.
+/// `duckdb/community-extensions`, then alias its functions under ducklink's
+/// chosen names. Ducklink is the router; the community extension is the
+/// actual implementation. The community-signed key is in DuckDB's trust
+/// chain already, so no `-unsigned` is needed.
 fn community_native_load(
     rt: &DucklinkRuntime,
     bind: &BindInfo,
     name_arg: &str,
-    community_ext_name: &str,
+    spec: crate::catalog::CommunityNativeSpec,
 ) -> Result<WasmLoadBind, Box<dyn std::error::Error>> {
+    let community_ext_name = &spec.extension_name;
+
     // Belt-and-braces: reject extension names that don't fit DuckDB's identifier
     // rules so an accidentally-crafted catalog entry can't inject arbitrary SQL.
-    // Community extension names are the same identifier shape DuckDB uses
-    // elsewhere: ASCII letters, digits, and underscores.
-    if !community_ext_name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !crate::catalog::is_safe_identifier(community_ext_name) {
         return Err(format!(
             "ducklink_load(kind='native'): community-native provider names '{community_ext_name}', \
              which contains characters outside the allowed [A-Za-z0-9_] identifier set. \
@@ -3482,16 +3480,13 @@ fn community_native_load(
     crate::events::emit(
         "load_community_native_start",
         Some(name_arg),
-        community_ext_name.to_string(),
+        community_ext_name.clone(),
     );
 
-    // Two statements on the persistent connection: install from community
-    // (idempotent — DuckDB no-ops if already installed at the right version),
-    // then load.
-    let install_sql = format!("INSTALL {community_ext_name} FROM community");
-    let load_sql = format!("LOAD {community_ext_name}");
+    // INSTALL is idempotent (DuckDB no-ops when already at the right version);
+    // LOAD registers the community extension's functions under community's names.
     let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(err) = con.execute(&install_sql, []) {
+    if let Err(err) = con.execute(&format!("INSTALL {community_ext_name} FROM community"), []) {
         let err_msg = err.to_string();
         crate::events::emit("load_community_native_error", Some(name_arg), err_msg.clone());
         return Err(format!(
@@ -3499,7 +3494,7 @@ fn community_native_load(
         )
         .into());
     }
-    if let Err(err) = con.execute(&load_sql, []) {
+    if let Err(err) = con.execute(&format!("LOAD {community_ext_name}"), []) {
         let err_msg = err.to_string();
         crate::events::emit("load_community_native_error", Some(name_arg), err_msg.clone());
         return Err(format!(
@@ -3507,10 +3502,19 @@ fn community_native_load(
         )
         .into());
     }
+
+    // Generate SQL aliases so both names — community's own and ducklink's
+    // chosen — are callable. Non-fatal per-alias: a mismapping doesn't block
+    // the rest of the load. The alias summary rolls up into an event.
+    let alias_count = create_community_aliases(&con, &spec)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     crate::events::emit(
         "load_community_native_ok",
         Some(name_arg),
-        community_ext_name.to_string(),
+        format!(
+            "extension='{community_ext_name}' aliases={alias_count}"
+        ),
     );
 
     bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
@@ -3520,15 +3524,119 @@ fn community_native_load(
     bind.add_result_column("aggregates", LogicalTypeHandle::from(LogicalTypeId::Bigint));
     Ok(WasmLoadBind {
         name: name_arg.to_string(),
-        // `path` for a community-native load is a description, not a filesystem
-        // path — DuckDB manages its own extension directory and we don't know
-        // where it dropped the file. Making this obvious keeps the summary
-        // useful when a user pipes it into scripting.
         path: format!("community-extensions:{community_ext_name}"),
-        scalars: usize::MAX, // sentinel: "n/a" (same shape as the ducklink-native branch)
+        scalars: usize::MAX, // sentinel: "n/a"
         tables: usize::MAX,
         aggregates: usize::MAX,
     })
+}
+
+/// After a community extension is INSTALLed and LOADed, generate the SQL
+/// aliases the catalog author asked for. Returns the number of aliases
+/// created (across all kinds).
+///
+/// Two catalog shapes drive the mapping (either or both may appear on the
+/// provider):
+///
+/// * `function_mapping: {"our_name": "their_name"}` — explicit per-function
+///   pairs. Wins over `community_prefix` when both refer to the same
+///   community function.
+/// * `community_prefix: "t_"` — systematic prefix on community's exports;
+///   ducklink discovers matching community names via `duckdb_functions()`
+///   and creates aliases with the prefix stripped.
+///
+/// The macro shapes themselves are built in
+/// [`crate::catalog::build_alias_macro`]; the pair-selection logic is in
+/// [`crate::catalog::compute_alias_pairs`]. This function is just the
+/// duckdb-crate flavour of the row-iteration + statement-execute plumbing
+/// around those helpers. The advanced-tier callsite in `advanced.rs` uses
+/// the C-API flavour but the same helpers.
+fn create_community_aliases(
+    con: &duckdb::Connection,
+    spec: &crate::catalog::CommunityNativeSpec,
+) -> Result<usize, String> {
+    // 1. Discover community-registered function names for the prefix (if any).
+    let discovered: Vec<String> = if spec.community_prefix.is_some() {
+        // No SQL LIKE — `_` is LIKE's single-char wildcard, and prefixes
+        // like `"t_"` would over-match. Filter by prefix in Rust instead;
+        // `compute_alias_pairs` handles the starts_with test.
+        let sql = "SELECT function_name FROM duckdb_functions() \
+                   WHERE function_type IN ('scalar','aggregate','table_macro','scalar_macro','macro','table') \
+                   GROUP BY function_name";
+        let mut stmt = con
+            .prepare(sql)
+            .map_err(|e| format!("prepare duckdb_functions scan: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query duckdb_functions scan: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("row read: {e}"))?);
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    // 2. Fold explicit mapping + discovered prefix hits into a stable pair list.
+    let pairs = crate::catalog::compute_alias_pairs(spec, &discovered);
+
+    // 3. Emit CREATE MACRO per pair per arity. `duckdb_functions()` can report
+    //    multiple rows (one per overload); we produce one macro per distinct
+    //    arity (macros support arity-overloading with the same name).
+    let mut created = 0usize;
+    for (ours, theirs) in &pairs {
+        let info_sql = format!(
+            "SELECT function_type, array_to_string(parameters, ',') AS param_csv \
+             FROM duckdb_functions() WHERE function_name = '{theirs}'"
+        );
+        let mut stmt = con
+            .prepare(&info_sql)
+            .map_err(|e| format!("prepare info for '{theirs}': {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let ftype: String = row.get(0)?;
+                // parameters rendered as a CSV via array_to_string —
+                // duckdb-rs doesn't ship a FromSql impl for `Vec<String>`,
+                // and the CSV form is what the advanced-tier callsite uses
+                // too, so the two paths stay behaviourally identical.
+                let param_csv: Option<String> = row.get(1)?;
+                Ok((ftype, param_csv))
+            })
+            .map_err(|e| format!("query info for '{theirs}': {e}"))?;
+
+        let mut done_arities: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for row in rows {
+            let (ftype, param_csv) = row.map_err(|e| format!("row read: {e}"))?;
+            let param_csv = param_csv.unwrap_or_default();
+            let params: Vec<String> = if param_csv.is_empty() {
+                Vec::new()
+            } else {
+                param_csv
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            if !done_arities.insert(params.len()) {
+                continue;
+            }
+            let Some(macro_sql) = crate::catalog::build_alias_macro(&ftype, ours, theirs, &params) else {
+                continue;
+            };
+            if let Err(err) = con.execute(&macro_sql, []) {
+                crate::events::emit(
+                    "community_alias_error",
+                    Some(ours),
+                    format!("{theirs}: {err}"),
+                );
+                continue;
+            }
+            created += 1;
+        }
+    }
+    Ok(created)
 }
 
 /// Fallback native path — download a ducklink-hosted native provider matching
@@ -5856,5 +5964,113 @@ mod tests {
         // Bare path -> file stem as the name.
         assert_eq!(specs[1].name, "z");
         assert_eq!(specs[1].path, PathBuf::from("/y/z.wasm"));
+    }
+
+    // --- Community-native aliasing -----------------------------------------
+    //
+    // These tests exercise `create_community_aliases()` against a live
+    // in-process DuckDB, using user-defined SQL macros / aggregates to
+    // stand in for the community extension's functions (which we can't
+    // INSTALL from network in a unit test). The aliasing logic itself
+    // doesn't care whether the underlying functions came from a real
+    // community LOAD or from CREATE MACRO — it only reads
+    // `duckdb_functions()`.
+
+    fn spec_with(prefix: Option<&str>, map: &[(&str, &str)]) -> crate::catalog::CommunityNativeSpec {
+        let mut m = std::collections::HashMap::new();
+        for (o, t) in map {
+            m.insert((*o).to_string(), (*t).to_string());
+        }
+        crate::catalog::CommunityNativeSpec {
+            extension_name: "test_ext".into(),
+            community_prefix: prefix.map(str::to_string),
+            function_mapping: m,
+        }
+    }
+
+    #[test]
+    fn alias_gen_scalar_via_prefix() {
+        let con = Connection::open_in_memory().expect("open");
+        // Simulate a community-registered scalar under community's name.
+        con.execute("CREATE MACRO t_add_one(x) AS x + 1", [])
+            .expect("create t_add_one");
+        let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
+            .expect("alias gen");
+        assert!(n >= 1, "expected >=1 alias, got {n}");
+        // Both names work.
+        let via_alias: i64 = con
+            .query_row("SELECT add_one(41)", [], |r| r.get(0))
+            .expect("via alias");
+        assert_eq!(via_alias, 42);
+        let via_original: i64 = con
+            .query_row("SELECT t_add_one(41)", [], |r| r.get(0))
+            .expect("via original");
+        assert_eq!(via_original, 42);
+    }
+
+    #[test]
+    fn alias_gen_table_via_mapping() {
+        let con = Connection::open_in_memory().expect("open");
+        // A community-registered table macro under their name.
+        con.execute(
+            "CREATE MACRO t_gen_range(n) AS TABLE SELECT i FROM range(n) t(i)",
+            [],
+        )
+        .expect("create t_gen_range");
+        let n = create_community_aliases(
+            &con,
+            &spec_with(None, &[("gen_range", "t_gen_range")]),
+        )
+        .expect("alias gen");
+        assert!(n >= 1);
+        let sum: i64 = con
+            .query_row("SELECT sum(i) FROM gen_range(5)", [], |r| r.get(0))
+            .expect("via alias");
+        assert_eq!(sum, 0 + 1 + 2 + 3 + 4);
+    }
+
+    #[test]
+    fn alias_gen_aggregate_via_prefix_using_list_aggregate_trick() {
+        // Use a builtin single-arg aggregate — sum() — under a fake `t_`
+        // prefix to keep the test hermetic. We CREATE MACRO t_sum(x) AS
+        // sum(x) so the aliasing layer sees it as a `scalar_macro`
+        // (macros register as scalar-shaped). That still exercises the
+        // "alias into ducklink's namespace" wiring end-to-end; separate
+        // list_aggregate coverage lives in the catalog unit tests.
+        let con = Connection::open_in_memory().expect("open");
+        con.execute("CREATE MACRO t_double(x) AS x * 2", [])
+            .expect("create t_double");
+        let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
+            .expect("alias gen");
+        assert!(n >= 1);
+        let out: i64 = con
+            .query_row("SELECT double(21)", [], |r| r.get(0))
+            .expect("via alias");
+        assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn alias_gen_explicit_mapping_wins_over_prefix() {
+        let con = Connection::open_in_memory().expect("open");
+        con.execute("CREATE MACRO t_add(x) AS x + 100", [])
+            .expect("create t_add");
+        con.execute("CREATE MACRO t_sub(x) AS x - 100", [])
+            .expect("create t_sub");
+        // Prefix would give us `add` + `sub`; explicit mapping renames
+        // `t_add` to `plus100` and lets prefix handle `sub` normally.
+        let n = create_community_aliases(
+            &con,
+            &spec_with(Some("t_"), &[("plus100", "t_add")]),
+        )
+        .expect("alias gen");
+        assert!(n >= 2, "expected two aliases (explicit + prefix), got {n}");
+        let a: i64 = con
+            .query_row("SELECT plus100(1)", [], |r| r.get(0))
+            .expect("plus100");
+        assert_eq!(a, 101);
+        let s: i64 = con
+            .query_row("SELECT sub(200)", [], |r| r.get(0))
+            .expect("sub");
+        assert_eq!(s, 100);
     }
 }

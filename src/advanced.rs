@@ -906,13 +906,11 @@ unsafe fn ducklink_load_native_impl(
     //    delegates to an existing native implementation when one is
     //    published, rather than shipping a competing native build.
     use crate::catalog::{resolve_name_to_community_native, resolve_name_to_native, NATIVE_PLATFORM};
-    if let Ok(community_ext) = resolve_name_to_community_native(name_str) {
+    if let Ok(spec) = resolve_name_to_community_native(name_str) {
+        let community_ext = spec.extension_name.clone();
         // Belt-and-braces: identifier check on the extension name so a bad
         // catalog entry can't inject SQL into INSTALL / LOAD.
-        if !community_ext
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !crate::catalog::is_safe_identifier(&community_ext) {
             *out_summary = CString::new(format!(
                 "DUCKLINK LOAD NATIVE: community-native provider for '{name_str}' names \
                  '{community_ext}', which contains characters outside [A-Za-z0-9_]. \
@@ -940,13 +938,31 @@ unsafe fn ducklink_load_native_impl(
             .unwrap_or(std::ptr::null_mut());
             return 1;
         }
+        let alias_count = match create_community_aliases_advanced(db.cast(), &spec) {
+            Ok(n) => n,
+            Err(e) => {
+                // Non-fatal for the LOAD itself: community's own names are
+                // still callable. Surface the aliasing error in the summary so
+                // catalog authors can fix mismappings without hiding them.
+                crate::events::emit("community_alias_error", Some(name_str), e.clone());
+                *out_summary = CString::new(format!(
+                    "installed '{name_str}' via community-extensions:{community_ext}; \
+                     alias generation failed: {e}"
+                ))
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+                return 0;
+            }
+        };
         crate::events::emit(
             "load_community_native_ok",
             Some(name_str),
-            community_ext.clone(),
+            format!("extension='{community_ext}' aliases={alias_count}"),
         );
         *out_summary = CString::new(format!(
-            "installed '{name_str}' via community-extensions:{community_ext}"
+            "installed '{name_str}' via community-extensions:{community_ext} \
+             ({alias_count} alias{})",
+            if alias_count == 1 { "" } else { "es" }
         ))
         .map(|c| c.into_raw())
         .unwrap_or(std::ptr::null_mut());
@@ -1077,6 +1093,153 @@ unsafe fn load_via_duckdb_query(
         CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
     };
     Err(msg)
+}
+
+/// Advanced-tier flavour of the reg_duckdb `create_community_aliases`: after
+/// `INSTALL / LOAD` succeeded on a community extension, discover its
+/// functions and register `CREATE OR REPLACE MACRO` aliases under ducklink's
+/// chosen names.
+///
+/// The SQL-building lives in [`crate::catalog::build_alias_macro`] and the
+/// pair-selection in [`crate::catalog::compute_alias_pairs`]; this function
+/// only wraps them in DuckDB's C API for the parser-hook code path (which
+/// has a raw `duckdb_database` and no `duckdb::Connection`).
+///
+/// # Safety
+/// `db` must be a valid live `duckdb_database`. All names composed into SQL
+/// pass through [`crate::catalog::is_safe_identifier`] before splicing.
+unsafe fn create_community_aliases_advanced(
+    db: ffi::duckdb_database,
+    spec: &crate::catalog::CommunityNativeSpec,
+) -> Result<usize, String> {
+    // 1. Discover community-registered function names for the prefix (if any).
+    //    Prefix filter is applied in Rust (by compute_alias_pairs) — the SQL
+    //    wildcard `_` in LIKE would over-match for prefixes like "t_".
+    let discovered: Vec<String> = if spec.community_prefix.is_some() {
+        let scan_sql = "SELECT function_name FROM duckdb_functions() \
+                        WHERE function_type IN ('scalar','aggregate','table_macro','scalar_macro','macro','table') \
+                        GROUP BY function_name";
+        let rows = query_rows_via_duckdb(db, scan_sql)?;
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // 2. Fold explicit mapping + prefix hits into a stable pair list.
+    let pairs = crate::catalog::compute_alias_pairs(spec, &discovered);
+
+    // 3. Emit CREATE MACRO per pair per arity. `parameters` on
+    //    `duckdb_functions()` is `VARCHAR[]`; `array_to_string` renders it
+    //    into a CSV we can split — the C API's `duckdb_value_varchar` would
+    //    otherwise return a bracketed list literal.
+    let mut created = 0usize;
+    for (ours, theirs) in &pairs {
+        let info_sql = format!(
+            "SELECT function_type, array_to_string(parameters, ',') AS param_csv \
+             FROM duckdb_functions() WHERE function_name = '{theirs}'"
+        );
+        let rows = query_rows_via_duckdb(db, &info_sql)?;
+        let mut done_arities: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for row in rows {
+            let ftype = match row.first().and_then(|x| x.clone()) {
+                Some(t) => t,
+                None => continue,
+            };
+            let param_csv = row.get(1).cloned().flatten().unwrap_or_default();
+            let params: Vec<String> = if param_csv.is_empty() {
+                Vec::new()
+            } else {
+                param_csv
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            if !done_arities.insert(params.len()) {
+                continue;
+            }
+            let Some(macro_sql) = crate::catalog::build_alias_macro(&ftype, ours, theirs, &params)
+            else {
+                continue;
+            };
+            if let Err(err) = load_via_duckdb_query(db, &macro_sql) {
+                crate::events::emit(
+                    "community_alias_error",
+                    Some(ours.as_str()),
+                    format!("{theirs}: {err}"),
+                );
+                continue;
+            }
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
+/// Open a sibling connection, run `sql`, materialize every row's columns as
+/// `Option<String>` (NULL → `None`). All values are read via
+/// `duckdb_value_varchar`, which casts every column type to VARCHAR. Suitable
+/// for small metadata queries like `duckdb_functions()`; not for bulk data.
+///
+/// # Safety
+/// `db` must be a valid live `duckdb_database`.
+unsafe fn query_rows_via_duckdb(
+    db: ffi::duckdb_database,
+    sql: &str,
+) -> Result<Vec<Vec<Option<String>>>, String> {
+    let c_sql = CString::new(sql).map_err(|e| format!("query contains NUL: {e}"))?;
+
+    let mut conn: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(db, &mut conn) != ffi::DuckDBSuccess {
+        return Err("duckdb_connect failed".to_string());
+    }
+    struct ConnGuard(ffi::duckdb_connection);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_disconnect(&mut self.0) };
+        }
+    }
+    let _guard = ConnGuard(conn);
+
+    let mut result: ffi::duckdb_result = std::mem::zeroed();
+    let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
+    struct ResGuard<'a>(&'a mut ffi::duckdb_result);
+    impl Drop for ResGuard<'_> {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_destroy_result(self.0) };
+        }
+    }
+    let result_guard = ResGuard(&mut result);
+    if rc != ffi::DuckDBSuccess {
+        let err_ptr = ffi::duckdb_result_error(result_guard.0 as *mut _);
+        let msg = if err_ptr.is_null() {
+            "duckdb_query failed with no error message".to_string()
+        } else {
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        return Err(msg);
+    }
+
+    let col_count = ffi::duckdb_column_count(result_guard.0 as *mut _);
+    let row_count = ffi::duckdb_row_count(result_guard.0 as *mut _);
+    let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(row_count as usize);
+    for r in 0..row_count {
+        let mut row_vals: Vec<Option<String>> = Vec::with_capacity(col_count as usize);
+        for c in 0..col_count {
+            let ptr = ffi::duckdb_value_varchar(result_guard.0 as *mut _, c, r);
+            if ptr.is_null() {
+                row_vals.push(None);
+            } else {
+                let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+                ffi::duckdb_free(ptr as *mut _);
+                row_vals.push(Some(s));
+            }
+        }
+        rows.push(row_vals);
+    }
+    Ok(rows)
 }
 
 /// Free a C string returned by the advanced-tier bridge functions.

@@ -303,9 +303,11 @@ Sometimes the capability already exists as a published `duckdb/community-extensi
 extension. Rather than rebundle it, a catalog entry can advertise a **community-native
 provider** — a pointer at the community-published extension. Ducklink then dispatches
 `INSTALL <extension_name> FROM community; LOAD <extension_name>;` on the user's
-behalf when they ask for the native path.
+behalf when they ask for the native path, and (optionally) generates SQL macro
+aliases so the community extension's functions are callable under ducklink's
+chosen names.
 
-Provider shape:
+Provider shape (minimal):
 
 ```json
 {
@@ -322,23 +324,60 @@ Fields:
   `duckdb/community-extensions`. Must match `[A-Za-z0-9_]+` (identifier-shape).
   Ducklink refuses to run INSTALL / LOAD if the name contains anything else,
   so a bad catalog entry can't inject SQL.
+- `community_prefix` (optional) — a systematic prefix that community's
+  extension puts on every exported function name. Ducklink strips this
+  prefix when generating aliases, so `t_sma` becomes `sma`.
+- `function_mapping` (optional) — an object `{"our_name": "their_name"}`
+  giving explicit per-function renames. Overrides the prefix when both are
+  set — an author who wants "prefix for most, override a handful" can list
+  the overrides here.
 
 No `content_digest`, `platform`, `duckdb_version`, or `url` — DuckDB's
 `INSTALL … FROM community` machinery handles all of that (per-platform
 resolution, per-DuckDB-version resolution, signature verification against
 the community key).
 
-### Function-name parity is a hard requirement
+### Aliasing model: ducklink owns the SQL surface
 
-The community extension **must** expose the same SQL function names as
-ducklink's WASM version. That's the whole point: the user's query works
-whether the WASM sandbox is running or the community extension is loaded;
-ducklink is the routing layer, not a mapping layer.
+Ducklink is the routing layer. The community extension is what actually
+executes. Users write SQL against **ducklink's chosen names**; ducklink
+translates those names to community's names via `CREATE OR REPLACE MACRO`
+at load time. The macro is inlined at query planning, so there's no
+per-row overhead — the community function runs exactly as it would if
+called directly.
 
-If names diverge, don't add a community-native provider — leave users on
-the WASM path (or their explicit `INSTALL <ext> FROM community` outside
-ducklink). Silent function-name mismatches are worse than the small perf
-gain from routing.
+Community's own names remain callable too. Both point at the same
+implementation, so no signal is lost. A user who happens to know community
+uses `t_sma` can still call it directly; a user reading ducklink's docs
+sees `sma` and calls that.
+
+### Which SQL macro shape ducklink emits, per function kind
+
+After `LOAD <extension_name>` succeeds, ducklink introspects
+`duckdb_functions()` for each community function in the mapping and picks
+the macro shape:
+
+| Community kind | Macro emitted by ducklink | Overhead |
+|---|---|---|
+| `scalar` | `CREATE OR REPLACE MACRO our(args) AS their(args);` | Inlined at plan time — zero |
+| `table` / `table_macro` | `CREATE OR REPLACE MACRO our(args) AS TABLE SELECT * FROM their(args);` | Inlined at plan time — zero |
+| `aggregate` (single-arg) | `CREATE OR REPLACE MACRO our(x) AS list_aggregate(list(x), 'their');` | One `list()` build per group + `list_aggregate` dispatch |
+
+**Aggregate caveat.** The `list_aggregate` trick works for the common
+`SELECT agg(x) FROM t GROUP BY g;` shape, but does NOT propagate SQL
+aggregate modifiers (`DISTINCT`, `FILTER (WHERE …)`, `ORDER BY`) or
+work as a window function. Multi-argument aggregates are also skipped.
+Users who need any of those call community's name directly — it stays
+callable.
+
+### Function-name parity is a soft preference
+
+Where you CAN keep names identical between ducklink's WASM version and
+the community-native provider, do — a query then works unchanged when
+users switch between `WASM` and `NATIVE`. But it's no longer a hard
+requirement: if community's naming diverges (e.g. they use a `t_` prefix
+you don't want), set `community_prefix` and let the aliasing layer bridge
+the gap.
 
 ### Selection order when `kind: "native"` is requested
 
@@ -354,13 +393,13 @@ consult providers in this order:
    the WASM path (`DUCKLINK LOAD 'name' WASM`, the default) or wait for
    a native provider to land.
 
-### Example: a WASM entry with a community-native routing target
+### Example: names match — no aliasing needed
 
 ```json
 {
-  "name": "shellfs_test",
+  "name": "shellfs",
   "version": "0.1.0",
-  "description": "Test entry: ducklink WASM implementation with a community-native routing target",
+  "description": "Read files via a shell one-liner from SQL",
   "exports": ["shellfs_read", "shellfs_glob"],
   "providers": [
     {
@@ -381,9 +420,64 @@ consult providers in this order:
 
 Behaviour:
 
-- `DUCKLINK LOAD 'shellfs_test';` → WASM (the safe default).
-- `DUCKLINK LOAD 'shellfs_test' WASM;` → WASM (explicit).
-- `DUCKLINK LOAD 'shellfs_test' NATIVE;` → routes to `INSTALL shellfs FROM community; LOAD shellfs;`. The user's `SELECT shellfs_read(...)` calls work either way.
+- `DUCKLINK LOAD 'shellfs';` → WASM (the safe default).
+- `DUCKLINK LOAD 'shellfs' WASM;` → WASM (explicit).
+- `DUCKLINK LOAD 'shellfs' NATIVE;` → routes to `INSTALL shellfs FROM community; LOAD shellfs;`. No aliases created because names already match; the user's `SELECT shellfs_read(...)` calls work either way.
+
+### Example: community uses a prefix — strip it via `community_prefix`
+
+Community's tapa-technical-analysis extension registers everything as
+`t_sma`, `t_ema`, `t_rsi`, etc. Ducklink advertises `sma`, `ema`, `rsi`:
+
+```json
+{
+  "name": "ta",
+  "version": "0.1.0",
+  "description": "Technical-analysis indicators for time-series data",
+  "exports": ["sma", "ema", "rsi", "macd"],
+  "providers": [
+    {
+      "id": "cn-tapa",
+      "kind": "community-native",
+      "extension_name": "tapa",
+      "community_prefix": "t_"
+    }
+  ]
+}
+```
+
+`DUCKLINK LOAD 'ta' NATIVE;` INSTALLs + LOADs `tapa`, then generates
+`CREATE OR REPLACE MACRO sma(x) AS t_sma(x)`, etc. — one per exported
+function that matches the prefix. Both `SELECT sma(price)` and
+`SELECT t_sma(price)` work.
+
+### Example: explicit `function_mapping` for renames
+
+When names don't fit a clean prefix, spell them out:
+
+```json
+{
+  "name": "geo",
+  "version": "0.1.0",
+  "description": "Spatial primitives via community's spatial extension",
+  "exports": ["distance", "buffer"],
+  "providers": [
+    {
+      "id": "cn-spatial",
+      "kind": "community-native",
+      "extension_name": "spatial",
+      "function_mapping": {
+        "distance": "st_distance",
+        "buffer":   "st_buffer"
+      }
+    }
+  ]
+}
+```
+
+`function_mapping` and `community_prefix` can appear together: the
+explicit map wins for anything it names, and the prefix fills in the
+rest.
 
 ### When to use each provider kind
 
