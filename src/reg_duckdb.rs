@@ -3610,7 +3610,7 @@ fn create_community_aliases(
         //     rejects (name not found, version drift, etc.), fall through.
         #[cfg(advanced_tier)]
         if !raw_conn.is_null() {
-            match unsafe { crate::advanced::catalog_alias(raw_conn, theirs, ours) } {
+            match unsafe { crate::advanced::catalog_alias(raw_conn, None, theirs, None, ours) } {
                 Ok(_) => {
                     created += 1;
                     continue;
@@ -6199,7 +6199,7 @@ mod tests {
         // real AggregateFunctionCatalogEntry, DISTINCT / FILTER / ORDER BY /
         // OVER all work through `total(x)` unchanged.
         unsafe {
-            let kind = crate::advanced::catalog_alias(raw, "sum", "total")
+            let kind = crate::advanced::catalog_alias(raw, None, "sum", None, "total")
                 .expect("catalog_alias sum -> total");
             assert_eq!(kind, crate::advanced::AliasKind::Aggregate);
         }
@@ -6258,10 +6258,110 @@ mod tests {
             );
             let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
             assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            let err = crate::advanced::catalog_alias(raw, "definitely_not_a_function", "x")
-                .expect_err("missing entry must error");
+            let err = crate::advanced::catalog_alias(
+                raw,
+                None,
+                "definitely_not_a_function",
+                None,
+                "x",
+            )
+            .expect_err("missing entry must error");
             assert!(err.contains("no scalar/aggregate/table function"), "got: {err}");
         }
+    }
+
+    /// Slice-2 acceptance: alias `sum` from `main` into a fresh `crypto`
+    /// schema. Both the schema-qualified form (`crypto.total(x)`) and
+    /// community-original bare form (`sum(x)`) must resolve, and the shim
+    /// must auto-create the `crypto` schema. Also verifies that the
+    /// original `sum(x)` is left untouched — aliasing is additive.
+    #[cfg(advanced_tier)]
+    #[test]
+    fn shim_alias_into_non_main_schema() {
+        use duckdb::ffi;
+        let (raw, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con)
+        };
+        // The `crypto` schema does not exist yet; the shim must create it.
+        let kind = unsafe {
+            crate::advanced::catalog_alias(raw, None, "sum", Some("crypto"), "total")
+                .expect("alias sum -> crypto.total")
+        };
+        assert_eq!(kind, crate::advanced::AliasKind::Aggregate);
+
+        con.execute_batch(
+            "CREATE TABLE t(x INTEGER); \
+             INSERT INTO t VALUES (1), (2), (3), (4);",
+        )
+        .expect("seed");
+        // Schema-qualified form resolves.
+        let via_alias: i64 = con
+            .query_row("SELECT crypto.total(x) FROM t", [], |r| r.get(0))
+            .expect("alias qualified");
+        assert_eq!(via_alias, 10);
+        // Original bare form untouched.
+        let via_original: i64 = con
+            .query_row("SELECT sum(x) FROM t", [], |r| r.get(0))
+            .expect("original bare");
+        assert_eq!(via_original, 10);
+        // Bare `total(x)` is NOT auto-added to search_path — must be unbound.
+        let bare = con.query_row("SELECT total(x) FROM t", [], |r| r.get::<_, i64>(0));
+        assert!(
+            bare.is_err(),
+            "bare `total` must not resolve without explicit search_path opt-in"
+        );
+        // With search_path opt-in, bare resolves through the crypto schema.
+        // DuckDB splits search_path on ',' verbatim; leading spaces become
+        // part of the schema name, so no space after the comma.
+        con.execute("SET search_path = 'main,crypto'", [])
+            .expect("set search_path");
+        let bare2: i64 = con
+            .query_row("SELECT total(x) FROM t", [], |r| r.get(0))
+            .expect("bare via search_path");
+        assert_eq!(bare2, 10);
+    }
+
+    /// Slice-2 acceptance: cross-schema lookup. Alias `sum` from `main`
+    /// into `mathns`, then re-alias `mathns.total` into `stat` under a
+    /// different name (`grand`). Proves both `source_schema` and
+    /// `target_schema` parameters flow through the shim correctly.
+    #[cfg(advanced_tier)]
+    #[test]
+    fn shim_alias_source_and_target_schema_compose() {
+        use duckdb::ffi;
+        let (raw, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con)
+        };
+        unsafe {
+            crate::advanced::catalog_alias(raw, None, "sum", Some("mathns"), "total")
+                .expect("main.sum -> mathns.total");
+            crate::advanced::catalog_alias(raw, Some("mathns"), "total", Some("stat"), "grand")
+                .expect("mathns.total -> stat.grand");
+        }
+        con.execute_batch(
+            "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2),(3);",
+        )
+        .expect("seed");
+        let g: i64 = con
+            .query_row("SELECT stat.grand(x) FROM t", [], |r| r.get(0))
+            .expect("stat.grand");
+        assert_eq!(g, 6);
     }
 
     /// Live-network smoke that aliases functions from a REAL community
@@ -6312,7 +6412,7 @@ mod tests {
 
         // Scalar path: crypto_hash -> hash.
         let kind_scalar = unsafe {
-            crate::advanced::catalog_alias(raw, "crypto_hash", "hash")
+            crate::advanced::catalog_alias(raw, None, "crypto_hash", None, "hash")
                 .expect("alias crypto_hash")
         };
         assert_eq!(kind_scalar, crate::advanced::AliasKind::Scalar);
@@ -6328,7 +6428,7 @@ mod tests {
         // basic ORDER BY / DISTINCT / FILTER must produce byte-identical
         // BLOB output against community's own name.
         let kind = unsafe {
-            crate::advanced::catalog_alias(raw, "crypto_hash_agg", "hash_agg")
+            crate::advanced::catalog_alias(raw, None, "crypto_hash_agg", None, "hash_agg")
                 .expect("alias crypto_hash_agg")
         };
         assert_eq!(kind, crate::advanced::AliasKind::Aggregate);

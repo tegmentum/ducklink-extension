@@ -254,6 +254,25 @@ pub struct CatalogEntry {
     /// The signature-enrichment field; absent in the current snapshot.
     #[serde(default)]
     pub functions: Vec<FunctionSig>,
+
+    /// Canonical namespace for this entry's registered functions. When set,
+    /// ducklink DOUBLE-registers each function: once in DuckDB's `main`
+    /// schema (backcompat — community's original bare names keep working)
+    /// and once in a schema named after this field, so users can call
+    /// `namespace.function(x)` as the fully-qualified form. Absent = every
+    /// function lands in `main` only (today's behaviour, no schema is
+    /// created). Two loaded entries that declare the same `namespace` are
+    /// MERGED into that schema.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Advisory short prefix hint for this entry's namespace. A discovery
+    /// signal for tools that want to suggest a default `DUCKLINK PREFIX`
+    /// alias to users (e.g. entry advertises `namespace: "crypto"` +
+    /// `prefix: "c"` → tools can suggest `DUCKLINK PREFIX c: crypto;`).
+    /// Does NOT auto-declare the prefix — users still opt in.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 /// Deserialize a possibly-`null` JSON array into an empty `Vec` (the catalog
@@ -1145,6 +1164,59 @@ mod tests {
     }
 
     #[test]
+    fn namespace_and_prefix_default_to_none_when_absent() {
+        // Backcompat pass: an entry with no `namespace` / `prefix` fields
+        // parses cleanly and reports both as None. This is what every
+        // existing catalog entry looks like — the additive fields must
+        // never require a manifest change.
+        let json = r#"{"extensions":[{"name":"aba","exports":["aba_validate"]}]}"#;
+        let cat: Catalog = serde_json::from_str(json).expect("parse");
+        let e = cat.find("aba").expect("aba");
+        assert!(e.namespace.is_none(), "namespace defaults to None");
+        assert!(e.prefix.is_none(), "prefix defaults to None");
+    }
+
+    #[test]
+    fn namespace_and_prefix_round_trip_when_declared() {
+        // A catalog entry that declares both fields deserializes into
+        // `Some(...)`. Together these are what a community-native
+        // publisher writes to opt into the SPARQL-like prefix system:
+        // `crypto.hash(x)` becomes callable alongside `crypto_hash(x)`,
+        // and tools can surface `c` as a suggested short alias.
+        let json = r#"{
+            "extensions": [{
+                "name": "crypto",
+                "exports": ["crypto_hash", "crypto_hash_agg"],
+                "namespace": "crypto",
+                "prefix": "c"
+            }]
+        }"#;
+        let cat: Catalog = serde_json::from_str(json).expect("parse");
+        let e = cat.find("crypto").expect("crypto");
+        assert_eq!(e.namespace.as_deref(), Some("crypto"));
+        assert_eq!(e.prefix.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn unknown_catalog_fields_are_ignored() {
+        // The catalog schema is open — publishers can carry conformance
+        // metadata, deprecation notes, etc. that ducklink doesn't
+        // interpret. Adding `namespace`/`prefix` must not have made the
+        // parser stricter about other unrecognised keys.
+        let json = r#"{
+            "extensions": [{
+                "name": "aba",
+                "exports": ["aba_validate"],
+                "some_future_field": {"nested": [1, 2, 3]},
+                "namespace": "banking"
+            }]
+        }"#;
+        let cat: Catalog = serde_json::from_str(json).expect("parse");
+        let e = cat.find("aba").expect("aba");
+        assert_eq!(e.namespace.as_deref(), Some("banking"));
+    }
+
+    #[test]
     fn aba_entry_has_expected_digest_and_exports() {
         let cat = bundled_catalog();
         let aba = cat.find("aba").expect("aba present");
@@ -1271,6 +1343,8 @@ mod tests {
                 mk("duckdb:extension@4.0.0", "d4"),
             ],
             functions: vec![],
+            namespace: None,
+            prefix: None,
         };
         // Gen-4 host: picks the EXACT gen-4 provider (not the newest <= host).
         assert_eq!(entry.select_provider(4).unwrap().content_digest.as_deref(), Some("d4"));
@@ -1310,6 +1384,8 @@ mod tests {
             wit_contract_version: Some("2.2.0".into()),
             providers: vec![mk("duckdb:extension@2.2.0", "d2")],
             functions: vec![],
+            namespace: None,
+            prefix: None,
         };
         // On a gen-4 host: the gen-2 provider is not selected AND the entry's own
         // generation (2) != host (4) -> a clear cross-major REJECTION.
@@ -1337,6 +1413,8 @@ mod tests {
             wit_contract_version: Some("4.0.0".into()),
             providers: vec![mk("duckdb:extension@2.2.0", "top4")],
             functions: vec![],
+            namespace: None,
+            prefix: None,
         };
         assert!(gen4_stale.select_provider(4).is_none());
         assert_eq!(gen4_stale.resolve_digest(4).as_deref(), Ok("top4"));
@@ -1370,6 +1448,8 @@ mod tests {
                 function_mapping: None,
             }],
             functions: vec![],
+            namespace: None,
+            prefix: None,
         };
         assert!(entry.select_provider(4).is_none());
     }

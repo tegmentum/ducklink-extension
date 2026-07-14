@@ -36,6 +36,10 @@
 #include "duckdb/common/enums/on_create_conflict.hpp"
 #include "duckdb/common/enums/on_entry_not_found.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
@@ -85,7 +89,9 @@ SetT rename_set(const duckdb::FunctionSet<FunT> &src, const std::string &new_nam
 
 extern "C" int32_t ducklink_alias_function(
     void *conn,
+    const char *source_schema,
     const char *existing_name,
+    const char *target_schema,
     const char *new_name,
     char **out_err
 ) {
@@ -113,7 +119,12 @@ extern "C" int32_t ducklink_alias_function(
 			return -2;
 		}
 		auto &context = *connection->context;
-		const std::string schema = DEFAULT_SCHEMA;
+		// Schema arguments default to "main" when NULL — that matches the
+		// pre-namespace behaviour so existing callers that pass NULL keep
+		// working. `source_schema` is where we LOOK UP `existing_name`;
+		// `target_schema` is where we REGISTER the alias `new_name`.
+		const std::string src_schema = source_schema ? source_schema : DEFAULT_SCHEMA;
+		const std::string tgt_schema = target_schema ? target_schema : DEFAULT_SCHEMA;
 		const std::string ex_name = existing_name;
 		const std::string new_nm = new_name;
 
@@ -126,7 +137,43 @@ extern "C" int32_t ducklink_alias_function(
 		const bool had_auto_commit = connection->IsAutoCommit();
 		connection->BeginTransaction();
 
-		auto &catalog = Catalog::GetSystemCatalog(context);
+		// Route lookup vs registration to the right CATALOG:
+		//   - LOOKUP for `existing_name` walks the SYSTEM catalog, because
+		//     community extensions and every ducklink-loaded function
+		//     register into `system.main` via `ExtensionLoader::RegisterFunction`.
+		//   - REGISTRATION for `new_name` lands in the USER'S DEFAULT catalog
+		//     (usually `memory` for an in-memory DB), so two-part references
+		//     like `crypto.hash(x)` bind naturally without a `system.` prefix.
+		//     A user's `information_schema` scan then also picks up the alias.
+		auto &lookup_catalog = Catalog::GetSystemCatalog(context);
+		const std::string &default_db = DatabaseManager::GetDefaultDatabase(context);
+		auto &target_catalog = Catalog::GetCatalog(context, default_db);
+
+		// `DuckSchemaEntry::AddEntryInternal` refuses to accept new entries
+		// unless the surrounding `MetaTransaction` has this database
+		// flagged as modified (see duck_schema_entry.cpp:110 — the check
+		// exempts temp and system catalogs but errors on `memory`, which
+		// is our target). Flag it explicitly before `CreateSchema` or
+		// `CreateFunction` gets called.
+		auto &target_attached = target_catalog.GetAttached();
+		MetaTransaction::Get(context).ModifyDatabase(target_attached, DatabaseModificationType());
+
+		// Ensure the target schema exists before we try to register into it.
+		// A missing schema would make `CreateFunction` throw with a catalog
+		// error; creating it up-front is the shim's CREATE-SCHEMA-IF-NOT-EXISTS
+		// so callers don't have to think about it. `internal = false`: DuckDB
+		// refuses to create internal entries in a non-system catalog
+		// ("internal entries can only be created in the system catalog"),
+		// and we're targeting the user's default catalog so the alias shows
+		// up in `information_schema` alongside user-defined functions.
+		if (tgt_schema != DEFAULT_SCHEMA) {
+			CreateSchemaInfo schema_info;
+			schema_info.catalog = default_db;
+			schema_info.schema = tgt_schema;
+			schema_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+			schema_info.internal = false;
+			target_catalog.CreateSchema(context, schema_info);
+		}
 
 		// Prefer aggregate → scalar → table. The three catalog spaces are
 		// disjoint by DuckDB convention (an extension registers a name in
@@ -145,9 +192,26 @@ extern "C" int32_t ducklink_alias_function(
 			// mismatched-type return like a null.
 			auto probe = [&](CatalogType want) -> optional_ptr<CatalogEntry> {
 				try {
-					auto e = catalog.GetEntry(context, want, schema, ex_name,
-					                          OnEntryNotFound::RETURN_NULL);
-					return (e && e->type == want) ? e : nullptr;
+					auto e = lookup_catalog.GetEntry(context, want, src_schema, ex_name,
+					                                 OnEntryNotFound::RETURN_NULL);
+					if (e && e->type == want) {
+						return e;
+					}
+					// Community's functions live in `system.main`; user
+					// tables and their schemas live in the user's default
+					// catalog. If the caller pointed us at a non-main source
+					// schema, also try the target catalog — that's where
+					// `DUCKLINK PREFIX c: crypto` (source == crypto, a
+					// ducklink-owned schema in the default catalog) needs to
+					// find its entries.
+					if (src_schema != DEFAULT_SCHEMA) {
+						auto e2 = target_catalog.GetEntry(context, want, src_schema, ex_name,
+						                                  OnEntryNotFound::RETURN_NULL);
+						if (e2 && e2->type == want) {
+							return e2;
+						}
+					}
+					return nullptr;
 				} catch (...) {
 					return nullptr;
 				}
@@ -164,27 +228,45 @@ extern "C" int32_t ducklink_alias_function(
 				CreateAggregateFunctionInfo info(
 				    rename_set<AggregateFunctionSet, AggregateFunction>(afe.functions, new_nm));
 				info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
-				info.schema = schema;
+				info.schema = tgt_schema;
 				info.name = new_nm;
-				catalog.CreateFunction(context, info);
+				info.catalog = default_db;
+				// The CreateFunctionInfo constructors flip `internal = true`
+				// so DuckDB registers built-in-style, system-only entries.
+				// We're targeting the user's default catalog, so clear it —
+				// aliases behave like user-defined functions.
+				info.internal = false;
+				target_catalog.CreateFunction(context, info);
 				rc = 1;
 			} else if (sc_entry) {
 				auto &sfe = sc_entry->Cast<ScalarFunctionCatalogEntry>();
 				CreateScalarFunctionInfo info(
 				    rename_set<ScalarFunctionSet, ScalarFunction>(sfe.functions, new_nm));
 				info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
-				info.schema = schema;
+				info.schema = tgt_schema;
 				info.name = new_nm;
-				catalog.CreateFunction(context, info);
+				info.catalog = default_db;
+				// The CreateFunctionInfo constructors flip `internal = true`
+				// so DuckDB registers built-in-style, system-only entries.
+				// We're targeting the user's default catalog, so clear it —
+				// aliases behave like user-defined functions.
+				info.internal = false;
+				target_catalog.CreateFunction(context, info);
 				rc = 2;
 			} else if (tbl_entry) {
 				auto &tfe = tbl_entry->Cast<TableFunctionCatalogEntry>();
 				CreateTableFunctionInfo info(
 				    rename_set<TableFunctionSet, TableFunction>(tfe.functions, new_nm));
 				info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
-				info.schema = schema;
+				info.schema = tgt_schema;
 				info.name = new_nm;
-				catalog.CreateFunction(context, info);
+				info.catalog = default_db;
+				// The CreateFunctionInfo constructors flip `internal = true`
+				// so DuckDB registers built-in-style, system-only entries.
+				// We're targeting the user's default catalog, so clear it —
+				// aliases behave like user-defined functions.
+				info.internal = false;
+				target_catalog.CreateFunction(context, info);
 				rc = 3;
 			}
 		} catch (...) {
@@ -204,7 +286,9 @@ extern "C" int32_t ducklink_alias_function(
 
 		std::string msg = "ducklink_alias_function: no scalar/aggregate/table function named '";
 		msg += ex_name;
-		msg += "' in system catalog";
+		msg += "' in schema '";
+		msg += src_schema;
+		msg += "'";
 		if (out_err) {
 			*out_err = dup_c_str(msg);
 		}

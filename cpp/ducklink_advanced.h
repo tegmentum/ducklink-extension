@@ -101,28 +101,40 @@ int32_t ducklink_load_native(void *db, const char *name, char **out_summary);
 // catalog-alias shim (cpp/ducklink_alias.cpp) — community-native transparency
 //===----------------------------------------------------------------------===//
 
-// Register `existing_name` (a scalar / aggregate / table function already in
-// the system catalog) under `new_name`, so DuckDB's binder resolves both to
-// the same underlying function set. Ducklink's community-native branch calls
-// this after `INSTALL <ext> FROM community; LOAD <ext>;` to present community's
-// functions under ducklink's chosen names — aggregate delegation stays
-// transparent under DISTINCT / FILTER / ORDER BY / window because the alias
-// IS a real AggregateFunctionCatalogEntry, not a scalar-macro wrap.
+// Register `existing_name` (a scalar / aggregate / table function in
+// `source_schema`) under `new_name` in `target_schema`, so DuckDB's binder
+// resolves both to the same underlying function set. Ducklink's
+// community-native branch calls this after `INSTALL <ext> FROM community;
+// LOAD <ext>;` to present community's functions under ducklink's chosen
+// names — aggregate delegation stays transparent under DISTINCT / FILTER /
+// ORDER BY / window because the alias IS a real AggregateFunctionCatalogEntry,
+// not a scalar-macro wrap.
 //
-// `conn` is a raw `duckdb_connection` (the shim casts it to the internal
-// `ConnectionWrapper` to reach ClientContext). Returns:
+// Passing NULL for either schema argument defaults to `main` — that matches
+// the pre-namespace shim behaviour. If `target_schema` doesn't exist, the
+// shim creates it (IGNORE_ON_CONFLICT) before registration. This is the
+// primitive both community-native aliasing (target == main + optionally a
+// namespace) and `DUCKLINK PREFIX c: crypto` (source == crypto, target == c)
+// build on top of.
+//
+// `conn` is a raw `duckdb_connection` (reinterpret_cast to
+// `duckdb::Connection *`, matching every other C API TU). Returns:
 //    1 = aggregate aliased
 //    2 = scalar aliased
 //    3 = table function aliased
 //   -1 = null argument
 //   -2 = invalid connection handle
-//   -3 = no function of any kind found under `existing_name`
+//   -3 = no function of any kind found under `source_schema.existing_name`
 //   -4 = C++ exception (message in *out_err)
 //   -5 = unknown exception (message in *out_err)
 // On error, `*out_err` receives a malloc'd C string (free via
 // ducklink_adv_free); on success, `*out_err` is left NULL.
-int32_t ducklink_alias_function(void *conn, const char *existing_name,
-                                const char *new_name, char **out_err);
+int32_t ducklink_alias_function(void *conn,
+                                const char *source_schema,
+                                const char *existing_name,
+                                const char *target_schema,
+                                const char *new_name,
+                                char **out_err);
 
 //===----------------------------------------------------------------------===//
 // table-stream bridge (filter pushdown) — mirrors wasm_table_stream_bridge.h
