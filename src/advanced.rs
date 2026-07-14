@@ -1237,6 +1237,11 @@ unsafe fn create_community_aliases_advanced(
     let _guard = ConnGuard(conn);
 
     let mut created = 0usize;
+    // Optional namespace mirror — see the reg_duckdb.rs sibling for the
+    // full explanation. Same shape: double-register each alias in `main`
+    // (backcompat) and in `<namespace>` (schema-qualified).
+    let namespace = spec.namespace.as_deref();
+
     for (ours, theirs) in &pairs {
         // Try the C++ catalog-alias first — it gives real transparency:
         // aggregate DISTINCT/FILTER/ORDER BY/window all work through the
@@ -1244,6 +1249,17 @@ unsafe fn create_community_aliases_advanced(
         match catalog_alias(conn, None, theirs, None, ours) {
             Ok(_kind) => {
                 created += 1;
+                if let Some(ns) = namespace {
+                    if let Err(err) = catalog_alias(conn, None, theirs, Some(ns), ours) {
+                        crate::events::emit(
+                            "community_namespace_alias_error",
+                            Some(ours.as_str()),
+                            format!("{ns}.{ours}: {err}"),
+                        );
+                    } else {
+                        created += 1;
+                    }
+                }
                 continue;
             }
             Err(err) => {

@@ -3603,6 +3603,14 @@ fn create_community_aliases(
     let pairs = crate::catalog::compute_alias_pairs(spec, &discovered);
 
     let mut created = 0usize;
+    // The catalog entry MAY carry a canonical `namespace` — when set, every
+    // community function is aliased twice: once in `main` (backcompat) and
+    // once in `<namespace>` (schema-qualified). Callers write
+    // `main.foo(x)` OR `<namespace>.foo(x)` and both bind the same
+    // AggregateFunctionSet/ScalarFunctionSet. Users opt into bare `foo(x)`
+    // by adding the namespace to `search_path` themselves.
+    let namespace = spec.namespace.as_deref();
+
     for (ours, theirs) in &pairs {
         // 3a. Advanced-tier catalog alias (transparent for aggregates). If
         //     the shim finds the entry, register the pair as a real
@@ -3610,9 +3618,34 @@ fn create_community_aliases(
         //     rejects (name not found, version drift, etc.), fall through.
         #[cfg(advanced_tier)]
         if !raw_conn.is_null() {
+            // Register into `main` (backcompat: community's original bare
+            // name and ducklink's alias both live in main).
             match unsafe { crate::advanced::catalog_alias(raw_conn, None, theirs, None, ours) } {
                 Ok(_) => {
                     created += 1;
+                    // Also register in the declared namespace when one is
+                    // set. Failure here is non-fatal — the main alias
+                    // already landed, so the bare form works; the
+                    // schema-qualified form just isn't reachable.
+                    if let Some(ns) = namespace {
+                        if let Err(err) = unsafe {
+                            crate::advanced::catalog_alias(
+                                raw_conn,
+                                None,
+                                theirs,
+                                Some(ns),
+                                ours,
+                            )
+                        } {
+                            crate::events::emit(
+                                "community_namespace_alias_error",
+                                Some(ours),
+                                format!("{ns}.{ours}: {err}"),
+                            );
+                        } else {
+                            created += 1;
+                        }
+                    }
                     continue;
                 }
                 Err(err) => {
@@ -3626,7 +3659,7 @@ fn create_community_aliases(
             }
         }
         #[cfg(not(advanced_tier))]
-        let _ = raw_conn; // silence unused-variable warning on loadable-only builds
+        let _ = (raw_conn, namespace); // silence unused-variable warning on loadable-only builds
 
         // 3b. Macro fallback. `duckdb_functions()` can report multiple rows
         //     (one per overload); produce one macro per distinct arity
@@ -6057,6 +6090,14 @@ mod tests {
     // `duckdb_functions()`.
 
     fn spec_with(prefix: Option<&str>, map: &[(&str, &str)]) -> crate::catalog::CommunityNativeSpec {
+        spec_with_namespace(prefix, map, None)
+    }
+
+    fn spec_with_namespace(
+        prefix: Option<&str>,
+        map: &[(&str, &str)],
+        namespace: Option<&str>,
+    ) -> crate::catalog::CommunityNativeSpec {
         let mut m = std::collections::HashMap::new();
         for (o, t) in map {
             m.insert((*o).to_string(), (*t).to_string());
@@ -6065,6 +6106,7 @@ mod tests {
             extension_name: "test_ext".into(),
             community_prefix: prefix.map(str::to_string),
             function_mapping: m,
+            namespace: namespace.map(str::to_string),
         }
     }
 
@@ -6160,6 +6202,82 @@ mod tests {
             .query_row("SELECT sub(200)", [], |r| r.get(0))
             .expect("sub");
         assert_eq!(s, 100);
+    }
+
+    /// Slice-3 acceptance: when `spec.namespace` is set, each alias is
+    /// double-registered — once in `main` (backcompat, bare form) and once
+    /// in `<namespace>` (schema-qualified form). Uses the built-in `sum`
+    /// aggregate aliased as `total`, with namespace `stats`. Both
+    /// `total(x)` (bare) and `stats.total(x)` (qualified) must bind.
+    /// Runs only on the advanced tier — the macro fallback doesn't route
+    /// through the C++ shim's schema targeting.
+    #[cfg(advanced_tier)]
+    #[test]
+    fn alias_gen_double_registers_when_namespace_set() {
+        use duckdb::ffi;
+        let (raw, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con)
+        };
+        let spec = spec_with_namespace(None, &[("total", "sum")], Some("stats"));
+        let n = create_community_aliases(&con, raw, &spec).expect("alias gen");
+        // 1 alias -> registered twice (main + namespace) -> count == 2.
+        assert_eq!(n, 2, "expected 2 registrations (main + namespace), got {n}");
+
+        con.execute_batch(
+            "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (10),(20),(30);",
+        )
+        .expect("seed");
+        let bare: i64 = con
+            .query_row("SELECT total(x) FROM t", [], |r| r.get(0))
+            .expect("bare total");
+        assert_eq!(bare, 60);
+        let qualified: i64 = con
+            .query_row("SELECT stats.total(x) FROM t", [], |r| r.get(0))
+            .expect("stats.total");
+        assert_eq!(qualified, 60);
+        // Community's original still works.
+        let orig: i64 = con
+            .query_row("SELECT sum(x) FROM t", [], |r| r.get(0))
+            .expect("sum");
+        assert_eq!(orig, 60);
+    }
+
+    /// Slice-3 acceptance: `spec.namespace = None` behaves exactly like
+    /// before — single-register in main, no schema created.
+    #[cfg(advanced_tier)]
+    #[test]
+    fn alias_gen_single_registers_when_namespace_absent() {
+        use duckdb::ffi;
+        let (raw, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con)
+        };
+        let spec = spec_with(None, &[("mytotal", "sum")]);
+        assert!(spec.namespace.is_none(), "test setup: namespace absent");
+        let n = create_community_aliases(&con, raw, &spec).expect("alias gen");
+        assert_eq!(n, 1, "no namespace -> single registration, got {n}");
+
+        con.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2);")
+            .expect("seed");
+        let bare: i64 = con
+            .query_row("SELECT mytotal(x) FROM t", [], |r| r.get(0))
+            .expect("bare mytotal");
+        assert_eq!(bare, 3);
     }
 
     // --- Advanced-tier catalog-alias smoke: real aggregate transparency ----

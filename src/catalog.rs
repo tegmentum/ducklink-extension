@@ -830,6 +830,13 @@ pub struct CommunityNativeSpec {
     /// over `community_prefix` — an author who sets both is stating "prefer
     /// this table; use the prefix as a fallback for anything not listed."
     pub function_mapping: std::collections::HashMap<String, String>,
+    /// Canonical namespace for this entry's aliased functions, mirrored
+    /// from [`CatalogEntry::namespace`]. When set, each community function
+    /// ducklink aliases will ALSO be registered as `<namespace>.<our_name>`
+    /// alongside the existing `main.<our_name>` (backcompat). Absent =
+    /// today's behaviour (`main.<our_name>` only). Kept on the spec so the
+    /// registration path doesn't have to re-consult the catalog.
+    pub namespace: Option<String>,
 }
 
 /// Returns the community-native routing spec for `name`, which is the exact
@@ -876,6 +883,7 @@ pub fn resolve_name_to_community_native(name: &str) -> Result<CommunityNativeSpe
         extension_name: ext_name,
         community_prefix: provider.community_prefix.clone(),
         function_mapping: provider.function_mapping.clone().unwrap_or_default(),
+        namespace: entry.namespace.clone(),
     })
 }
 
@@ -1527,6 +1535,7 @@ mod tests {
             extension_name: "example".into(),
             community_prefix: Some("t_".into()),
             function_mapping: mapping,
+            namespace: None,
         };
         let discovered = vec![
             "t_sma".to_string(),
@@ -1557,6 +1566,7 @@ mod tests {
             extension_name: "e".into(),
             community_prefix: None,
             function_mapping: mapping,
+            namespace: None,
         };
         let pairs = compute_alias_pairs(&spec, &[]);
         assert_eq!(pairs, vec![("keep".into(), "t_keep".into())]);
@@ -1568,6 +1578,7 @@ mod tests {
             extension_name: "e".into(),
             community_prefix: Some(String::new()),
             function_mapping: std::collections::HashMap::new(),
+            namespace: None,
         };
         // No pairs — empty prefix must not alias every function under the same name.
         let pairs = compute_alias_pairs(&spec, &["sma".into(), "ema".into()]);
