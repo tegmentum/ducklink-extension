@@ -60,6 +60,13 @@ int32_t ducklink_register_filterable_table_function(void *db, const char *name, 
 // claims it, or NULL if none do.
 char *ducklink_parser_try_rewrite(const char *sql);
 
+// PARSER-OVERRIDE: run ducklink's SPARQL-flavored colon-syntax rewrite over
+// `sql` BEFORE DuckDB's built-in parser sees it. Returns a malloc'd rewrite
+// (free via ducklink_adv_free) if `<ident>:<ident>(…)` patterns were found
+// outside strings / comments / `::` / `:bind`, or NULL if nothing to
+// rewrite (the built-in parser then sees the original unchanged).
+char *ducklink_parser_rewrite_colon(const char *sql);
+
 // OPTIMIZER: offer the flattened plan to every declared component rule.
 // `plan_json` is the neutral plan-shape array
 // (`[{"id":N,"op":"X","parent":P,"table":"T"?}, ...]`, same shape the wasm core

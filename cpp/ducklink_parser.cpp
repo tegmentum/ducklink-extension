@@ -25,6 +25,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
@@ -217,11 +218,39 @@ static ParserExtensionPlanResult DucklinkPlan(ParserExtensionInfo *, ClientConte
 	return result;
 }
 
+//! parser_override: called BEFORE DuckDB's built-in parser sees the query.
+//! Runs the Rust rewriter over `query`; if it finds ducklink's colon-syntax
+//! (`c:hash(x)`), rewrites to `c.hash(x)` and hands the result to DuckDB's
+//! own `Parser::ParseQuery`. When no rewrite happens, we return an empty
+//! ParserOverrideResult so the built-in parser takes over unchanged.
+//!
+//! If the rewritten SQL somehow fails to parse (should never happen — we
+//! only substitute `:` for `.`, both valid in a schema qualifier), we
+//! fall through to the built-in parser with the ORIGINAL text so the user
+//! sees an error message that points at what THEY wrote.
+static ParserOverrideResult DucklinkParserOverride(ParserExtensionInfo *, const string &query,
+                                                   ParserOptions &options) {
+	char *rewritten_c = ducklink_parser_rewrite_colon(query.c_str());
+	if (!rewritten_c) {
+		return ParserOverrideResult(); // no rewrite -> DISPLAY_ORIGINAL_ERROR
+	}
+	string rewritten(rewritten_c);
+	ducklink_adv_free(rewritten_c);
+	try {
+		Parser parser(options);
+		parser.ParseQuery(rewritten);
+		return ParserOverrideResult(std::move(parser.statements));
+	} catch (...) {
+		return ParserOverrideResult();
+	}
+}
+
 class DucklinkParserExtension : public ParserExtension {
 public:
 	DucklinkParserExtension() {
 		parse_function = DucklinkParse;
 		plan_function = DucklinkPlan;
+		parser_override = DucklinkParserOverride;
 	}
 };
 
@@ -247,6 +276,29 @@ extern "C" int32_t ducklink_register_parser(void *db) {
 		auto &instance = *wrapper->database->instance;
 		auto &config = DBConfig::GetConfig(instance);
 		ParserExtension::Register(config, DucklinkParserExtension());
+
+		// Enable the extension parser-override hook. DuckDB defaults to
+		// DEFAULT_OVERRIDE which skips every registered `parser_override`
+		// (parser.cpp:242); users would otherwise have to
+		// `SET allow_parser_override_extension = 'FALLBACK_OVERRIDE'`
+		// themselves. FALLBACK_OVERRIDE is safe: if our override returns
+		// an empty result (nothing to rewrite), the built-in parser sees
+		// the query unchanged. Idempotent — flipping it a second time is
+		// a no-op.
+		try {
+			duckdb::Connection con(*wrapper->database);
+			auto result = con.Query(
+			    "SET allow_parser_override_extension = 'FALLBACK'");
+			if (result->HasError()) {
+				fprintf(stderr,
+				        "[ducklink] failed to enable parser_override: %s\n",
+				        result->GetError().c_str());
+			}
+		} catch (const std::exception &e) {
+			fprintf(stderr, "[ducklink] enabling parser_override threw: %s\n",
+			        e.what());
+		}
+
 		registered = true;
 		return 0;
 	} catch (const std::exception &e) {

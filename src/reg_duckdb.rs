@@ -6474,6 +6474,97 @@ mod tests {
         assert_eq!(rows, 1, "re-declare must be idempotent, got {rows} rows");
     }
 
+    /// Slice-5 acceptance: colon-syntax sugar (`c:hash(x)`) is rewritten
+    /// to dot-syntax (`c.hash(x)`) by the parser_override hook, and the
+    /// SAME queries would break every DuckDB user if the hook stepped on
+    /// `::` casts, `:name` bind params, string literals, or comments —
+    /// verify each of those still works alongside the sugar.
+    #[cfg(advanced_tier)]
+    #[test]
+    fn colon_syntax_sugar_binds_via_parser_override() {
+        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::engine::Engine2;
+        use duckdb::ffi;
+        let (db, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            (db, con)
+        };
+        let engine = Arc::new(Engine2::new().expect("engine"));
+        register_load_function(&con, db, engine).expect("register ducklink_load");
+        if !runtime_is_ours(db) {
+            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
+            return;
+        }
+        extern "C" {
+            fn ducklink_register_parser(db: *mut std::ffi::c_void) -> i32;
+        }
+        assert_eq!(unsafe { ducklink_register_parser(db.cast()) }, 0);
+
+        // Set up: alias sum -> stats.total, declare PREFIX c: stats.
+        let raw = RUNTIME.get().unwrap().raw_con.0;
+        unsafe {
+            crate::advanced::catalog_alias(raw, None, "sum", Some("stats"), "total")
+                .expect("alias");
+        }
+        let _: String = con
+            .query_row("DUCKLINK PREFIX c: stats", [], |r| r.get(0))
+            .expect("PREFIX");
+        con.execute_batch(
+            "CREATE TABLE t(x INTEGER, tag VARCHAR); \
+             INSERT INTO t VALUES (10, 'x:y'), (20, 'p:q'), (30, 'z:z');",
+        )
+        .expect("seed");
+
+        // The core: colon-syntax rewrites to dot-syntax at parse time.
+        let via_colon: i64 = con
+            .query_row("SELECT c:total(x) FROM t", [], |r| r.get(0))
+            .expect("c:total(x)");
+        assert_eq!(via_colon, 60);
+        // Same query via dot-syntax must give the same answer (baseline).
+        let via_dot: i64 = con
+            .query_row("SELECT c.total(x) FROM t", [], |r| r.get(0))
+            .expect("c.total(x)");
+        assert_eq!(via_colon, via_dot);
+
+        // Collision guards — the hook must NOT rewrite these:
+        // 1. `::` casts still work.
+        let cast: String = con
+            .query_row("SELECT 42::VARCHAR", [], |r| r.get(0))
+            .expect("cast");
+        assert_eq!(cast, "42");
+        // 2. Casts chained with our syntax on the outside.
+        let chained: String = con
+            .query_row("SELECT c:total(x)::VARCHAR FROM t", [], |r| r.get(0))
+            .expect("colon + cast");
+        assert_eq!(chained, "60");
+        // 3. String literals containing colons pass through unchanged.
+        let s: String = con
+            .query_row("SELECT tag FROM t WHERE x = 10", [], |r| r.get(0))
+            .expect("literal");
+        assert_eq!(s, "x:y");
+        // 4. Prepared statements with `:bind` parameters bind correctly.
+        con.execute("PREPARE q AS SELECT c:total(x) + $1 FROM t", [])
+            .expect("prepare with our syntax + bind param");
+        let bound: i64 = con
+            .query_row("EXECUTE q(100)", [], |r| r.get(0))
+            .expect("execute q");
+        assert_eq!(bound, 160);
+        // 5. Comments hide colons — rewrite must not touch them.
+        let commented: i64 = con
+            .query_row(
+                "SELECT c:total(x) /* also c:total(x) inside */ FROM t",
+                [],
+                |r| r.get(0),
+            )
+            .expect("comment");
+        assert_eq!(commented, 60);
+    }
+
     // --- Advanced-tier catalog-alias smoke: real aggregate transparency ----
     //
     // The C++ shim registers `existing` under `new_name` as a real

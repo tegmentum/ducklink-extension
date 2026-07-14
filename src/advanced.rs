@@ -743,6 +743,36 @@ unsafe fn ducklink_optimizer_try_rewrite_impl(
     std::ptr::null_mut()
 }
 
+/// PARSER-OVERRIDE bridge (called from the C++ ParserExtension's
+/// `parser_override` hook BEFORE DuckDB's built-in parser sees the query).
+///
+/// Runs [`rewrite_colon_syntax`] on `sql`. If a rewrite happened, returns a
+/// malloc'd C string with the rewritten SQL (caller frees via
+/// [`ducklink_adv_free`]); if nothing to rewrite, returns NULL so the shim
+/// skips its parse-and-swap and lets the built-in parser see the original
+/// unchanged.
+///
+/// # Safety
+/// `sql` must be a valid NUL-terminated C string for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ducklink_parser_rewrite_colon(sql: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || unsafe {
+        if sql.is_null() {
+            return std::ptr::null_mut();
+        }
+        let s = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match rewrite_colon_syntax(s) {
+            Some(rewritten) => CString::new(rewritten)
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
+}
+
 /// PARSER bridge (called from the C++ ParserExtension's parse_function). Offer
 /// the rejected statement `sql` to each declared component parser; the first that
 /// claims it wins. Returns a malloc'd rewrite-SQL C string (freed via
@@ -960,6 +990,168 @@ fn parse_ducklink_load(sql: &str) -> Option<(String, LoadKind)> {
     };
 
     Some((name.to_string(), kind))
+}
+
+/// Rewrite ducklink's SPARQL-flavored colon syntax (`c:hash(x)`) into
+/// DuckDB's schema-qualified dot form (`c.hash(x)`).
+///
+/// Called by the C++ [`ParserExtension::parser_override`] hook (see
+/// `cpp/ducklink_parser.cpp`) BEFORE DuckDB's built-in parser sees the
+/// query. When we return `Some`, the shim hands the rewritten SQL to
+/// `Parser::ParseQuery` and uses those statements; when we return `None`,
+/// the built-in parser sees the original text unchanged.
+///
+/// Only rewrites when the shape is unambiguous: `<ident>+:<ident>+` where
+/// the colon is (a) preceded by an identifier character in the source
+/// text, (b) followed by identifier characters, (c) followed by an
+/// optional whitespace run and then `(`. That last requirement is what
+/// distinguishes our function-call syntax from `:name` bind parameters
+/// (colon preceded by non-ident) and `::` casts (colon preceded by
+/// colon).
+///
+/// Skips string literals (single-quoted with `''` escapes), quoted
+/// identifiers (double-quoted with `""` escapes), and both comment
+/// forms (`-- …\n` and `/* … */`) so a colon inside those never gets
+/// rewritten. UTF-8 safe: non-ASCII bytes pass through verbatim since
+/// none of the interesting anchors (`:` `'` `"` `-` `/` `(` ident chars)
+/// are non-ASCII.
+///
+/// Deliberately conservative — the design decision was "ship colon as
+/// sugar only if it can't step on DuckDB's existing syntax", so anything
+/// that fails these gates is left alone.
+pub(crate) fn rewrite_colon_syntax(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut modified = false;
+
+    while i < bytes.len() {
+        // Skip over string/comment lexical units without touching their
+        // contents — colons inside them are user data, not our syntax.
+        if let Some(end) = skip_string_or_comment(bytes, i) {
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
+            continue;
+        }
+
+        // `::` cast — copy both bytes and skip. Order matters: check this
+        // BEFORE the colon-syntax detector so `foo::bar(x)` doesn't get
+        // rewritten (the second `:` would have the first as a preceding
+        // ident-adjacent char).
+        if bytes[i] == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+            out.push(b':');
+            out.push(b':');
+            i += 2;
+            continue;
+        }
+
+        if bytes[i] == b':' {
+            // Left side: colon preceded by an identifier byte in the
+            // OUTPUT (which mirrors the source at this point since we've
+            // been copying byte-for-byte). Excludes `:name`, `IS :bind`,
+            // etc.
+            let prev_is_ident = out
+                .last()
+                .copied()
+                .map(is_ident_byte)
+                .unwrap_or(false);
+            if prev_is_ident {
+                // Right side: at least one ident byte, then optional
+                // whitespace, then `(`.
+                let mut j = i + 1;
+                while j < bytes.len() && is_ident_byte(bytes[j]) {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    let mut k = j;
+                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < bytes.len() && bytes[k] == b'(' {
+                        // Rewrite: emit `.` in place of the `:`. The rest
+                        // of the ident + whitespace + `(` copy through on
+                        // subsequent iterations unchanged.
+                        out.push(b'.');
+                        i += 1;
+                        modified = true;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    if !modified {
+        return None;
+    }
+    // Rewrites replace only ASCII bytes with ASCII bytes; non-ASCII bytes
+    // pass through untouched. So the output is valid UTF-8 iff the input was.
+    String::from_utf8(out).ok()
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// If `bytes[start..]` begins with a string literal, quoted identifier,
+/// line comment, or block comment, return the byte index one past the end
+/// of that lexical unit. Otherwise `None`. Handles PostgreSQL-style `''`
+/// and `""` escapes inside the respective quoted forms.
+fn skip_string_or_comment(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start).copied()? {
+        b'\'' => {
+            let mut i = start + 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2; // '' escape stays inside the string
+                    } else {
+                        return Some(i + 1);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            Some(i)
+        }
+        b'"' => {
+            let mut i = start + 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        return Some(i + 1);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            Some(i)
+        }
+        b'-' if bytes.get(start + 1) == Some(&b'-') => {
+            let mut i = start + 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            Some(i) // leave the newline to be processed normally
+        }
+        b'/' if bytes.get(start + 1) == Some(&b'*') => {
+            let mut i = start + 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                Some(i + 2)
+            } else {
+                Some(bytes.len())
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Recognize `DUCKLINK PREFIX <alias>: <namespace>[;]` (case-insensitive on
@@ -1776,4 +1968,196 @@ pub unsafe extern "C" fn ducklink_adv_free(ptr: *mut c_char) {
             drop(CString::from_raw(ptr));
         }
     })
+}
+
+#[cfg(test)]
+mod colon_rewrite_tests {
+    use super::rewrite_colon_syntax;
+
+    /// The primary transformation: `<ident>:<ident>(...)` → `<ident>.<ident>(...)`.
+    #[test]
+    fn function_call_rewrites() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT c:hash(x) FROM t").as_deref(),
+            Some("SELECT c.hash(x) FROM t")
+        );
+        assert_eq!(
+            rewrite_colon_syntax("SELECT c:hash_agg('sha2-256', s ORDER BY s) FROM t").as_deref(),
+            Some("SELECT c.hash_agg('sha2-256', s ORDER BY s) FROM t")
+        );
+    }
+
+    /// Multiple occurrences in one statement.
+    #[test]
+    fn multiple_calls_all_rewrite() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT c:hash(x), math:sqrt(y) FROM t").as_deref(),
+            Some("SELECT c.hash(x), math.sqrt(y) FROM t")
+        );
+    }
+
+    /// Whitespace between the colon and the function is fine.
+    #[test]
+    fn whitespace_before_open_paren_ok() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT c:hash  (x)").as_deref(),
+            Some("SELECT c.hash  (x)")
+        );
+    }
+
+    /// `::` cast is untouched. This is the load-bearing collision check —
+    /// getting this wrong would break every DuckDB CAST expression.
+    #[test]
+    fn double_colon_cast_untouched() {
+        assert_eq!(rewrite_colon_syntax("SELECT x::TEXT FROM t"), None);
+        assert_eq!(
+            rewrite_colon_syntax("SELECT c:hash(x)::VARCHAR FROM t").as_deref(),
+            Some("SELECT c.hash(x)::VARCHAR FROM t")
+        );
+        // Trailing :: after an ident (looks close to our pattern but the
+        // second colon rules it out).
+        assert_eq!(rewrite_colon_syntax("SELECT foo::bar"), None);
+    }
+
+    /// `:name` bind parameters MUST NOT be rewritten. The `:` there is
+    /// preceded by non-identifier characters (whitespace, comma, `(`).
+    #[test]
+    fn bind_parameter_untouched() {
+        assert_eq!(rewrite_colon_syntax("SELECT :name FROM t"), None);
+        assert_eq!(rewrite_colon_syntax("SELECT * FROM t WHERE x = :x"), None);
+        assert_eq!(
+            rewrite_colon_syntax("EXECUTE q(:p1, :p2, :p3)"),
+            None,
+            "bind params inside function calls must not rewrite"
+        );
+    }
+
+    /// Colon inside a single-quoted string literal is user data.
+    #[test]
+    fn string_literal_colon_untouched() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT 'c:hash(x)' FROM t"),
+            None,
+            "colon inside single-quoted string literal must not rewrite"
+        );
+        // A rewrite outside the string still works even if there's a
+        // colon inside the string.
+        assert_eq!(
+            rewrite_colon_syntax("SELECT c:hash('c:x') FROM t").as_deref(),
+            Some("SELECT c.hash('c:x') FROM t")
+        );
+    }
+
+    /// `''` escape inside a single-quoted string keeps us in the string.
+    #[test]
+    fn escaped_single_quote_inside_string() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT 'a''c:hash(x)' FROM t"),
+            None,
+            "'' escape must not close the string prematurely"
+        );
+    }
+
+    /// Colon inside a double-quoted identifier is user data.
+    #[test]
+    fn quoted_identifier_colon_untouched() {
+        assert_eq!(
+            rewrite_colon_syntax(r#"SELECT "weird:name" FROM t"#),
+            None
+        );
+    }
+
+    /// Line comment absorbs everything to end-of-line.
+    #[test]
+    fn line_comment_colon_untouched() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT 1 -- c:hash(x)\nFROM t"),
+            None
+        );
+        // Rewrite AFTER the comment closes still works.
+        assert_eq!(
+            rewrite_colon_syntax("-- c:hash(x)\nSELECT c:hash(y)").as_deref(),
+            Some("-- c:hash(x)\nSELECT c.hash(y)")
+        );
+    }
+
+    /// Block comment absorbs across newlines.
+    #[test]
+    fn block_comment_colon_untouched() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT /* c:hash(x) */ 1"),
+            None
+        );
+        assert_eq!(
+            rewrite_colon_syntax("/* c:x\nc:y(z) */ SELECT c:hash(w)").as_deref(),
+            Some("/* c:x\nc:y(z) */ SELECT c.hash(w)")
+        );
+    }
+
+    /// A colon between idents but NOT followed by `(` — leave alone.
+    /// Could be JSON path syntax someone adds to DuckDB later, or a
+    /// user's alias-like construct we don't want to accidentally break.
+    #[test]
+    fn colon_between_idents_without_paren_untouched() {
+        assert_eq!(rewrite_colon_syntax("SELECT c:hash FROM t"), None);
+        assert_eq!(rewrite_colon_syntax("SELECT c:hash, x FROM t"), None);
+        // With optional whitespace before the '('  we DO rewrite —
+        // whitespace between name and `(` is legal SQL for function calls.
+        assert_eq!(
+            rewrite_colon_syntax("SELECT c:hash (x)").as_deref(),
+            Some("SELECT c.hash (x)")
+        );
+    }
+
+    /// Non-ASCII content passes through untouched.
+    #[test]
+    fn utf8_passthrough() {
+        assert_eq!(
+            rewrite_colon_syntax("SELECT 'naïve' AS x, c:hash(y) FROM t").as_deref(),
+            Some("SELECT 'naïve' AS x, c.hash(y) FROM t")
+        );
+        assert_eq!(
+            rewrite_colon_syntax("SELECT '日本語:test(x)' FROM t"),
+            None
+        );
+    }
+
+    /// No rewrite → returns None (so the shim can skip the parse-and-swap
+    /// entirely and let DuckDB's parser see the original text).
+    #[test]
+    fn returns_none_when_nothing_to_rewrite() {
+        assert_eq!(rewrite_colon_syntax("SELECT 1"), None);
+        assert_eq!(rewrite_colon_syntax(""), None);
+        assert_eq!(rewrite_colon_syntax(";"), None);
+        assert_eq!(rewrite_colon_syntax("SELECT crypto.hash(x) FROM t"), None);
+    }
+
+    /// Unterminated string — don't emit garbage or panic. Leaving the
+    /// original text unchanged is the right call: DuckDB's parser will
+    /// report the syntax error on the original source.
+    #[test]
+    fn unterminated_string_or_comment_doesnt_panic() {
+        // Should complete without panicking (the string absorbs to EOF,
+        // no rewrite candidate outside it, so `None`).
+        let _ = rewrite_colon_syntax("SELECT 'unterminated");
+        let _ = rewrite_colon_syntax("SELECT /* unclosed comment ");
+    }
+
+    /// The specific pathological patterns the design flagged.
+    #[test]
+    fn design_flagged_patterns() {
+        // JSON path-ish: no colons in DuckDB JSON syntax today, but
+        // future-proof by not rewriting things that don't fit our shape.
+        assert_eq!(rewrite_colon_syntax("SELECT x->'a:b'"), None);
+        // Prepared statement with bind params.
+        assert_eq!(
+            rewrite_colon_syntax("PREPARE q AS SELECT * FROM t WHERE x = :p"),
+            None
+        );
+        // Multi-arg aggregate with a bind param — no false positive on `:`.
+        assert_eq!(
+            rewrite_colon_syntax("SELECT crypto_hash_agg(:algo, s ORDER BY s) FROM t"),
+            None
+        );
+    }
 }
