@@ -865,8 +865,14 @@ unsafe fn ducklink_load_wasm_impl(
     };
     match crate::reg_duckdb::load_wasm_into_db(db.cast(), arg) {
         Ok((name, scalars, tables, aggregates)) => {
+            let replayed = replay_persisted_prefixes(db.cast());
+            let replay_note = if replayed > 0 {
+                format!(", replayed {replayed} persisted prefix(es)")
+            } else {
+                String::new()
+            };
             let msg = format!(
-                "loaded '{name}': {scalars} scalar(s), {tables} table(s), {aggregates} aggregate(s)"
+                "loaded '{name}': {scalars} scalar(s), {tables} table(s), {aggregates} aggregate(s){replay_note}"
             );
             *out_summary = CString::new(msg)
                 .map(|c| c.into_raw())
@@ -1095,14 +1101,26 @@ unsafe fn ducklink_load_native_impl(
                 return 0;
             }
         };
+        // Replay any prefixes persisted from prior sessions — the
+        // just-loaded module might satisfy one whose namespace was empty
+        // before. Non-fatal: on failure, the current session's community
+        // aliases still work; the user just has to redeclare the prefix.
+        let replayed = replay_persisted_prefixes(db.cast());
         crate::events::emit(
             "load_community_native_ok",
             Some(name_str),
-            format!("extension='{community_ext}' aliases={alias_count}"),
+            format!(
+                "extension='{community_ext}' aliases={alias_count} prefixes_replayed={replayed}"
+            ),
         );
+        let replay_note = if replayed > 0 {
+            format!(", replayed {replayed} persisted prefix(es)")
+        } else {
+            String::new()
+        };
         *out_summary = CString::new(format!(
             "installed '{name_str}' via community-extensions:{community_ext} \
-             ({alias_count} alias{})",
+             ({alias_count} alias{}{replay_note})",
             if alias_count == 1 { "" } else { "es" }
         ))
         .map(|c| c.into_raw())
@@ -1133,8 +1151,18 @@ unsafe fn ducklink_load_native_impl(
 
     match load_result {
         Ok(()) => {
-            let msg = format!("installed '{name_str}' at {}", path_str);
-            crate::events::emit("load_native_ok", Some(name_str), path_str);
+            let replayed = replay_persisted_prefixes(db.cast());
+            let replay_note = if replayed > 0 {
+                format!(" (replayed {replayed} persisted prefix(es))")
+            } else {
+                String::new()
+            };
+            let msg = format!("installed '{name_str}' at {}{replay_note}", path_str);
+            crate::events::emit(
+                "load_native_ok",
+                Some(name_str),
+                format!("{path_str} prefixes_replayed={replayed}"),
+            );
             *out_summary = CString::new(msg)
                 .map(|c| c.into_raw())
                 .unwrap_or(std::ptr::null_mut());
@@ -1312,8 +1340,18 @@ unsafe fn ducklink_prefix_impl(
         }
     }
 
+    // Persist the mapping so reconnecting to the same database restores
+    // this alias on the next `DUCKLINK LOAD`. Non-fatal: aliasing already
+    // succeeded for this session; if persistence fails (e.g. read-only
+    // catalog) we record it in the summary but the user's current-session
+    // aliases still work.
+    let persistence_note = match persist_prefix(db_h, &alias, &namespace) {
+        Ok(()) => String::new(),
+        Err(e) => format!(" (persist failed: {e})"),
+    };
+
     let mut summary = format!(
-        "DUCKLINK PREFIX {alias}: {namespace} — aliased {aliased} of {} function(s)",
+        "DUCKLINK PREFIX {alias}: {namespace} — aliased {aliased} of {} function(s){persistence_note}",
         fns.len()
     );
     if !errors.is_empty() {
@@ -1324,6 +1362,152 @@ unsafe fn ducklink_prefix_impl(
         .map(|c| c.into_raw())
         .unwrap_or(std::ptr::null_mut());
     0
+}
+
+/// Create the `ducklink` schema + `ducklink.prefixes` table if they don't
+/// already exist. Called lazily from [`persist_prefix`] so a user who never
+/// declares a `DUCKLINK PREFIX` never gets an unused table in their catalog.
+///
+/// # Safety
+/// `db` must be a valid live `duckdb_database`.
+unsafe fn ensure_prefixes_table(db: ffi::duckdb_database) -> Result<(), String> {
+    load_via_duckdb_query(db, "CREATE SCHEMA IF NOT EXISTS ducklink")
+        .map_err(|e| format!("CREATE SCHEMA ducklink: {e}"))?;
+    load_via_duckdb_query(
+        db,
+        "CREATE TABLE IF NOT EXISTS ducklink.prefixes (\
+             alias VARCHAR PRIMARY KEY, \
+             namespace VARCHAR NOT NULL)",
+    )
+    .map_err(|e| format!("CREATE TABLE ducklink.prefixes: {e}"))?;
+    Ok(())
+}
+
+/// Persist a `(alias, namespace)` mapping into `ducklink.prefixes` so a
+/// fresh connection can replay it. Redeclaring the same alias
+/// idempotently REPLACES the row (INSERT OR REPLACE). Both `alias` and
+/// `namespace` must already be safe identifiers — callers gate on
+/// [`crate::catalog::is_safe_identifier`] before splicing.
+///
+/// For :memory: databases the table lives with the rest of the in-memory
+/// state and naturally dies at close — user redeclares on reconnect. For
+/// file-backed databases the row survives, and any subsequent
+/// `DUCKLINK LOAD` triggers [`replay_persisted_prefixes`].
+///
+/// # Safety
+/// `db` must be a valid live `duckdb_database`.
+unsafe fn persist_prefix(
+    db: ffi::duckdb_database,
+    alias: &str,
+    namespace: &str,
+) -> Result<(), String> {
+    ensure_prefixes_table(db)?;
+    // Identifiers already validated by the caller — safe to splice.
+    let sql = format!(
+        "INSERT OR REPLACE INTO ducklink.prefixes (alias, namespace) VALUES ('{alias}', '{namespace}')"
+    );
+    load_via_duckdb_query(db, &sql).map_err(|e| format!("INSERT ducklink.prefixes: {e}"))
+}
+
+/// Walk every persisted `(alias, namespace)` and reapply it (register
+/// aliases in the alias schema for every function currently in the
+/// namespace schema). Silent-skip a prefix whose namespace has no
+/// currently-loaded functions — that just means the source module isn't
+/// loaded yet in this session, and a later `DUCKLINK LOAD 'name' NATIVE`
+/// call will trigger another replay pass.
+///
+/// Called at the end of `ducklink_load_wasm_impl` /
+/// `ducklink_load_native_impl` so `DUCKLINK LOAD 'crypto' NATIVE` after
+/// a reconnect automatically restores any `c: crypto` alias declared in
+/// a prior session.
+///
+/// # Safety
+/// `db` must be a valid live `duckdb_database`.
+unsafe fn replay_persisted_prefixes(db: ffi::duckdb_database) -> usize {
+    // If the table hasn't been created yet (no prefix ever declared),
+    // nothing to replay. Check via information_schema so this stays a
+    // clean no-op on a virgin database.
+    let exists_check = query_rows_via_duckdb(
+        db,
+        "SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'ducklink' AND table_name = 'prefixes' LIMIT 1",
+    );
+    match exists_check {
+        Ok(rows) if !rows.is_empty() => {}
+        _ => return 0,
+    }
+    let rows = match query_rows_via_duckdb(db, "SELECT alias, namespace FROM ducklink.prefixes") {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut replayed = 0usize;
+    for row in rows {
+        let alias = match row.first().and_then(|c| c.clone()) {
+            Some(a) => a,
+            None => continue,
+        };
+        let namespace = match row.get(1).and_then(|c| c.clone()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !crate::catalog::is_safe_identifier(&alias)
+            || !crate::catalog::is_safe_identifier(&namespace)
+        {
+            continue;
+        }
+        // Reuse the impl but suppress persistence — we're already reading
+        // FROM the table, no need to write back into it. Passing None for
+        // the persistence hook is what does it.
+        if apply_prefix_no_persist(db, &alias, &namespace).is_ok() {
+            replayed += 1;
+        }
+    }
+    replayed
+}
+
+/// The core work of aliasing every function in `namespace` under `alias`,
+/// factored out of `ducklink_prefix_impl` so replay can share it without
+/// re-persisting. Returns Ok(count) when at least the schema scan
+/// succeeded, Err(msg) on hard C-API failure. A namespace with zero
+/// currently-loaded functions returns Ok(0).
+unsafe fn apply_prefix_no_persist(
+    db: ffi::duckdb_database,
+    alias: &str,
+    namespace: &str,
+) -> Result<usize, String> {
+    let scan_sql = format!(
+        "SELECT function_name FROM duckdb_functions() \
+         WHERE schema_name = '{namespace}' \
+         AND function_type IN ('scalar','aggregate','table_macro','scalar_macro','macro','table') \
+         GROUP BY function_name"
+    );
+    let rows = query_rows_via_duckdb(db, &scan_sql)?;
+    let fns: Vec<String> = rows
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .filter(|n| crate::catalog::is_safe_identifier(n))
+        .collect();
+    if fns.is_empty() {
+        return Ok(0);
+    }
+    let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(db, &mut raw) != ffi::DuckDBSuccess {
+        return Err("duckdb_connect failed".to_string());
+    }
+    struct ConnGuard(ffi::duckdb_connection);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_disconnect(&mut self.0) };
+        }
+    }
+    let _guard = ConnGuard(raw);
+    let mut aliased = 0usize;
+    for fn_name in &fns {
+        if catalog_alias(raw, Some(namespace), fn_name, Some(alias), fn_name).is_ok() {
+            aliased += 1;
+        }
+    }
+    Ok(aliased)
 }
 
 /// Open a sibling connection on the live database and run
