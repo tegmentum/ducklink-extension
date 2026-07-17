@@ -92,17 +92,35 @@ mod advanced_build {
         if target_arch == "wasm32" {
             return;
         }
-        // Never compiled on Windows. The advanced tier links against DuckDB's
-        // internal C++ ABI with internal symbols left UNDEFINED in the shim
-        // object, resolved at LOAD time against the host process. That
-        // deferred-undefined model has no portable equivalent on Windows
-        // PE/COFF (the MSVC linker requires every symbol resolved at link time
-        // and rejects the GNU-ld `--allow-shlib-undefined` flag below). So
-        // Windows builds the COMMON tier only and the advanced module is
-        // compiled out on the Rust side too (`#[cfg(advanced_tier)]`, which we
-        // never set here). Skip the C++ shim and emit no cdylib link-arg.
+        // Skip the C++ shim on platforms where the deferred-undefined-symbol
+        // resolution model doesn't work:
+        //
+        // * Windows PE/COFF — the MSVC linker requires every symbol resolved
+        //   at link time and rejects the GNU-ld `--allow-shlib-undefined`
+        //   flag below. So Windows builds the COMMON tier only.
+        //
+        // * Linux ELF — the host DuckDB binary compiles with default
+        //   `-fvisibility=hidden`, so internal C++ typeinfo (e.g.
+        //   `duckdb::FunctionData`, `duckdb::Catalog`, ...) is present in
+        //   the process image but NOT in `.dynsym`. `dlopen` can't find it
+        //   and rejects the LOAD with `undefined symbol: _ZTIN6duckdb...E`.
+        //   macOS works because Mach-O `-undefined dynamic_lookup` bypasses
+        //   the export table and searches the whole process image, so
+        //   internal typeinfo resolves regardless of visibility. This
+        //   asymmetry is a fundamental Mach-O vs ELF difference for the
+        //   internal-C++-ABI extension model — not something we can wave
+        //   away from our side.
+        //
+        // Users who need the advanced tier on Linux build locally (`cargo
+        // build --release --features loadable,advanced` against a DuckDB
+        // they trust and control the visibility flags of) rather than
+        // installing from community-extensions.
+        //
+        // The `advanced_tier` cfg stays UNSET on these platforms; every
+        // `#[cfg(advanced_tier)]` module and internal-ABI reference
+        // compiles out on the Rust side too.
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        if target_os == "windows" {
+        if target_os == "windows" || target_os == "linux" {
             return;
         }
 
