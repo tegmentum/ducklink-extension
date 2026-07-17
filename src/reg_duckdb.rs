@@ -3040,6 +3040,12 @@ pub fn register_load_function(
         loaded: Mutex::new(Vec::new()),
     });
     con.register_table_function::<WasmLoad>("ducklink_load")?;
+    // SPARQL-flavored alias schemas — the portable, C-API-only equivalent
+    // of the advanced-tier `DUCKLINK PREFIX c: crypto;` statement. Users
+    // invoke it as `FROM ducklink_prefix('c', 'crypto')`; the declaration
+    // is persisted in `ducklink.prefixes` and replayed on subsequent
+    // `ducklink_load('name', kind => 'native')` calls.
+    con.register_table_function::<DucklinkPrefix>("ducklink_prefix")?;
     // The INTERNAL discovery table functions backing the public `ducklink.*`
     // views. Users query the views (`SELECT * FROM ducklink.modules`); these
     // `ducklink_*()` TFs are the implementation the views select from.
@@ -3514,11 +3520,16 @@ fn community_native_load(
     let alias_count = create_community_aliases(&con, raw_conn, &spec)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+    // Replay any prefixes persisted from prior sessions. The just-loaded
+    // module might satisfy one whose namespace was empty before. Non-fatal:
+    // failures don't block the load itself.
+    let prefixes_replayed = replay_persisted_prefixes(&con);
+
     crate::events::emit(
         "load_community_native_ok",
         Some(name_arg),
         format!(
-            "extension='{community_ext_name}' aliases={alias_count}"
+            "extension='{community_ext_name}' aliases={alias_count} prefixes_replayed={prefixes_replayed}"
         ),
     );
 
@@ -3700,10 +3711,14 @@ fn create_community_aliases(
             if !done_arities.insert(params.len()) {
                 continue;
             }
-            let Some(macro_sql) = crate::catalog::build_alias_macro(&ftype, ours, theirs, &params) else {
+
+            // Register in `main` — bare form.
+            let Some(main_sql) = crate::catalog::build_alias_macro(
+                &ftype, None, ours, theirs, &params,
+            ) else {
                 continue;
             };
-            if let Err(err) = con.execute(&macro_sql, []) {
+            if let Err(err) = con.execute(&main_sql, []) {
                 crate::events::emit(
                     "community_alias_error",
                     Some(ours),
@@ -3712,9 +3727,337 @@ fn create_community_aliases(
                 continue;
             }
             created += 1;
+
+            // Optional double-registration in the declared namespace so
+            // `<namespace>.<ours>(x)` binds. Portable via `CREATE MACRO`
+            // in a specific schema — no internal-ABI shim required. The
+            // schema is created on demand with `IF NOT EXISTS`.
+            if let Some(ns) = namespace {
+                if !crate::catalog::is_safe_identifier(ns) {
+                    continue;
+                }
+                if let Err(err) = con.execute(&format!("CREATE SCHEMA IF NOT EXISTS {ns}"), []) {
+                    crate::events::emit(
+                        "community_namespace_schema_error",
+                        Some(ns),
+                        err.to_string(),
+                    );
+                    continue;
+                }
+                let Some(ns_sql) = crate::catalog::build_alias_macro(
+                    &ftype, Some(ns), ours, theirs, &params,
+                ) else {
+                    continue;
+                };
+                if let Err(err) = con.execute(&ns_sql, []) {
+                    crate::events::emit(
+                        "community_namespace_alias_error",
+                        Some(ours),
+                        format!("{ns}.{ours}: {err}"),
+                    );
+                    continue;
+                }
+                created += 1;
+            }
         }
     }
     Ok(created)
+}
+
+// ---------------------------------------------------------------------------
+// ducklink_prefix table function — SPARQL-flavored alias schemas on the C API.
+//
+// Portable equivalent of the advanced-tier `DUCKLINK PREFIX c: crypto;`
+// statement: `FROM ducklink_prefix('c', 'crypto')` creates an alias schema
+// `c` populated with `CREATE OR REPLACE MACRO` entries mirroring every
+// function reachable in schema `crypto`. Both `crypto.hash(x)` and
+// `c.hash(x)` bind to the same underlying macro; users can layer whichever
+// short form they want. The declaration is persisted in
+// `ducklink.prefixes(alias, namespace)` and replayed automatically on the
+// next `FROM ducklink_load('name', kind => 'native')` after a reconnect.
+//
+// Aggregate transparency trade-off: aliases are `CREATE MACRO` shapes, so
+// DISTINCT / FILTER / ORDER BY / OVER modifiers don't propagate through
+// the alias for aggregates. Users still have community's original name
+// available with full modifier support. This is the documented cost of
+// running on the stable C API — the advanced-tier catalog-alias shim did
+// preserve modifiers but wasn't portable to Linux/Windows.
+// ---------------------------------------------------------------------------
+
+/// Ensure `ducklink.prefixes(alias VARCHAR PRIMARY KEY, namespace VARCHAR)`
+/// exists. Called lazily from [`persist_prefix`] so a user who never
+/// declares a prefix never gets an unused table in their catalog.
+fn ensure_prefixes_table(con: &Connection) -> Result<(), String> {
+    con.execute("CREATE SCHEMA IF NOT EXISTS ducklink", [])
+        .map_err(|e| format!("CREATE SCHEMA ducklink: {e}"))?;
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS ducklink.prefixes (\
+             alias VARCHAR PRIMARY KEY, \
+             namespace VARCHAR NOT NULL)",
+        [],
+    )
+    .map_err(|e| format!("CREATE TABLE ducklink.prefixes: {e}"))?;
+    Ok(())
+}
+
+/// Persist a `(alias, namespace)` mapping into `ducklink.prefixes` so a
+/// fresh connection can replay it via [`replay_persisted_prefixes`].
+/// Redeclaring the same alias is idempotent via INSERT OR REPLACE.
+fn persist_prefix(con: &Connection, alias: &str, namespace: &str) -> Result<(), String> {
+    ensure_prefixes_table(con)?;
+    let sql = format!(
+        "INSERT OR REPLACE INTO ducklink.prefixes (alias, namespace) VALUES ('{alias}', '{namespace}')"
+    );
+    con.execute(&sql, [])
+        .map(|_| ())
+        .map_err(|e| format!("INSERT ducklink.prefixes: {e}"))
+}
+
+/// Populate the `<alias>` schema with `CREATE OR REPLACE MACRO` entries
+/// mirroring every function reachable in schema `<namespace>`. Returns
+/// the count of macros created. Skips functions whose type doesn't have
+/// a macro shape (see [`crate::catalog::build_alias_macro`]).
+fn create_prefix_aliases(
+    con: &Connection,
+    alias: &str,
+    namespace: &str,
+) -> Result<usize, String> {
+    // Belt-and-braces before we splice anything into DDL.
+    if !crate::catalog::is_safe_identifier(alias)
+        || !crate::catalog::is_safe_identifier(namespace)
+    {
+        return Err(format!(
+            "identifier gate: alias='{alias}', namespace='{namespace}' \
+             (both must match [A-Za-z0-9_]+)"
+        ));
+    }
+    // Ensure the alias schema exists; the namespace schema is expected to
+    // already exist (populated by an earlier `ducklink_load('x',
+    // kind => 'native')` with a namespace-declared entry).
+    con.execute(&format!("CREATE SCHEMA IF NOT EXISTS {alias}"), [])
+        .map_err(|e| format!("CREATE SCHEMA {alias}: {e}"))?;
+
+    // Enumerate every function name in the source namespace once; we'll
+    // fetch (type, params) per name in the inner loop.
+    let mut stmt = con
+        .prepare(&format!(
+            "SELECT DISTINCT function_name FROM duckdb_functions() \
+             WHERE schema_name = '{namespace}' \
+             AND function_type IN ('scalar','aggregate','table_macro','scalar_macro','macro','table')"
+        ))
+        .map_err(|e| format!("prepare namespace scan: {e}"))?;
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("scan {namespace}: {e}"))?
+        .filter_map(Result::ok)
+        .filter(|n| crate::catalog::is_safe_identifier(n))
+        .collect();
+    drop(stmt);
+    if names.is_empty() {
+        return Ok(0);
+    }
+
+    let mut created = 0usize;
+    for fn_name in &names {
+        let info_sql = format!(
+            "SELECT function_type, array_to_string(parameters, ',') AS param_csv \
+             FROM duckdb_functions() \
+             WHERE schema_name = '{namespace}' AND function_name = '{fn_name}'"
+        );
+        let mut info_stmt = con
+            .prepare(&info_sql)
+            .map_err(|e| format!("prepare info for '{fn_name}': {e}"))?;
+        let rows = info_stmt
+            .query_map([], |r| {
+                let ftype: String = r.get(0)?;
+                let csv: Option<String> = r.get(1)?;
+                Ok((ftype, csv))
+            })
+            .map_err(|e| format!("info query for '{fn_name}': {e}"))?;
+
+        let mut done_arities: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for row in rows.flatten() {
+            let (ftype, csv) = row;
+            let csv = csv.unwrap_or_default();
+            let params: Vec<String> = if csv.is_empty() {
+                Vec::new()
+            } else {
+                csv.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            if !done_arities.insert(params.len()) {
+                continue;
+            }
+            let Some(macro_sql) = crate::catalog::build_alias_macro(
+                &ftype,
+                Some(alias),
+                fn_name,
+                &format!("{namespace}.{fn_name}"),
+                &params,
+            ) else {
+                continue;
+            };
+            if let Err(err) = con.execute(&macro_sql, []) {
+                crate::events::emit(
+                    "prefix_alias_error",
+                    Some(alias),
+                    format!("{fn_name}: {err}"),
+                );
+                continue;
+            }
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
+/// Walk every row of `ducklink.prefixes` and reapply it: for each
+/// `(alias, namespace)`, populate the alias schema with macros mirroring
+/// the current contents of the namespace schema. Silently skips a prefix
+/// whose namespace is empty (source module isn't loaded in this session
+/// yet — another `ducklink_load` later triggers another replay pass).
+/// Returns the number of prefixes successfully replayed (at least one
+/// macro created for it).
+fn replay_persisted_prefixes(con: &Connection) -> usize {
+    let exists = con
+        .query_row(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'ducklink' AND table_name = 'prefixes' LIMIT 1",
+            [],
+            |r| r.get::<_, i32>(0),
+        )
+        .is_ok();
+    if !exists {
+        return 0;
+    }
+    let mut stmt = match con.prepare("SELECT alias, namespace FROM ducklink.prefixes") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let rows: Vec<(String, String)> = match stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    {
+        Ok(iter) => iter.filter_map(Result::ok).collect(),
+        Err(_) => return 0,
+    };
+    let mut replayed = 0usize;
+    for (alias, namespace) in rows {
+        match create_prefix_aliases(con, &alias, &namespace) {
+            Ok(n) if n > 0 => replayed += 1,
+            _ => {}
+        }
+    }
+    replayed
+}
+
+/// The `ducklink_prefix(alias, namespace)` table function: declares a
+/// SPARQL-flavored alias schema populated with C-API-only `CREATE OR
+/// REPLACE MACRO` entries. Returns a single-row summary
+/// `(alias, namespace, macros_created)`.
+struct DucklinkPrefix;
+
+struct DucklinkPrefixBind {
+    alias: String,
+    namespace: String,
+    macros: i64,
+}
+
+struct DucklinkPrefixInit {
+    done: AtomicUsize,
+}
+
+impl VTab for DucklinkPrefix {
+    type InitData = DucklinkPrefixInit;
+    type BindData = DucklinkPrefixBind;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("ducklink_prefix bind", || {
+            let rt = RUNTIME.get().ok_or_else(|| -> Box<dyn std::error::Error> {
+                "ducklink_prefix: runtime not initialised (LOAD ducklink first)".into()
+            })?;
+            let alias = bind.get_parameter(0).to_string();
+            let namespace = bind.get_parameter(1).to_string();
+            if !crate::catalog::is_safe_identifier(&alias)
+                || !crate::catalog::is_safe_identifier(&namespace)
+            {
+                return Err(format!(
+                    "ducklink_prefix: alias and namespace must match [A-Za-z0-9_]+ \
+                     (got alias='{alias}', namespace='{namespace}')"
+                )
+                .into());
+            }
+            let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+            let macros = create_prefix_aliases(&con, &alias, &namespace)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if macros == 0 {
+                return Err(format!(
+                    "ducklink_prefix: namespace '{namespace}' has no functions to alias — \
+                     is the module loaded?"
+                )
+                .into());
+            }
+            if let Err(e) = persist_prefix(&con, &alias, &namespace) {
+                crate::events::emit(
+                    "ducklink_prefix_persist_error",
+                    Some(&alias),
+                    e.clone(),
+                );
+                // Non-fatal: session aliases succeeded; persistence failure
+                // just means reconnect won't restore.
+            }
+            crate::events::emit(
+                "ducklink_prefix_ok",
+                Some(&alias),
+                format!("namespace='{namespace}' macros={macros}"),
+            );
+
+            bind.add_result_column("alias", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("namespace", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("macros", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+            Ok(DucklinkPrefixBind {
+                alias,
+                namespace,
+                macros: macros as i64,
+            })
+        })
+    }
+
+    fn init(_info: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(DucklinkPrefixInit {
+            done: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_prefix scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            if init.done.swap(1, Ordering::Relaxed) != 0 {
+                output.set_len(0);
+                return Ok(());
+            }
+            output.flat_vector(0).insert(0, bind.alias.as_str());
+            output.flat_vector(1).insert(0, bind.namespace.as_str());
+            unsafe {
+                output.flat_vector(2).as_mut_slice::<i64>()[0] = bind.macros;
+            }
+            output.set_len(1);
+            Ok(())
+        })
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ])
+    }
 }
 
 /// Fallback native path — download a ducklink-hosted native provider matching
@@ -6176,6 +6519,147 @@ mod tests {
             .query_row("SELECT double(21)", [], |r| r.get(0))
             .expect("via alias");
         assert_eq!(out, 42);
+    }
+
+    /// C-API-only namespace registration: without the advanced-tier shim,
+    /// `create_community_aliases` must still produce a callable
+    /// `<namespace>.<ours>(x)` binding by emitting `CREATE OR REPLACE
+    /// MACRO` in the namespace schema. This is what makes the
+    /// namespace-qualified surface work uniformly across every platform,
+    /// including Linux (where advanced_tier is off).
+    ///
+    /// Trade-off documented alongside: aggregate modifiers (DISTINCT /
+    /// FILTER / ORDER BY / OVER) don't propagate through a macro-aliased
+    /// aggregate — that limitation was the price of dropping the
+    /// internal-C++-ABI shim for portability. Community's original
+    /// function name still supports the modifiers.
+    #[test]
+    fn alias_gen_namespace_registers_via_macro_when_shim_off() {
+        let con = Connection::open_in_memory().expect("open");
+        // Simulate a community-registered scalar under its own name.
+        con.execute("CREATE MACRO crypto_hash(algo, data) AS algo || ':' || data", [])
+            .expect("create crypto_hash");
+        // Pass null raw_conn → shim path skipped even on advanced_tier
+        // builds; the macro-fallback is the only path exercised.
+        let n = create_community_aliases(
+            &con,
+            std::ptr::null_mut(),
+            &spec_with_namespace(
+                None,
+                &[("hash", "crypto_hash")],
+                Some("crypto"),
+            ),
+        )
+        .expect("alias gen");
+        // Two macros: main.hash and crypto.hash. Both are callable and
+        // return identical results.
+        assert_eq!(n, 2, "expected 2 registrations (main + namespace), got {n}");
+        let bare: String = con
+            .query_row("SELECT hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("bare hash()");
+        assert_eq!(bare, "sha2-256:ping");
+        let qualified: String = con
+            .query_row("SELECT crypto.hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("qualified crypto.hash()");
+        assert_eq!(qualified, "sha2-256:ping");
+        // Community's original name is untouched.
+        let original: String = con
+            .query_row("SELECT crypto_hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("original crypto_hash()");
+        assert_eq!(original, "sha2-256:ping");
+    }
+
+    /// Portable equivalent of `DUCKLINK PREFIX c: crypto;` — the C-API-only
+    /// implementation. `create_prefix_aliases` populates the alias schema
+    /// with `CREATE OR REPLACE MACRO` entries mirroring the source schema.
+    #[test]
+    fn create_prefix_aliases_populates_alias_schema_via_macros() {
+        let con = Connection::open_in_memory().expect("open");
+        // Set up a `crypto` schema with a couple of functions in it —
+        // simulates the state right after `ducklink_load('crypto', kind
+        // => 'native')` on an entry that declares `namespace: "crypto"`.
+        con.execute_batch(
+            "CREATE SCHEMA crypto; \
+             CREATE MACRO crypto.hash(algo, data) AS algo || ':' || data; \
+             CREATE MACRO crypto.hmac(algo, key, data) AS algo || '+' || key || ':' || data;",
+        )
+        .expect("seed crypto schema");
+
+        let n = create_prefix_aliases(&con, "c", "crypto").expect("prefix");
+        assert_eq!(n, 2, "expected 2 alias macros (hash + hmac), got {n}");
+
+        // Both qualifiers now resolve, sharing the same underlying macros.
+        let via_alias: String = con
+            .query_row("SELECT c.hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("c.hash()");
+        let via_ns: String = con
+            .query_row("SELECT crypto.hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("crypto.hash()");
+        assert_eq!(via_alias, via_ns);
+        assert_eq!(via_alias, "sha2-256:ping");
+
+        // Multi-arg case still works uniformly.
+        let hmac: String = con
+            .query_row("SELECT c.hmac('sha2-256', 'k1', 'body')", [], |r| r.get(0))
+            .expect("c.hmac()");
+        assert_eq!(hmac, "sha2-256+k1:body");
+    }
+
+    /// Empty-source-namespace path: if the source schema has no
+    /// registrable functions, `create_prefix_aliases` returns Ok(0)
+    /// rather than erroring — the ducklink_prefix TF turns that into a
+    /// user-facing "is the module loaded?" message.
+    #[test]
+    fn create_prefix_aliases_empty_namespace_returns_zero() {
+        let con = Connection::open_in_memory().expect("open");
+        // An empty schema — no functions to alias.
+        con.execute("CREATE SCHEMA emptyns", []).expect("schema");
+        let n = create_prefix_aliases(&con, "e", "emptyns").expect("empty is not an error");
+        assert_eq!(n, 0);
+    }
+
+    /// Persistence: declaring the same prefix twice must be idempotent
+    /// (`INSERT OR REPLACE`) — no duplicate rows in `ducklink.prefixes`.
+    #[test]
+    fn persist_prefix_is_idempotent() {
+        let con = Connection::open_in_memory().expect("open");
+        persist_prefix(&con, "c", "crypto").expect("first");
+        persist_prefix(&con, "c", "crypto").expect("second");
+        let count: i64 = con
+            .query_row(
+                "SELECT count(*) FROM ducklink.prefixes WHERE alias = 'c'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1, "re-declare must be idempotent, got {count} rows");
+    }
+
+    /// Replay path: with a persisted `(c, crypto)` in `ducklink.prefixes`
+    /// and a live `crypto` schema, `replay_persisted_prefixes` should
+    /// recreate the alias macros.
+    #[test]
+    fn replay_persisted_prefixes_recreates_alias_schema() {
+        let con = Connection::open_in_memory().expect("open");
+        // Seed source namespace.
+        con.execute_batch(
+            "CREATE SCHEMA crypto; \
+             CREATE MACRO crypto.hash(x) AS 'H:' || x;",
+        )
+        .expect("seed");
+        // Seed persistence table with a prior declaration.
+        persist_prefix(&con, "c", "crypto").expect("persist");
+        // Fresh session simulation: `c` schema doesn't exist yet.
+        let missing = con.query_row("SELECT c.hash('a')", [], |r| r.get::<_, String>(0));
+        assert!(missing.is_err(), "c.hash should be missing before replay");
+
+        let n = replay_persisted_prefixes(&con);
+        assert_eq!(n, 1, "one prefix replayed, got {n}");
+
+        let a: String = con
+            .query_row("SELECT c.hash('a')", [], |r| r.get(0))
+            .expect("c.hash() after replay");
+        assert_eq!(a, "H:a");
     }
 
     #[test]

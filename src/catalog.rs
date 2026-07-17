@@ -897,8 +897,9 @@ pub fn is_safe_identifier(s: &str) -> bool {
 }
 
 /// Build the SQL statement that aliases community function `theirs` under
-/// ducklink's chosen name `ours`. Returns `None` for function types we can't
-/// alias:
+/// ducklink's chosen name `ours`, optionally landing the alias in a target
+/// schema (`ours_schema.ours` instead of bare `ours`). Returns `None` for
+/// function types we can't alias:
 /// * `scalar`    → `CREATE OR REPLACE MACRO ours(args) AS theirs(args);`
 /// * `table`     → `CREATE OR REPLACE MACRO ours(args) AS TABLE
 ///                    SELECT * FROM theirs(args);`
@@ -908,11 +909,18 @@ pub fn is_safe_identifier(s: &str) -> bool {
 ///                    / ORDER BY modifiers are lost. Multi-arg aggregates are
 ///                    skipped (users call community's name directly).
 ///
-/// Callers must first pass `ours`, `theirs`, and every param through
-/// [`is_safe_identifier`] — this function assumes they've already been
-/// validated.
+/// When `ours_schema` is `Some`, the LHS becomes `<schema>.<ours>` so the
+/// alias is callable as `<schema>.<ours>(x)` from user SQL — this is the
+/// portable equivalent of what the advanced-tier catalog-alias shim used to
+/// do via `Catalog::CreateFunction` in a target schema, but implemented
+/// purely through DuckDB's own DDL so it works uniformly on every platform.
+///
+/// Callers must first pass `ours`, `theirs`, `ours_schema` (if set), and
+/// every param through [`is_safe_identifier`] — this function assumes
+/// they've already been validated.
 pub fn build_alias_macro(
     ftype: &str,
+    ours_schema: Option<&str>,
     ours: &str,
     theirs: &str,
     params: &[String],
@@ -929,16 +937,23 @@ pub fn build_alias_macro(
         })
         .collect();
     let arg_list = arg_names.join(", ");
+    // Qualified LHS when a target schema is provided — otherwise bare.
+    // DuckDB accepts `CREATE MACRO schema.name(...) AS ...`; the schema
+    // must exist beforehand (the caller does `CREATE SCHEMA IF NOT EXISTS`).
+    let lhs = match ours_schema {
+        Some(s) => format!("{s}.{ours}"),
+        None => ours.to_string(),
+    };
     match ftype {
         // DuckDB reports:
         //   `scalar`        — C-API scalar (community extensions register here)
         //   `scalar_macro`  — legacy synonym seen in some versions
         //   `macro`         — user-created `CREATE MACRO ... AS <expr>` shape
         "scalar" | "scalar_macro" | "macro" => Some(format!(
-            "CREATE OR REPLACE MACRO {ours}({arg_list}) AS {theirs}({arg_list})"
+            "CREATE OR REPLACE MACRO {lhs}({arg_list}) AS {theirs}({arg_list})"
         )),
         "table" | "table_macro" => Some(format!(
-            "CREATE OR REPLACE MACRO {ours}({arg_list}) AS TABLE \
+            "CREATE OR REPLACE MACRO {lhs}({arg_list}) AS TABLE \
              SELECT * FROM {theirs}({arg_list})"
         )),
         "aggregate" => {
@@ -947,7 +962,7 @@ pub fn build_alias_macro(
             } else {
                 let arg = &arg_names[0];
                 Some(format!(
-                    "CREATE OR REPLACE MACRO {ours}({arg}) AS \
+                    "CREATE OR REPLACE MACRO {lhs}({arg}) AS \
                      list_aggregate(list({arg}), '{theirs}')"
                 ))
             }
@@ -1487,31 +1502,54 @@ mod tests {
 
     #[test]
     fn build_alias_macro_shapes() {
-        // Scalar.
-        let s = build_alias_macro("scalar", "sma", "t_sma", &["price".into(), "n".into()])
+        // Scalar — bare form (no target schema).
+        let s = build_alias_macro("scalar", None, "sma", "t_sma", &["price".into(), "n".into()])
             .expect("scalar shape");
         assert_eq!(
             s,
             "CREATE OR REPLACE MACRO sma(price, n) AS t_sma(price, n)"
         );
+        // Scalar — schema-qualified form. This is the C-API-only equivalent of
+        // what the advanced-tier catalog-alias shim used to do for the
+        // namespace-qualified `crypto.hash(x)` binding.
+        let sq = build_alias_macro("scalar", Some("crypto"), "hash", "crypto_hash", &["x".into()])
+            .expect("scalar schema-qualified");
+        assert_eq!(
+            sq,
+            "CREATE OR REPLACE MACRO crypto.hash(x) AS crypto_hash(x)"
+        );
         // Table function.
-        let t = build_alias_macro("table", "csv", "read_csv_auto", &["path".into()])
+        let t = build_alias_macro("table", None, "csv", "read_csv_auto", &["path".into()])
             .expect("table shape");
         assert_eq!(
             t,
             "CREATE OR REPLACE MACRO csv(path) AS TABLE SELECT * FROM read_csv_auto(path)"
         );
         // Aggregate — single arg is aliased.
-        let a = build_alias_macro("aggregate", "geomean", "t_geomean", &["x".into()])
+        let a = build_alias_macro("aggregate", None, "geomean", "t_geomean", &["x".into()])
             .expect("aggregate single-arg shape");
         assert_eq!(
             a,
             "CREATE OR REPLACE MACRO geomean(x) AS list_aggregate(list(x), 't_geomean')"
         );
+        // Aggregate schema-qualified.
+        let aq = build_alias_macro(
+            "aggregate",
+            Some("crypto"),
+            "hash_agg",
+            "crypto_hash_agg",
+            &["x".into()],
+        )
+        .expect("aggregate qualified");
+        assert_eq!(
+            aq,
+            "CREATE OR REPLACE MACRO crypto.hash_agg(x) AS list_aggregate(list(x), 'crypto_hash_agg')"
+        );
         // Aggregate — multi-arg is skipped.
         assert!(
             build_alias_macro(
                 "aggregate",
+                None,
                 "corr",
                 "t_corr",
                 &["x".into(), "y".into()]
@@ -1519,9 +1557,9 @@ mod tests {
             .is_none()
         );
         // Unknown function_type: skipped.
-        assert!(build_alias_macro("pragma", "x", "y", &["a".into()]).is_none());
+        assert!(build_alias_macro("pragma", None, "x", "y", &["a".into()]).is_none());
         // Odd parameter name gets sanitized to a fallback.
-        let s = build_alias_macro("scalar", "f", "g", &["ok".into(), "not ok".into()])
+        let s = build_alias_macro("scalar", None, "f", "g", &["ok".into(), "not ok".into()])
             .expect("scalar sanitize");
         assert!(s.contains("f(ok, _a1)"), "unexpected: {s}");
     }

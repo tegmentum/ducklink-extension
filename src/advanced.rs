@@ -1875,7 +1875,8 @@ unsafe fn create_community_aliases_advanced(
             if !done_arities.insert(params.len()) {
                 continue;
             }
-            let Some(macro_sql) = crate::catalog::build_alias_macro(&ftype, ours, theirs, &params)
+            let Some(macro_sql) =
+                crate::catalog::build_alias_macro(&ftype, None, ours, theirs, &params)
             else {
                 continue;
             };
