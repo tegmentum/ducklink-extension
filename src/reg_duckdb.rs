@@ -3516,8 +3516,7 @@ fn community_native_load(
     // CREATE OR REPLACE MACRO with the documented aggregate caveat. Both
     // paths surface a rolled-up count in the summary; per-pair errors are
     // non-fatal so a mismapping doesn't block the rest of the load.
-    let raw_conn = rt.raw_con.0;
-    let alias_count = create_community_aliases(&con, raw_conn, &spec)
+    let alias_count = create_community_aliases(&con, &spec)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Replay any prefixes persisted from prior sessions. The just-loaded
@@ -3561,30 +3560,23 @@ fn community_native_load(
 ///   ducklink discovers matching community names via `duckdb_functions()`
 ///   and creates aliases with the prefix stripped.
 ///
-/// # Aliasing mechanism, by build
+/// # Aliasing mechanism
 ///
-/// * **Advanced tier compiled in** (`cfg(advanced_tier)`): calls the C++
-///   `ducklink_alias_function` shim per pair — a real
-///   `CreateAggregateFunctionInfo` / `CreateScalarFunctionInfo` /
-///   `CreateTableFunctionInfo` gets registered under ducklink's name. The
-///   alias IS a full CatalogEntry, so aggregate DISTINCT / FILTER /
-///   ORDER BY / window all propagate transparently. If the shim rejects a
-///   pair (e.g. name not found in the catalog), that pair falls through to
-///   the macro path so the caller still gets partial coverage.
-/// * **Loadable-only tier** (community-extensions CI build with `advanced`
-///   stripped): emits `CREATE OR REPLACE MACRO` per (pair, arity). Scalar
-///   and table macros are planner-inlined (zero overhead); the aggregate
-///   fallback uses the `list_aggregate` scalar-macro trick, which works for
-///   basic `GROUP BY` but does NOT propagate aggregate modifiers.
+/// Emits `CREATE OR REPLACE MACRO` per (pair, arity) — the same shape on
+/// every platform. Scalar and table macros are planner-inlined (zero
+/// overhead); single-arg aggregates use the `list_aggregate(list(x),
+/// 'their')` trick, which works for basic `GROUP BY` but does NOT
+/// propagate `DISTINCT` / `FILTER` / `ORDER BY` / window modifiers.
+/// Users who need those call community's original name (unchanged).
+///
+/// When the catalog entry declares a `namespace`, each alias is
+/// double-registered — once in `main` (bare form) and once in the
+/// namespace schema (schema-qualified form).
 ///
 /// Pair-selection is shared in [`crate::catalog::compute_alias_pairs`];
 /// macro-shape building is shared in [`crate::catalog::build_alias_macro`].
-/// `raw_conn` may be null on hosts where the runtime's raw C-API connect
-/// failed at init — in that case the shim path is skipped and every alias
-/// falls through to the macro path.
 fn create_community_aliases(
     con: &duckdb::Connection,
-    raw_conn: ffi::duckdb_connection,
     spec: &crate::catalog::CommunityNativeSpec,
 ) -> Result<usize, String> {
     // 1. Discover community-registered function names for the prefix (if any).
@@ -3615,66 +3607,19 @@ fn create_community_aliases(
 
     let mut created = 0usize;
     // The catalog entry MAY carry a canonical `namespace` — when set, every
-    // community function is aliased twice: once in `main` (backcompat) and
-    // once in `<namespace>` (schema-qualified). Callers write
-    // `main.foo(x)` OR `<namespace>.foo(x)` and both bind the same
-    // AggregateFunctionSet/ScalarFunctionSet. Users opt into bare `foo(x)`
-    // by adding the namespace to `search_path` themselves.
+    // community function is aliased twice: once in `main` (bare form) and
+    // once in `<namespace>` (schema-qualified form). Both share the same
+    // underlying `CREATE OR REPLACE MACRO` body, so `foo(x)` and
+    // `<namespace>.foo(x)` bind identically. Users opt into a bare short
+    // name (`bar(x)` resolving from a non-main schema) via
+    // `SET search_path`.
     let namespace = spec.namespace.as_deref();
 
     for (ours, theirs) in &pairs {
-        // 3a. Advanced-tier catalog alias (transparent for aggregates). If
-        //     the shim finds the entry, register the pair as a real
-        //     CatalogEntry and skip the macro path entirely. If the shim
-        //     rejects (name not found, version drift, etc.), fall through.
-        #[cfg(advanced_tier)]
-        if !raw_conn.is_null() {
-            // Register into `main` (backcompat: community's original bare
-            // name and ducklink's alias both live in main).
-            match unsafe { crate::advanced::catalog_alias(raw_conn, None, theirs, None, ours) } {
-                Ok(_) => {
-                    created += 1;
-                    // Also register in the declared namespace when one is
-                    // set. Failure here is non-fatal — the main alias
-                    // already landed, so the bare form works; the
-                    // schema-qualified form just isn't reachable.
-                    if let Some(ns) = namespace {
-                        if let Err(err) = unsafe {
-                            crate::advanced::catalog_alias(
-                                raw_conn,
-                                None,
-                                theirs,
-                                Some(ns),
-                                ours,
-                            )
-                        } {
-                            crate::events::emit(
-                                "community_namespace_alias_error",
-                                Some(ours),
-                                format!("{ns}.{ours}: {err}"),
-                            );
-                        } else {
-                            created += 1;
-                        }
-                    }
-                    continue;
-                }
-                Err(err) => {
-                    crate::events::emit(
-                        "community_alias_shim_fallback",
-                        Some(ours),
-                        format!("{theirs}: {err}"),
-                    );
-                    // fall through to the macro path
-                }
-            }
-        }
-        #[cfg(not(advanced_tier))]
-        let _ = (raw_conn, namespace); // silence unused-variable warning on loadable-only builds
-
-        // 3b. Macro fallback. `duckdb_functions()` can report multiple rows
-        //     (one per overload); produce one macro per distinct arity
-        //     (macros support arity-overloading with the same name).
+        // Macro-based registration — the portable path used on every
+        // platform. `duckdb_functions()` can report multiple rows (one per
+        // overload); produce one macro per distinct arity (macros support
+        // arity-overloading with the same name).
         let info_sql = format!(
             "SELECT function_type, array_to_string(parameters, ',') AS param_csv \
              FROM duckdb_functions() WHERE function_name = '{theirs}'"
@@ -5788,16 +5733,9 @@ pub fn register_components(
         };
         total += register_scalars(con, engine.clone(), &loaded.scalars)?;
         total += register_tables(con, engine.clone(), &loaded.tables)?;
-        // Advanced tier: wire any PARSER / OPTIMIZER / filterable-table markers
-        // through the internal-ABI C++ shim. Needs the raw `db` handle; the
-        // bundled tests (which use a duckdb-rs Connection) pass `None`. Compiled
-        // in only for `advanced_tier` builds; on the default community build and
-        // on Windows the C++ shim and the `advanced` module do not exist (callers
-        // there always pass `None` anyway).
-        #[cfg(advanced_tier)]
-        if let Some(db) = db {
-            crate::advanced::register(db, &engine, &loaded);
-        }
+        let _ = db; // `db` is retained in the signature for compatibility with
+                    // callers that once threaded an advanced-tier register call
+                    // through it — now a no-op on every platform.
         match raw_con {
             Some(rc) => {
                 total += unsafe { register_aggregates(rc, engine.clone(), &loaded.aggregates)? };
@@ -6462,7 +6400,7 @@ mod tests {
         // Pass null raw_conn — these tests exercise the macro fallback
         // path uniformly (the C++ shim would only fire when advanced_tier
         // is compiled AND raw_conn is live).
-        let n = create_community_aliases(&con, std::ptr::null_mut(), &spec_with(Some("t_"), &[]))
+        let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
             .expect("alias gen");
         assert!(n >= 1, "expected >=1 alias, got {n}");
         // Both names work.
@@ -6487,7 +6425,6 @@ mod tests {
         .expect("create t_gen_range");
         let n = create_community_aliases(
             &con,
-            std::ptr::null_mut(),
             &spec_with(None, &[("gen_range", "t_gen_range")]),
         )
         .expect("alias gen");
@@ -6512,7 +6449,7 @@ mod tests {
         // Pass null raw_conn — these tests exercise the macro fallback
         // path uniformly (the C++ shim would only fire when advanced_tier
         // is compiled AND raw_conn is live).
-        let n = create_community_aliases(&con, std::ptr::null_mut(), &spec_with(Some("t_"), &[]))
+        let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
             .expect("alias gen");
         assert!(n >= 1);
         let out: i64 = con
@@ -6539,11 +6476,8 @@ mod tests {
         // Simulate a community-registered scalar under its own name.
         con.execute("CREATE MACRO crypto_hash(algo, data) AS algo || ':' || data", [])
             .expect("create crypto_hash");
-        // Pass null raw_conn → shim path skipped even on advanced_tier
-        // builds; the macro-fallback is the only path exercised.
         let n = create_community_aliases(
             &con,
-            std::ptr::null_mut(),
             &spec_with_namespace(
                 None,
                 &[("hash", "crypto_hash")],
@@ -6673,7 +6607,6 @@ mod tests {
         // `t_add` to `plus100` and lets prefix handle `sub` normally.
         let n = create_community_aliases(
             &con,
-            std::ptr::null_mut(),
             &spec_with(Some("t_"), &[("plus100", "t_add")]),
         )
         .expect("alias gen");
@@ -6686,673 +6619,5 @@ mod tests {
             .query_row("SELECT sub(200)", [], |r| r.get(0))
             .expect("sub");
         assert_eq!(s, 100);
-    }
-
-    /// Slice-3 acceptance: when `spec.namespace` is set, each alias is
-    /// double-registered — once in `main` (backcompat, bare form) and once
-    /// in `<namespace>` (schema-qualified form). Uses the built-in `sum`
-    /// aggregate aliased as `total`, with namespace `stats`. Both
-    /// `total(x)` (bare) and `stats.total(x)` (qualified) must bind.
-    /// Runs only on the advanced tier — the macro fallback doesn't route
-    /// through the C++ shim's schema targeting.
-    #[cfg(advanced_tier)]
-    #[test]
-    fn alias_gen_double_registers_when_namespace_set() {
-        use duckdb::ffi;
-        let (raw, con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
-            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            (raw, con)
-        };
-        let spec = spec_with_namespace(None, &[("total", "sum")], Some("stats"));
-        let n = create_community_aliases(&con, raw, &spec).expect("alias gen");
-        // 1 alias -> registered twice (main + namespace) -> count == 2.
-        assert_eq!(n, 2, "expected 2 registrations (main + namespace), got {n}");
-
-        con.execute_batch(
-            "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (10),(20),(30);",
-        )
-        .expect("seed");
-        let bare: i64 = con
-            .query_row("SELECT total(x) FROM t", [], |r| r.get(0))
-            .expect("bare total");
-        assert_eq!(bare, 60);
-        let qualified: i64 = con
-            .query_row("SELECT stats.total(x) FROM t", [], |r| r.get(0))
-            .expect("stats.total");
-        assert_eq!(qualified, 60);
-        // Community's original still works.
-        let orig: i64 = con
-            .query_row("SELECT sum(x) FROM t", [], |r| r.get(0))
-            .expect("sum");
-        assert_eq!(orig, 60);
-    }
-
-    /// Slice-3 acceptance: `spec.namespace = None` behaves exactly like
-    /// before — single-register in main, no schema created.
-    #[cfg(advanced_tier)]
-    #[test]
-    fn alias_gen_single_registers_when_namespace_absent() {
-        use duckdb::ffi;
-        let (raw, con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
-            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            (raw, con)
-        };
-        let spec = spec_with(None, &[("mytotal", "sum")]);
-        assert!(spec.namespace.is_none(), "test setup: namespace absent");
-        let n = create_community_aliases(&con, raw, &spec).expect("alias gen");
-        assert_eq!(n, 1, "no namespace -> single registration, got {n}");
-
-        con.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2);")
-            .expect("seed");
-        let bare: i64 = con
-            .query_row("SELECT mytotal(x) FROM t", [], |r| r.get(0))
-            .expect("bare mytotal");
-        assert_eq!(bare, 3);
-    }
-
-    /// Slice-4a acceptance: `DUCKLINK PREFIX c: stats;` — declare a session
-    /// alias `c` for schema `stats` and prove every function in `stats`
-    /// becomes callable as `c.<fn>`. Uses the built-in `sum` aggregate
-    /// double-registered under `stats.total` (Slice 3), then aliases the
-    /// whole schema. Requires the parser hook + full ducklink runtime, so
-    /// we use `register_load_function` to set up ducklink_load first.
-    #[cfg(advanced_tier)]
-    #[test]
-    fn ducklink_prefix_aliases_whole_namespace_schema() {
-        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::engine::Engine2;
-        use duckdb::ffi;
-        let (db, con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            (db, con)
-        };
-        let engine = Arc::new(Engine2::new().expect("engine"));
-        register_load_function(&con, db, engine).expect("register ducklink_load");
-        // RUNTIME can only be bound to one db per process. If a prior test
-        // has claimed it against a different db, skip cleanly rather than
-        // registering onto the wrong catalog.
-        if !runtime_is_ours(db) {
-            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
-            return;
-        }
-        // The C++ ParserExtension teaches DuckDB's parser about `DUCKLINK`.
-        // Real loads (loadable init) install it automatically; bundled
-        // tests need to do it explicitly.
-        extern "C" {
-            fn ducklink_register_parser(db: *mut std::ffi::c_void) -> i32;
-        }
-        let prc = unsafe { ducklink_register_parser(db.cast()) };
-        assert_eq!(prc, 0, "ducklink_register_parser rc={prc}");
-
-        // Set up schema `stats` with a function (`stats.total` = `sum`).
-        // Use the shim directly to avoid needing an INSTALL FROM community.
-        let raw = RUNTIME.get().unwrap().raw_con.0;
-        assert!(!raw.is_null());
-        unsafe {
-            crate::advanced::catalog_alias(raw, None, "sum", Some("stats"), "total")
-                .expect("alias sum -> stats.total");
-        }
-
-        // The statement under test: `DUCKLINK PREFIX c: stats;`.
-        let summary: String = con
-            .query_row(
-                "DUCKLINK PREFIX c: stats",
-                [],
-                |r| r.get(0),
-            )
-            .expect("DUCKLINK PREFIX");
-        assert!(
-            summary.contains("aliased") && summary.contains("stats"),
-            "unexpected summary: {summary}"
-        );
-
-        // Both qualifiers now resolve to the same underlying aggregate.
-        con.execute_batch(
-            "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2),(3);",
-        )
-        .expect("seed");
-        let via_ns: i64 = con
-            .query_row("SELECT stats.total(x) FROM t", [], |r| r.get(0))
-            .expect("stats.total");
-        let via_alias: i64 = con
-            .query_row("SELECT c.total(x) FROM t", [], |r| r.get(0))
-            .expect("c.total");
-        assert_eq!(via_ns, 6);
-        assert_eq!(via_alias, 6);
-
-        // The parser rejects malformed shapes cleanly rather than binding
-        // garbage aliases.
-        let bad = con.execute("DUCKLINK PREFIX c! : stats", []);
-        assert!(bad.is_err(), "malformed prefix must error");
-
-        // Slice-4b side effect: the successful PREFIX above persisted
-        // (c, stats) into ducklink.prefixes. Verify the row is there and
-        // shaped correctly — no fragile SQL-shape assumption beyond the
-        // schema+column contract.
-        let (alias, ns): (String, String) = con
-            .query_row(
-                "SELECT alias, namespace FROM ducklink.prefixes WHERE alias = 'c'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .expect("ducklink.prefixes row");
-        assert_eq!(alias, "c");
-        assert_eq!(ns, "stats");
-    }
-
-    /// Slice-4b acceptance: a persisted `(alias, namespace)` gets
-    /// automatically re-applied when the source namespace is (re)populated
-    /// by a `DUCKLINK LOAD`. This is the reconnect-flow test — we simulate
-    /// a fresh connection by wiping the alias schema, then triggering a
-    /// LOAD path to prove the replay hook fires.
-    ///
-    /// End-to-end: seed the ducklink.prefixes table with a `(c, stats)`
-    /// row, drop the `c` schema so the alias is gone, then use the WASM
-    /// load path (which invokes `replay_persisted_prefixes` on success)
-    /// to prove the alias comes back.
-    #[cfg(advanced_tier)]
-    #[test]
-    fn persisted_prefix_replays_on_ducklink_load() {
-        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::engine::Engine2;
-        use duckdb::ffi;
-        let (db, con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            (db, con)
-        };
-        let engine = Arc::new(Engine2::new().expect("engine"));
-        register_load_function(&con, db, engine).expect("register ducklink_load");
-        if !runtime_is_ours(db) {
-            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
-            return;
-        }
-        extern "C" {
-            fn ducklink_register_parser(db: *mut std::ffi::c_void) -> i32;
-        }
-        assert_eq!(unsafe { ducklink_register_parser(db.cast()) }, 0);
-
-        // Populate `stats.total` and declare `DUCKLINK PREFIX c: stats;`.
-        // This is the same setup as `ducklink_prefix_aliases…`, but the
-        // point here is what happens AFTER a reconnect-style wipe.
-        let raw = RUNTIME.get().unwrap().raw_con.0;
-        unsafe {
-            crate::advanced::catalog_alias(raw, None, "sum", Some("stats"), "total")
-                .expect("alias sum -> stats.total");
-        }
-        let _: String = con
-            .query_row("DUCKLINK PREFIX c: stats", [], |r| r.get(0))
-            .expect("DUCKLINK PREFIX");
-        con.execute_batch(
-            "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (100),(200);",
-        )
-        .expect("seed");
-
-        // Baseline: c.total works.
-        let a: i64 = con
-            .query_row("SELECT c.total(x) FROM t", [], |r| r.get(0))
-            .expect("c.total");
-        assert_eq!(a, 300);
-
-        // Simulate reconnect: DROP the alias schema so no `c.total`
-        // exists, but the persisted row in ducklink.prefixes stays. The
-        // stats schema and its functions stay too (they'd normally get
-        // re-registered by a `DUCKLINK LOAD` after reconnect — for the
-        // test we skip that).
-        con.execute("DROP SCHEMA c CASCADE", [])
-            .expect("drop c schema");
-        let bare = con.query_row("SELECT c.total(x) FROM t", [], |r| r.get::<_, i64>(0));
-        assert!(bare.is_err(), "c.total must be unbound after DROP SCHEMA");
-
-        // Trigger the WASM load path — this exercises `replay_persisted_prefixes`.
-        // Loading a non-existent path errors, but the replay hook runs
-        // ONLY on success, so we use the parser hook's summary directly
-        // via the DUCKLINK PREFIX statement itself as a re-declare (also
-        // triggers replay through persistence).
-        //
-        // Actually — cleaner: call the replay path directly through a
-        // second DUCKLINK PREFIX statement, which we know triggers alias
-        // creation + persistence + effectively acts as a manual "restore".
-        // That's what a user would do on reconnect if they realize the
-        // persisted state is missing.
-        let _: String = con
-            .query_row("DUCKLINK PREFIX c: stats", [], |r| r.get(0))
-            .expect("DUCKLINK PREFIX (re-declare)");
-        let after: i64 = con
-            .query_row("SELECT c.total(x) FROM t", [], |r| r.get(0))
-            .expect("c.total after re-declare");
-        assert_eq!(after, 300);
-
-        // The persisted row from the first declaration must NOT have
-        // duplicated on re-declare (INSERT OR REPLACE).
-        let rows: i64 = con
-            .query_row(
-                "SELECT count(*) FROM ducklink.prefixes WHERE alias = 'c'",
-                [],
-                |r| r.get(0),
-            )
-            .expect("prefixes count");
-        assert_eq!(rows, 1, "re-declare must be idempotent, got {rows} rows");
-    }
-
-    /// Slice-5 acceptance: colon-syntax sugar (`c:hash(x)`) is rewritten
-    /// to dot-syntax (`c.hash(x)`) by the parser_override hook, and the
-    /// SAME queries would break every DuckDB user if the hook stepped on
-    /// `::` casts, `:name` bind params, string literals, or comments —
-    /// verify each of those still works alongside the sugar.
-    #[cfg(advanced_tier)]
-    #[test]
-    fn colon_syntax_sugar_binds_via_parser_override() {
-        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::engine::Engine2;
-        use duckdb::ffi;
-        let (db, con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            (db, con)
-        };
-        let engine = Arc::new(Engine2::new().expect("engine"));
-        register_load_function(&con, db, engine).expect("register ducklink_load");
-        if !runtime_is_ours(db) {
-            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
-            return;
-        }
-        extern "C" {
-            fn ducklink_register_parser(db: *mut std::ffi::c_void) -> i32;
-        }
-        assert_eq!(unsafe { ducklink_register_parser(db.cast()) }, 0);
-
-        // Set up: alias sum -> stats.total, declare PREFIX c: stats.
-        let raw = RUNTIME.get().unwrap().raw_con.0;
-        unsafe {
-            crate::advanced::catalog_alias(raw, None, "sum", Some("stats"), "total")
-                .expect("alias");
-        }
-        let _: String = con
-            .query_row("DUCKLINK PREFIX c: stats", [], |r| r.get(0))
-            .expect("PREFIX");
-        con.execute_batch(
-            "CREATE TABLE t(x INTEGER, tag VARCHAR); \
-             INSERT INTO t VALUES (10, 'x:y'), (20, 'p:q'), (30, 'z:z');",
-        )
-        .expect("seed");
-
-        // The core: colon-syntax rewrites to dot-syntax at parse time.
-        let via_colon: i64 = con
-            .query_row("SELECT c:total(x) FROM t", [], |r| r.get(0))
-            .expect("c:total(x)");
-        assert_eq!(via_colon, 60);
-        // Same query via dot-syntax must give the same answer (baseline).
-        let via_dot: i64 = con
-            .query_row("SELECT c.total(x) FROM t", [], |r| r.get(0))
-            .expect("c.total(x)");
-        assert_eq!(via_colon, via_dot);
-
-        // Collision guards — the hook must NOT rewrite these:
-        // 1. `::` casts still work.
-        let cast: String = con
-            .query_row("SELECT 42::VARCHAR", [], |r| r.get(0))
-            .expect("cast");
-        assert_eq!(cast, "42");
-        // 2. Casts chained with our syntax on the outside.
-        let chained: String = con
-            .query_row("SELECT c:total(x)::VARCHAR FROM t", [], |r| r.get(0))
-            .expect("colon + cast");
-        assert_eq!(chained, "60");
-        // 3. String literals containing colons pass through unchanged.
-        let s: String = con
-            .query_row("SELECT tag FROM t WHERE x = 10", [], |r| r.get(0))
-            .expect("literal");
-        assert_eq!(s, "x:y");
-        // 4. Prepared statements with `:bind` parameters bind correctly.
-        con.execute("PREPARE q AS SELECT c:total(x) + $1 FROM t", [])
-            .expect("prepare with our syntax + bind param");
-        let bound: i64 = con
-            .query_row("EXECUTE q(100)", [], |r| r.get(0))
-            .expect("execute q");
-        assert_eq!(bound, 160);
-        // 5. Comments hide colons — rewrite must not touch them.
-        let commented: i64 = con
-            .query_row(
-                "SELECT c:total(x) /* also c:total(x) inside */ FROM t",
-                [],
-                |r| r.get(0),
-            )
-            .expect("comment");
-        assert_eq!(commented, 60);
-    }
-
-    // --- Advanced-tier catalog-alias smoke: real aggregate transparency ----
-    //
-    // The C++ shim registers `existing` under `new_name` as a real
-    // `AggregateFunctionCatalogEntry`, so every SQL aggregate modifier
-    // (DISTINCT / FILTER / ORDER BY / OVER) propagates through the alias
-    // unchanged. We use a built-in aggregate (`sum`) as the "community"
-    // function to keep the test hermetic. The shim is only compiled in with
-    // `advanced_tier`; on loadable-only builds these tests are absent.
-
-    #[cfg(advanced_tier)]
-    #[test]
-    fn shim_aggregate_alias_supports_full_modifier_set() {
-        use duckdb::ffi;
-        // One database with two views on it: the raw C-API `duckdb_connection`
-        // we hand the shim, and a duckdb-rs Connection we run test queries
-        // through. Both see the same catalog, so a shim-registered alias is
-        // visible on the duckdb-rs side.
-        let (raw, shim_con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            let r = ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
-            assert_eq!(r, ffi::DuckDBSuccess, "duckdb_open failed");
-            let shim_con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
-            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            (raw, shim_con)
-        };
-        shim_con
-            .execute_batch(
-                "CREATE TABLE t(g INTEGER, x INTEGER, ok BOOLEAN); \
-                 INSERT INTO t VALUES (1,1,true),(1,1,true),(1,2,false),(2,3,true),(2,4,true);",
-            )
-            .expect("seed");
-
-        // Alias built-in `sum` under `total`. Because the shim registers a
-        // real AggregateFunctionCatalogEntry, DISTINCT / FILTER / ORDER BY /
-        // OVER all work through `total(x)` unchanged.
-        unsafe {
-            let kind = crate::advanced::catalog_alias(raw, None, "sum", None, "total")
-                .expect("catalog_alias sum -> total");
-            assert_eq!(kind, crate::advanced::AliasKind::Aggregate);
-        }
-
-        // Basic GROUP BY: total(x) == sum(x).
-        let sum_alias: i64 = shim_con
-            .query_row("SELECT total(x) FROM t", [], |r| r.get(0))
-            .expect("alias sum");
-        assert_eq!(sum_alias, 1 + 1 + 2 + 3 + 4);
-
-        // DISTINCT modifier — this is the modifier list_aggregate() fails.
-        let sum_distinct: i64 = shim_con
-            .query_row("SELECT total(DISTINCT x) FROM t", [], |r| r.get(0))
-            .expect("alias DISTINCT");
-        assert_eq!(sum_distinct, 1 + 2 + 3 + 4);
-
-        // FILTER modifier.
-        let sum_filter: i64 = shim_con
-            .query_row("SELECT total(x) FILTER (WHERE ok) FROM t", [], |r| r.get(0))
-            .expect("alias FILTER");
-        assert_eq!(sum_filter, 1 + 1 + 3 + 4);
-
-        // ORDER BY inside the aggregate — for sum() the result is
-        // order-independent, but the parser has to accept it, which it only
-        // does when the callee is a REAL aggregate.
-        let sum_ordered: i64 = shim_con
-            .query_row(
-                "SELECT total(x ORDER BY x DESC) FROM t",
-                [],
-                |r| r.get(0),
-            )
-            .expect("alias ORDER BY");
-        assert_eq!(sum_ordered, 1 + 1 + 2 + 3 + 4);
-
-        // Window context — running total per group.
-        let last_run: i64 = shim_con
-            .query_row(
-                "SELECT total(x) OVER (PARTITION BY g ORDER BY x) \
-                 FROM t ORDER BY g DESC, x DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("alias OVER");
-        assert_eq!(last_run, 3 + 4);
-    }
-
-    #[cfg(advanced_tier)]
-    #[test]
-    fn shim_missing_entry_reports_not_found() {
-        use duckdb::ffi;
-        unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(std::ptr::null(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
-            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            let err = crate::advanced::catalog_alias(
-                raw,
-                None,
-                "definitely_not_a_function",
-                None,
-                "x",
-            )
-            .expect_err("missing entry must error");
-            assert!(err.contains("no scalar/aggregate/table function"), "got: {err}");
-        }
-    }
-
-    /// Slice-2 acceptance: alias `sum` from `main` into a fresh `crypto`
-    /// schema. Both the schema-qualified form (`crypto.total(x)`) and
-    /// community-original bare form (`sum(x)`) must resolve, and the shim
-    /// must auto-create the `crypto` schema. Also verifies that the
-    /// original `sum(x)` is left untouched — aliasing is additive.
-    #[cfg(advanced_tier)]
-    #[test]
-    fn shim_alias_into_non_main_schema() {
-        use duckdb::ffi;
-        let (raw, con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
-            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            (raw, con)
-        };
-        // The `crypto` schema does not exist yet; the shim must create it.
-        let kind = unsafe {
-            crate::advanced::catalog_alias(raw, None, "sum", Some("crypto"), "total")
-                .expect("alias sum -> crypto.total")
-        };
-        assert_eq!(kind, crate::advanced::AliasKind::Aggregate);
-
-        con.execute_batch(
-            "CREATE TABLE t(x INTEGER); \
-             INSERT INTO t VALUES (1), (2), (3), (4);",
-        )
-        .expect("seed");
-        // Schema-qualified form resolves.
-        let via_alias: i64 = con
-            .query_row("SELECT crypto.total(x) FROM t", [], |r| r.get(0))
-            .expect("alias qualified");
-        assert_eq!(via_alias, 10);
-        // Original bare form untouched.
-        let via_original: i64 = con
-            .query_row("SELECT sum(x) FROM t", [], |r| r.get(0))
-            .expect("original bare");
-        assert_eq!(via_original, 10);
-        // Bare `total(x)` is NOT auto-added to search_path — must be unbound.
-        let bare = con.query_row("SELECT total(x) FROM t", [], |r| r.get::<_, i64>(0));
-        assert!(
-            bare.is_err(),
-            "bare `total` must not resolve without explicit search_path opt-in"
-        );
-        // With search_path opt-in, bare resolves through the crypto schema.
-        // DuckDB splits search_path on ',' verbatim; leading spaces become
-        // part of the schema name, so no space after the comma.
-        con.execute("SET search_path = 'main,crypto'", [])
-            .expect("set search_path");
-        let bare2: i64 = con
-            .query_row("SELECT total(x) FROM t", [], |r| r.get(0))
-            .expect("bare via search_path");
-        assert_eq!(bare2, 10);
-    }
-
-    /// Slice-2 acceptance: cross-schema lookup. Alias `sum` from `main`
-    /// into `mathns`, then re-alias `mathns.total` into `stat` under a
-    /// different name (`grand`). Proves both `source_schema` and
-    /// `target_schema` parameters flow through the shim correctly.
-    #[cfg(advanced_tier)]
-    #[test]
-    fn shim_alias_source_and_target_schema_compose() {
-        use duckdb::ffi;
-        let (raw, con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
-            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            (raw, con)
-        };
-        unsafe {
-            crate::advanced::catalog_alias(raw, None, "sum", Some("mathns"), "total")
-                .expect("main.sum -> mathns.total");
-            crate::advanced::catalog_alias(raw, Some("mathns"), "total", Some("stat"), "grand")
-                .expect("mathns.total -> stat.grand");
-        }
-        con.execute_batch(
-            "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2),(3);",
-        )
-        .expect("seed");
-        let g: i64 = con
-            .query_row("SELECT stat.grand(x) FROM t", [], |r| r.get(0))
-            .expect("stat.grand");
-        assert_eq!(g, 6);
-    }
-
-    /// Live-network smoke that aliases functions from a REAL community
-    /// extension (not user-CREATE-MACRO stand-ins) and asserts the
-    /// aggregate transparency contract on both a scalar and an aggregate
-    /// path. Complements `tests/live_community_alias_smoke.rs`, which
-    /// exercises the full `ducklink_load()` entry pipeline with a
-    /// synthetic catalog fixture; this one calls `catalog_alias` directly,
-    /// so a regression that lives above the shim (parser, resolver,
-    /// runtime handle) surfaces there while a regression IN the shim
-    /// surfaces here.
-    ///
-    /// Ignored by default — needs outbound HTTPS to
-    /// `community-extensions.duckdb.org`. Run with:
-    ///   cargo test --release --no-default-features \
-    ///     --features bundled,advanced,network --lib -- \
-    ///     shim_alias_over_real_community_aggregate --ignored --nocapture
-    #[cfg(all(advanced_tier, feature = "network"))]
-    #[test]
-    #[ignore]
-    fn shim_alias_over_real_community_aggregate() {
-        use duckdb::ffi;
-        // Isolate the INSTALL cache to a fresh HOME.
-        let scratch = std::env::temp_dir().join(format!("dl_cn_shim_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).expect("scratch");
-        unsafe {
-            std::env::set_var("HOME", &scratch);
-            std::env::set_var("XDG_CACHE_HOME", scratch.join(".cache"));
-        }
-
-        let (raw, shim_con) = unsafe {
-            let mut db: ffi::duckdb_database = std::ptr::null_mut();
-            assert_eq!(
-                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
-                ffi::DuckDBSuccess
-            );
-            let shim_con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
-            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
-            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
-            (raw, shim_con)
-        };
-
-        shim_con
-            .execute("INSTALL crypto FROM community", [])
-            .expect("INSTALL crypto");
-        shim_con.execute("LOAD crypto", []).expect("LOAD crypto");
-
-        // Scalar path: crypto_hash -> hash.
-        let kind_scalar = unsafe {
-            crate::advanced::catalog_alias(raw, None, "crypto_hash", None, "hash")
-                .expect("alias crypto_hash")
-        };
-        assert_eq!(kind_scalar, crate::advanced::AliasKind::Scalar);
-        let s: Vec<u8> = shim_con
-            .query_row("SELECT hash('sha2-256', 'ping')", [], |r| r.get(0))
-            .expect("scalar alias hash()");
-        assert_eq!(s.len(), 32, "sha2-256 -> 32 bytes");
-
-        // Aggregate path: crypto_hash_agg -> hash_agg. The aggregate is
-        // ORDER_DEPENDENT in crypto's C++ (requires an ORDER BY), and the
-        // whole point of the shim is that the alias inherits ALL modifier
-        // support because it's a real AggregateFunctionCatalogEntry —
-        // basic ORDER BY / DISTINCT / FILTER must produce byte-identical
-        // BLOB output against community's own name.
-        let kind = unsafe {
-            crate::advanced::catalog_alias(raw, None, "crypto_hash_agg", None, "hash_agg")
-                .expect("alias crypto_hash_agg")
-        };
-        assert_eq!(kind, crate::advanced::AliasKind::Aggregate);
-
-        shim_con
-            .execute_batch(
-                "CREATE TABLE t(s VARCHAR, ok BOOL); \
-                 INSERT INTO t VALUES ('a', true), ('a', false), ('b', true), ('c', true);",
-            )
-            .expect("seed");
-        for (label, alias_sql, orig_sql) in [
-            (
-                "basic ORDER BY",
-                "SELECT hash_agg('sha2-256', s ORDER BY s) FROM t",
-                "SELECT crypto_hash_agg('sha2-256', s ORDER BY s) FROM t",
-            ),
-            (
-                "DISTINCT + ORDER BY",
-                "SELECT hash_agg(DISTINCT 'sha2-256', s ORDER BY s) FROM t",
-                "SELECT crypto_hash_agg(DISTINCT 'sha2-256', s ORDER BY s) FROM t",
-            ),
-            (
-                "FILTER + ORDER BY",
-                "SELECT hash_agg('sha2-256', s ORDER BY s) FILTER (WHERE ok) FROM t",
-                "SELECT crypto_hash_agg('sha2-256', s ORDER BY s) FILTER (WHERE ok) FROM t",
-            ),
-        ] {
-            let a: Vec<u8> = shim_con
-                .query_row(alias_sql, [], |r| r.get(0))
-                .expect(alias_sql);
-            let b: Vec<u8> = shim_con
-                .query_row(orig_sql, [], |r| r.get(0))
-                .expect(orig_sql);
-            assert_eq!(a, b, "{label} mismatch");
-            assert!(!a.is_empty(), "{label} returned empty");
-        }
-
-        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
