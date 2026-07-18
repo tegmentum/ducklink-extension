@@ -161,8 +161,7 @@
         "scalar",
         "table",
         "aggregate",
-        "macro",
-        "catalog"
+        "macro"
       ],
       "crates": [],
       "min_duckdb_version": "1.0.0",
@@ -11851,68 +11850,6 @@
       ]
     },
     {
-      "name": "sqlitewasm",
-      "version": "0.1.0",
-      "description": "SQLite scanner: the SQLite C library compiled to wasm INSIDE the component (rusqlite bundled), behind the WIT boundary. sqlite_blob_scan(hex_db, table) melts a SQLite database (passed as a hex string) into (row_no,col,val) rows; the component also backs the storage/pushdown-scan WIT interface (attach-blob + projection/filter/limit scan) used for ATTACH. Demonstrates delivering a heavy C library as a durable WIT component.",
-      "license": "MIT",
-      "authors": [
-        "Tegmentum"
-      ],
-      "repository": "https://github.com/tegmentum/ducklink",
-      "categories": [
-        "import-export"
-      ],
-      "source": "extensions/sqlitewasm-component",
-      "status": "working",
-      "artifact": "artifacts/extensions/sqlitewasm.wasm",
-      "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
-      "exports": [
-        "sqlite_blob_scan"
-      ],
-      "requires": [
-        "table",
-        "storage"
-      ],
-      "crates": [
-        "rusqlite"
-      ],
-      "min_duckdb_version": "1.0.0",
-      "prefix": "sqlitewasm",
-      "expansion": "com.tegmentum.ducklink.sqlitewasm",
-      "wit_contract_version": "4.0.0",
-      "content_digest": "2343406b43bddd815501c9e5a7705217060d8ca166e465dec9810260c70d7c38",
-      "functions": [
-        {
-          "name": "sqlite_blob_scan",
-          "kind": "table",
-          "arguments": [
-            {
-              "name": "db",
-              "type": "VARCHAR"
-            },
-            {
-              "name": "table",
-              "type": "VARCHAR"
-            }
-          ],
-          "columns": [
-            {
-              "name": "row_no",
-              "type": "BIGINT"
-            },
-            {
-              "name": "col",
-              "type": "VARCHAR"
-            },
-            {
-              "name": "val",
-              "type": "VARCHAR"
-            }
-          ]
-        }
-      ]
-    },
-    {
       "name": "jsonfns",
       "prefix": "jsonfns",
       "expansion": "com.tegmentum.ducklink.json",
@@ -12938,139 +12875,6 @@
       ]
     },
     {
-      "name": "rtreefns",
-      "version": "0.1.0",
-      "description": "Spatial R-tree index on the custom-index capability (rstar): CREATE INDEX ... USING wasm_rtree over a FLOAT[4] bbox column; rtree_search(index, bbox_json, limit) -> intersecting rowids; bbox4(wkt) -> bbox JSON. Proves the index capability is general (same WIT serves HNSW point-kNN and R-tree bbox-intersection).",
-      "license": "MIT",
-      "authors": [
-        "Tegmentum"
-      ],
-      "repository": "https://github.com/tegmentum/ducklink",
-      "categories": [
-        "data-types"
-      ],
-      "source": "extensions/rtreefns-component",
-      "status": "working",
-      "artifact": "artifacts/extensions/rtreefns.wasm",
-      "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
-      "exports": [
-        "rtree_search",
-        "bbox4"
-      ],
-      "requires": [
-        "index",
-        "table",
-        "scalar"
-      ],
-      "crates": [
-        "rstar"
-      ],
-      "min_duckdb_version": "1.0.0",
-      "prefix": "rtreefns",
-      "expansion": "com.tegmentum.ducklink.rtreefns",
-      "wit_contract_version": "4.0.0",
-      "content_digest": "755683a81d477a245dcbc71fe9bade057bf0bb8ef3bc319c6fe16124b7f3fa54",
-      "functions": [
-        {
-          "name": "bbox4",
-          "kind": "scalar",
-          "arguments": [
-            {
-              "name": "wkt",
-              "type": "VARCHAR"
-            }
-          ],
-          "returns": "VARCHAR"
-        },
-        {
-          "name": "rtree_search",
-          "kind": "table",
-          "arguments": [
-            {
-              "name": "index_name",
-              "type": "VARCHAR"
-            },
-            {
-              "name": "bbox",
-              "type": "VARCHAR"
-            },
-            {
-              "name": "limit",
-              "type": "BIGINT"
-            }
-          ],
-          "columns": [
-            {
-              "name": "rowid",
-              "type": "BIGINT"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "hnswfns",
-      "version": "0.1.0",
-      "description": "HNSW vector index on the custom-index capability (instant-distance): CREATE INDEX ... USING wasm_hnsw over a FLOAT[N] column; the query planner auto-rewrites ORDER BY array_distance(col,q) LIMIT k to use it; hnsw_search(index, query, k) explicit kNN.",
-      "license": "MIT",
-      "authors": [
-        "Tegmentum"
-      ],
-      "repository": "https://github.com/tegmentum/ducklink",
-      "categories": [
-        "math"
-      ],
-      "source": "extensions/hnswfns-component",
-      "status": "working",
-      "artifact": "artifacts/extensions/hnswfns.wasm",
-      "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
-      "exports": [
-        "hnsw_search"
-      ],
-      "requires": [
-        "index",
-        "table"
-      ],
-      "crates": [
-        "instant-distance"
-      ],
-      "min_duckdb_version": "1.0.0",
-      "prefix": "hnswfns",
-      "expansion": "com.tegmentum.ducklink.hnswfns",
-      "wit_contract_version": "4.0.0",
-      "content_digest": "f3dc9e67ff48809b67e4a491cd9a3334ef4b6300b2562d08f288a911a4677139",
-      "functions": [
-        {
-          "name": "hnsw_search",
-          "kind": "table",
-          "arguments": [
-            {
-              "name": "index_name",
-              "type": "VARCHAR"
-            },
-            {
-              "name": "query",
-              "type": "VARCHAR"
-            },
-            {
-              "name": "k",
-              "type": "BIGINT"
-            }
-          ],
-          "columns": [
-            {
-              "name": "rowid",
-              "type": "BIGINT"
-            },
-            {
-              "name": "distance",
-              "type": "FLOAT"
-            }
-          ]
-        }
-      ]
-    },
-    {
       "name": "geomtype",
       "version": "0.1.0",
       "description": "Custom GEOMETRY logical type via register-logical-type + casts: a geom2 type (WKB/BLOB physical) with VARCHAR<->geom2 WKT casts and geom_area/geom_astext typed scalars (geo+wkt). Demonstrates the custom-type + cast capability.",
@@ -13833,58 +13637,6 @@
             },
             {
               "name": "manifest_list",
-              "type": "VARCHAR"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "autocomplete",
-      "version": "0.1.0",
-      "description": "SQL autocompletion (componentizes official autocomplete): sql_complete(partial) -> last-token-prefix matches over SQL keywords PLUS live catalog table + column names (via a new query host import; served from a host-side catalog snapshot to avoid table-function re-entrancy). kind = keyword|table|column.",
-      "license": "MIT",
-      "authors": [
-        "Tegmentum"
-      ],
-      "repository": "https://github.com/tegmentum/ducklink",
-      "categories": [
-        "text-processing"
-      ],
-      "source": "extensions/autocomplete-component",
-      "status": "working",
-      "artifact": "artifacts/extensions/autocomplete.wasm",
-      "wit_contract": "a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40",
-      "exports": [
-        "sql_complete"
-      ],
-      "requires": [
-        "query",
-        "table"
-      ],
-      "crates": [],
-      "min_duckdb_version": "1.0.0",
-      "prefix": "autocomplete",
-      "expansion": "com.tegmentum.ducklink.autocomplete",
-      "wit_contract_version": "4.0.0",
-      "content_digest": "3f8b490994d38d8f04a2dfe527b081ba188bcb8f365fd8804883d9a565e7da84",
-      "functions": [
-        {
-          "name": "sql_complete",
-          "kind": "table",
-          "arguments": [
-            {
-              "name": "partial",
-              "type": "VARCHAR"
-            }
-          ],
-          "columns": [
-            {
-              "name": "suggestion",
-              "type": "VARCHAR"
-            },
-            {
-              "name": "kind",
               "type": "VARCHAR"
             }
           ]
@@ -16247,15 +15999,14 @@
     {
       "name": "talib",
       "version": "0.1.0",
-      "description": "TA-Lib technical indicators (sma/ema/rsi) as aggregate + window functions driven by DuckDB's window machinery (shared datalink talib-core).",
+      "description": "TA-Lib technical indicators (sma/ema/rsi) as aggregate functions, callable inside OVER (...) window frames via DuckDB's window machinery (shared datalink talib-core).",
       "exports": [
         "sma",
         "ema",
         "rsi"
       ],
       "requires": [
-        "aggregate",
-        "window"
+        "aggregate"
       ],
       "crates": [],
       "categories": [
