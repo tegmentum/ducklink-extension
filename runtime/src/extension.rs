@@ -1486,7 +1486,7 @@ impl extension_settings::Host for ExtensionStoreState {
     }
 }
 
-// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// DEPRECATED (ducklink 5.0.0) — scheduled for removal at the next
 // `duckdb:extension` major bump. No host drains `pending_parsers` anymore;
 // components calling `register_parser_extension` still succeed but their
 // declarations never reach DuckDB. See ducklink v4.6.0 for the rationale.
@@ -1515,7 +1515,7 @@ impl extension_parser::Host for ExtensionStoreState {
     }
 }
 
-// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// DEPRECATED (ducklink 5.0.0) — scheduled for removal at the next
 // `duckdb:extension` major bump. No host drains `pending_optimizers` anymore;
 // components calling `register_optimizer_rule` still succeed but their
 // declarations never reach DuckDB. See ducklink v4.6.0 for the rationale.
@@ -1544,7 +1544,7 @@ impl extension_optimizer::Host for ExtensionStoreState {
     }
 }
 
-// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// DEPRECATED (ducklink 5.0.0) — scheduled for removal at the next
 // `duckdb:extension` major bump. No host drains
 // `pending_filterable_tables` anymore; components calling
 // `register_filterable_table` still succeed but their declarations never

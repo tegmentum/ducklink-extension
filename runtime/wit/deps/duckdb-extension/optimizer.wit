@@ -2,7 +2,7 @@ package duckdb:extension@4.0.0;
 
 use types;
 
-// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// DEPRECATED (ducklink 5.0.0) — scheduled for removal at the next
 // duckdb:extension major bump.
 //
 // No host consumes registrations made through this interface: DuckDB's

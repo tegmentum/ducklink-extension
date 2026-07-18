@@ -201,7 +201,7 @@ world duckdb-extension-storage-write {
   export storage-write-dispatch;
 }
 
-// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// DEPRECATED (ducklink 5.0.0) — scheduled for removal at the next
 // duckdb:extension major bump. Depends on the deprecated `table-stream` +
 // `table-stream-dispatch` interfaces; no host drives it.
 //
@@ -304,7 +304,7 @@ world duckdb-extension-settings {
   export settings-dispatch;
 }
 
-// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// DEPRECATED (ducklink 5.0.0) — scheduled for removal at the next
 // duckdb:extension major bump. Depends on the deprecated `parser` +
 // `parser-dispatch` interfaces; no host drives it.
 //
@@ -327,7 +327,7 @@ world duckdb-extension-parser {
   export parser-dispatch;
 }
 
-// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// DEPRECATED (ducklink 5.0.0) — scheduled for removal at the next
 // duckdb:extension major bump. Depends on the deprecated `optimizer` +
 // `optimizer-dispatch` interfaces; no host drives it.
 //

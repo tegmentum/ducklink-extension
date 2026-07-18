@@ -1037,7 +1037,7 @@ pub mod reg {
         pub callback_handle: u32,
     }
 
-    /// DEPRECATED (ducklink 4.6.2). Scheduled for removal at the next
+    /// DEPRECATED (ducklink 5.0.0). Scheduled for removal at the next
     /// `duckdb:extension` major bump. No host consumes `ParserReg`s anymore —
     /// ducklink is C-API-only and DuckDB's `ParserExtension` is on the
     /// unstable internal C++ ABI. See ducklink v4.6.0 (advanced-tier removal).
@@ -1053,7 +1053,7 @@ pub mod reg {
         pub callback_handle: u32,
     }
 
-    /// DEPRECATED (ducklink 4.6.2). Scheduled for removal at the next
+    /// DEPRECATED (ducklink 5.0.0). Scheduled for removal at the next
     /// `duckdb:extension` major bump. No host consumes `OptimizerReg`s anymore —
     /// ducklink is C-API-only and DuckDB's `OptimizerExtension` is on the
     /// unstable internal C++ ABI. See ducklink v4.6.0 (advanced-tier removal).
@@ -1069,7 +1069,7 @@ pub mod reg {
         pub callback_handle: u32,
     }
 
-    /// DEPRECATED (ducklink 4.6.2). Scheduled for removal at the next
+    /// DEPRECATED (ducklink 5.0.0). Scheduled for removal at the next
     /// `duckdb:extension` major bump. No host wires filter-pushdown table
     /// functions anymore — ducklink is C-API-only and the streaming
     /// `TableFunction` with `filter_pushdown = true` is on the unstable
