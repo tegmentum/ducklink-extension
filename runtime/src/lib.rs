@@ -1037,6 +1037,11 @@ pub mod reg {
         pub callback_handle: u32,
     }
 
+    /// DEPRECATED (ducklink 4.6.2). Scheduled for removal at the next
+    /// `duckdb:extension` major bump. No host consumes `ParserReg`s anymore —
+    /// ducklink is C-API-only and DuckDB's `ParserExtension` is on the
+    /// unstable internal C++ ABI. See ducklink v4.6.0 (advanced-tier removal).
+    ///
     /// A parser extension registered by an extension (2.3.0 / v3). `callback_handle`
     /// routes every `parser-dispatch.call-parse` to the owning component. The core
     /// shim wires a DuckDB `ParserExtension` that forwards unrecognized statement
@@ -1048,6 +1053,11 @@ pub mod reg {
         pub callback_handle: u32,
     }
 
+    /// DEPRECATED (ducklink 4.6.2). Scheduled for removal at the next
+    /// `duckdb:extension` major bump. No host consumes `OptimizerReg`s anymore —
+    /// ducklink is C-API-only and DuckDB's `OptimizerExtension` is on the
+    /// unstable internal C++ ABI. See ducklink v4.6.0 (advanced-tier removal).
+    ///
     /// A general optimizer rule registered by an extension (2.3.0 / v3).
     /// `callback_handle` routes every `optimizer-dispatch.call-optimize` to the
     /// owning component. The core shim wires a DuckDB `OptimizerExtension` that
@@ -1059,6 +1069,13 @@ pub mod reg {
         pub callback_handle: u32,
     }
 
+    /// DEPRECATED (ducklink 4.6.2). Scheduled for removal at the next
+    /// `duckdb:extension` major bump. No host wires filter-pushdown table
+    /// functions anymore — ducklink is C-API-only and the streaming
+    /// `TableFunction` with `filter_pushdown = true` is on the unstable
+    /// internal C++ ABI. Components should register through
+    /// `runtime.table-registry` and filter above the scan. See ducklink v4.6.0.
+    ///
     /// A STREAMING + FILTER-PUSHDOWN-capable table function registered by an
     /// extension via the additive 3.1.0 `table-stream` interface (the first
     /// additive MINOR off the frozen major-3 baseline). Unlike [`TableReg`] (the

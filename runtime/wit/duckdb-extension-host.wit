@@ -201,6 +201,10 @@ world duckdb-extension-storage-write {
   export storage-write-dispatch;
 }
 
+// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// duckdb:extension major bump. Depends on the deprecated `table-stream` +
+// `table-stream-dispatch` interfaces; no host drives it.
+//
 // Streaming-table world (2.2.0, Item 6): additionally exports
 // table-stream-dispatch. Built lazily from an already-loaded instance.
 world duckdb-extension-table-stream {
@@ -300,6 +304,10 @@ world duckdb-extension-settings {
   export settings-dispatch;
 }
 
+// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// duckdb:extension major bump. Depends on the deprecated `parser` +
+// `parser-dispatch` interfaces; no host drives it.
+//
 // Parser-extension world (2.3.0 / v3): additionally imports the parser
 // registration surface and exports parser-dispatch (the host drives the
 // component's `call-parse` from a DuckDB ParserExtension). Built lazily from an
@@ -319,6 +327,10 @@ world duckdb-extension-parser {
   export parser-dispatch;
 }
 
+// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// duckdb:extension major bump. Depends on the deprecated `optimizer` +
+// `optimizer-dispatch` interfaces; no host drives it.
+//
 // General-optimizer world (2.3.0 / v3): additionally imports the optimizer-rule
 // registration surface and exports optimizer-dispatch (the host offers the
 // flattened plan to the component's `call-optimize` from a DuckDB

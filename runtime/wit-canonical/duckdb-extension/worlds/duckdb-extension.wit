@@ -169,6 +169,10 @@ world duckdb-extension-storage-write {
   export storage-write-dispatch;
 }
 
+// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// duckdb:extension major bump. Depends on the deprecated `table-stream` +
+// `table-stream-dispatch` interfaces; no host drives it.
+//
 // Streaming-table world (2.2.0, Item 6): exports table-stream-dispatch.
 // 3.1.0 additive: also imports the `table-stream` registration marker so a
 // filterable streaming component declares its table fn in load() AND serves the

@@ -1486,6 +1486,11 @@ impl extension_settings::Host for ExtensionStoreState {
     }
 }
 
+// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// `duckdb:extension` major bump. No host drains `pending_parsers` anymore;
+// components calling `register_parser_extension` still succeed but their
+// declarations never reach DuckDB. See ducklink v4.6.0 for the rationale.
+//
 // 2.3.0 / v3: the `parser` interface declares a parser extension. Captured into a
 // neutral pending buffer; the core shim drains it and wires a DuckDB
 // `ParserExtension` that forwards unrecognized statement text to the component's
@@ -1510,6 +1515,11 @@ impl extension_parser::Host for ExtensionStoreState {
     }
 }
 
+// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// `duckdb:extension` major bump. No host drains `pending_optimizers` anymore;
+// components calling `register_optimizer_rule` still succeed but their
+// declarations never reach DuckDB. See ducklink v4.6.0 for the rationale.
+//
 // 2.3.0 / v3: the `optimizer` interface declares a general optimizer rule.
 // Captured into a neutral pending buffer; the core shim drains it and wires a
 // DuckDB `OptimizerExtension` that offers the flattened plan-shape to the
@@ -1534,6 +1544,13 @@ impl extension_optimizer::Host for ExtensionStoreState {
     }
 }
 
+// DEPRECATED (ducklink 4.6.2) — scheduled for removal at the next
+// `duckdb:extension` major bump. No host drains
+// `pending_filterable_tables` anymore; components calling
+// `register_filterable_table` still succeed but their declarations never
+// reach DuckDB. Register through `runtime.table-registry` instead; DuckDB
+// filters above the scan (correct, not pushdown-fast). See ducklink v4.6.0.
+//
 // 3.1.0 (the first additive MINOR off the frozen major-3 baseline): the
 // `table-stream` interface declares a STREAMING + FILTER-PUSHDOWN-capable table
 // function. Captured into a neutral pending buffer; the core shim drains it and
