@@ -1,5 +1,9 @@
 # Visualization: the ducklink take
 
+This is the specific instance of a broader position — see
+`docs/extension-scope.md` for the general "extensions compose in the
+SQL grammar, they don't replace it" argument.
+
 ## Position
 
 Ducklink will NOT ship a `VISUALIZE` SQL statement, and will NOT render
