@@ -99,11 +99,12 @@ docs:
 
     Catalog entries can further declare an optional `namespace` so their functions bind
     under both DuckDB's `main` schema (bare) and a schema-qualified form (`crypto.hash(x)`
-    for `namespace: "crypto"`). Users layer session-scoped short aliases on top with
-    `FROM ducklink_prefix('c', 'crypto');` (persisted in `ducklink.prefixes` and replayed
-    on the next LOAD). All four forms — bare, ducklink-alias bare, namespace-qualified,
-    and alias-qualified — bind the same underlying function set, so aggregate modifiers
-    propagate through every one of them.
+    for `namespace: "crypto"`). Users layer session-scoped short aliases on top via
+    `ducklink_prefix('c', 'crypto')` — callable as a table function, a scalar, or through
+    the shorter `PREFIX('c','crypto')` macro (persisted in `ducklink.prefixes` and
+    replayed on the next LOAD). All four qualifier forms — bare, ducklink-alias bare,
+    namespace-qualified, and alias-qualified — bind the same underlying function set,
+    so aggregate modifiers propagate through every one of them.
 
     A built-in `ducklink_version()` scalar is always available, so the
     extension is usable and testable before any module is loaded. For

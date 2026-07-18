@@ -3026,6 +3026,20 @@ pub fn register_load_function(
     // `ducklink.prefixes` and replayed on subsequent
     // `ducklink_load('name', kind => 'native')` calls.
     con.register_table_function::<DucklinkPrefix>("ducklink_prefix")?;
+    // Scalar form of the same name — usable as `SELECT ducklink_prefix('c','crypto');`.
+    // The TF and scalar coexist under one name because DuckDB's binder
+    // routes `FROM foo(...)` to the TF and `SELECT foo(...)` to the scalar.
+    con.register_scalar_function::<DucklinkPrefixScalar>("ducklink_prefix")?;
+    // Shorter macro that just delegates to the scalar. Users still need
+    // to quote the two identifiers — `SELECT PREFIX('c','crypto');` —
+    // because DuckDB has no parser hook to reinterpret bare idents as
+    // strings, but PREFIX is materially shorter than ducklink_prefix.
+    if let Err(e) = con.execute(
+        "CREATE OR REPLACE MACRO PREFIX(alias, namespace) AS ducklink_prefix(alias, namespace)",
+        [],
+    ) {
+        eprintln!("[ducklink] could not register PREFIX macro: {e}");
+    }
     // The INTERNAL discovery table functions backing the public `ducklink.*`
     // views. Users query the views (`SELECT * FROM ducklink.modules`); these
     // `ducklink_*()` TFs are the implementation the views select from.
@@ -4057,52 +4071,17 @@ impl VTab for DucklinkPrefix {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         guard("ducklink_prefix bind", || {
-            let rt = RUNTIME.get().ok_or_else(|| -> Box<dyn std::error::Error> {
-                "ducklink_prefix: runtime not initialised (LOAD ducklink first)".into()
-            })?;
             let alias = bind.get_parameter(0).to_string();
             let namespace = bind.get_parameter(1).to_string();
-            if !crate::catalog::is_safe_identifier(&alias)
-                || !crate::catalog::is_safe_identifier(&namespace)
-            {
-                return Err(format!(
-                    "ducklink_prefix: alias and namespace must match [A-Za-z0-9_]+ \
-                     (got alias='{alias}', namespace='{namespace}')"
-                )
-                .into());
-            }
-            let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
-            let macros = create_prefix_aliases(&con, &alias, &namespace)
+            let macros = run_ducklink_prefix(&alias, &namespace)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            if macros == 0 {
-                return Err(format!(
-                    "ducklink_prefix: namespace '{namespace}' has no functions to alias — \
-                     is the module loaded?"
-                )
-                .into());
-            }
-            if let Err(e) = persist_prefix(&con, &alias, &namespace) {
-                crate::events::emit(
-                    "ducklink_prefix_persist_error",
-                    Some(&alias),
-                    e.clone(),
-                );
-                // Non-fatal: session aliases succeeded; persistence failure
-                // just means reconnect won't restore.
-            }
-            crate::events::emit(
-                "ducklink_prefix_ok",
-                Some(&alias),
-                format!("namespace='{namespace}' macros={macros}"),
-            );
-
             bind.add_result_column("alias", LogicalTypeHandle::from(LogicalTypeId::Varchar));
             bind.add_result_column("namespace", LogicalTypeHandle::from(LogicalTypeId::Varchar));
             bind.add_result_column("macros", LogicalTypeHandle::from(LogicalTypeId::Bigint));
             Ok(DucklinkPrefixBind {
                 alias,
                 namespace,
-                macros: macros as i64,
+                macros,
             })
         })
     }
@@ -4139,6 +4118,110 @@ impl VTab for DucklinkPrefix {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ])
+    }
+}
+
+/// Shared body of the `ducklink_prefix()` TF, scalar, and PREFIX macro.
+/// Validates identifiers, creates the alias schema on the runtime's
+/// persistent connection, persists the declaration for replay, and
+/// returns the number of macros registered.
+fn run_ducklink_prefix(alias: &str, namespace: &str) -> Result<i64, String> {
+    let rt = RUNTIME
+        .get()
+        .ok_or_else(|| "ducklink_prefix: runtime not initialised (LOAD ducklink first)".to_string())?;
+    if !crate::catalog::is_safe_identifier(alias)
+        || !crate::catalog::is_safe_identifier(namespace)
+    {
+        return Err(format!(
+            "ducklink_prefix: alias and namespace must match [A-Za-z0-9_]+ \
+             (got alias='{alias}', namespace='{namespace}')"
+        ));
+    }
+    let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+    let macros = create_prefix_aliases(&con, alias, namespace)?;
+    if macros == 0 {
+        return Err(format!(
+            "ducklink_prefix: namespace '{namespace}' has no functions to alias — \
+             is the module loaded?"
+        ));
+    }
+    if let Err(e) = persist_prefix(&con, alias, namespace) {
+        crate::events::emit(
+            "ducklink_prefix_persist_error",
+            Some(alias),
+            e.clone(),
+        );
+        // Non-fatal: session aliases succeeded; persistence failure
+        // just means reconnect won't restore.
+    }
+    crate::events::emit(
+        "ducklink_prefix_ok",
+        Some(alias),
+        format!("namespace='{namespace}' macros={macros}"),
+    );
+    Ok(macros as i64)
+}
+
+/// Scalar counterpart of the `ducklink_prefix()` TF. Same body, but
+/// callable without `FROM` — `SELECT ducklink_prefix('c','crypto');`
+/// returns a single VARCHAR summary. Register the scalar under the SAME
+/// name as the TF: DuckDB's binder disambiguates by context.
+struct DucklinkPrefixScalar;
+
+impl VScalar for DucklinkPrefixScalar {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("ducklink_prefix scalar", || {
+            let len = input.len();
+            let mut a_col = input.flat_vector(0);
+            let mut n_col = input.flat_vector(1);
+            let out = output.flat_vector();
+            let aliases: Vec<String> = unsafe {
+                let s = a_col.as_mut_slice_with_len::<duckdb_string_t>(len);
+                (0..len)
+                    .map(|i| {
+                        let mut t = s[i];
+                        DuckString::new(&mut t).as_str().into_owned()
+                    })
+                    .collect()
+            };
+            let namespaces: Vec<String> = unsafe {
+                let s = n_col.as_mut_slice_with_len::<duckdb_string_t>(len);
+                (0..len)
+                    .map(|i| {
+                        let mut t = s[i];
+                        DuckString::new(&mut t).as_str().into_owned()
+                    })
+                    .collect()
+            };
+            for i in 0..len {
+                let alias = &aliases[i];
+                let namespace = &namespaces[i];
+                let summary = match run_ducklink_prefix(alias, namespace) {
+                    Ok(macros) => format!(
+                        "alias='{alias}' namespace='{namespace}' macros={macros}"
+                    ),
+                    Err(e) => return Err(e.into()),
+                };
+                out.insert(i, summary.as_str());
+            }
+            Ok(())
+        })
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeId::Varchar.into(),
+                LogicalTypeId::Varchar.into(),
+            ],
+            LogicalTypeId::Varchar.into(),
+        )]
     }
 }
 
@@ -6956,5 +7039,113 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         assert_eq!(groups, vec![(1, 50), (2, 70)]);
+    }
+
+    /// Scalar form: `SELECT ducklink_prefix('c','crypto')` runs the same
+    /// alias-schema work as the TF and returns a VARCHAR summary. Both
+    /// shapes must coexist under the same name because DuckDB's binder
+    /// routes them by context.
+    #[test]
+    fn ducklink_prefix_scalar_form_creates_alias_schema() {
+        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::engine::Engine2;
+        use duckdb::ffi;
+        let (db, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            (db, con)
+        };
+        let engine = Arc::new(Engine2::new().expect("engine"));
+        register_load_function(&con, db, engine).expect("register ducklink_load");
+        if !runtime_is_ours(db) {
+            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
+            return;
+        }
+
+        con.execute_batch(
+            "CREATE SCHEMA crypto; \
+             CREATE MACRO crypto.hash(algo, data) AS algo || ':' || data;",
+        )
+        .expect("seed crypto schema");
+
+        let summary: String = con
+            .query_row("SELECT ducklink_prefix('c','crypto')", [], |r| r.get(0))
+            .expect("scalar ducklink_prefix");
+        assert!(
+            summary.contains("alias='c'") && summary.contains("namespace='crypto'"),
+            "unexpected summary: {summary}"
+        );
+        assert!(summary.contains("macros=1"), "unexpected summary: {summary}");
+
+        // The alias schema is populated — resolves same as `crypto.hash(...)`.
+        let via_alias: String = con
+            .query_row("SELECT c.hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("c.hash()");
+        assert_eq!(via_alias, "sha2-256:ping");
+
+        // Redeclaring the same prefix is idempotent — the scalar just
+        // reruns the CREATE OR REPLACE + INSERT OR REPLACE bodies.
+        let _ = con
+            .query_row("SELECT ducklink_prefix('c','crypto')", [], |r| {
+                r.get::<usize, String>(0)
+            })
+            .expect("redeclare");
+        let count: i64 = con
+            .query_row(
+                "SELECT count(*) FROM ducklink.prefixes WHERE alias = 'c'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    /// The `PREFIX(a,n)` macro delegates to the scalar. Users still
+    /// have to quote the two identifiers — bare `PREFIX(c, crypto)`
+    /// binds them as column refs — but the macro is materially
+    /// shorter than `ducklink_prefix`.
+    #[test]
+    fn prefix_macro_delegates_to_scalar() {
+        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::engine::Engine2;
+        use duckdb::ffi;
+        let (db, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            (db, con)
+        };
+        let engine = Arc::new(Engine2::new().expect("engine"));
+        register_load_function(&con, db, engine).expect("register ducklink_load");
+        if !runtime_is_ours(db) {
+            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
+            return;
+        }
+
+        con.execute_batch(
+            "CREATE SCHEMA crypto; \
+             CREATE MACRO crypto.hash(algo, data) AS algo || ':' || data;",
+        )
+        .expect("seed crypto schema");
+
+        let summary: String = con
+            .query_row("SELECT PREFIX('c','crypto')", [], |r| r.get(0))
+            .expect("PREFIX macro");
+        assert!(
+            summary.contains("alias='c'") && summary.contains("namespace='crypto'"),
+            "unexpected summary: {summary}"
+        );
+
+        let via_alias: String = con
+            .query_row("SELECT c.hash('sha2-256', 'ping')", [], |r| r.get(0))
+            .expect("c.hash() via PREFIX");
+        assert_eq!(via_alias, "sha2-256:ping");
     }
 }

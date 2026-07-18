@@ -565,17 +565,24 @@ that schema (same rule DuckDB already uses for extensions all sharing
 modules will error at registration with a clear "already exists"
 message.
 
-### User-side session aliases: `ducklink_prefix()`
+### User-side session aliases
 
-Users add their own short aliases with a table-function call:
+Users add their own short aliases via one of three call surfaces —
+all three run the same body and are fully interchangeable:
 
 ```sql
-FROM ducklink_prefix('c', 'crypto');
+FROM ducklink_prefix('c', 'crypto');    -- table function (returns alias, namespace, macros)
+SELECT ducklink_prefix('c', 'crypto');  -- scalar (returns a VARCHAR summary)
+SELECT PREFIX('c', 'crypto');           -- shorter macro that delegates to the scalar
 ```
 
-That creates an alias schema `c` and re-registers every function in
+Each creates an alias schema `c` and re-registers every function in
 schema `crypto` under `c.<fn>`. Both alias and namespace forms bind
 the same catalog entry.
+
+The identifiers still have to be quoted string literals — DuckDB
+gives us no parser hook to reinterpret bare idents (`PREFIX(c,
+crypto)`) as strings, so quoting is the price of C-API-only.
 
 Persistence: the declaration is stored in a `ducklink.prefixes(alias,
 namespace)` table inside the user's default catalog. On file-backed
