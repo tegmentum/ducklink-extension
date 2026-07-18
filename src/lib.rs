@@ -228,16 +228,10 @@ mod loadable {
         }
         let db: ffi::duckdb_database = *db_ptr;
 
-        // VERSION GUARD for the advanced tier. The advanced tier (parser /
-        // optimizer / filter pushdown) binds DuckDB's INTERNAL C++ ABI through
-        // the linked C++ shim, with the internal symbols resolved at LOAD against
-        // the host process. That ABI is NOT stable across DuckDB versions, so
-        // calling into it on a host that differs from the version the shim was
-        // compiled against could crash or corrupt state. We therefore enable the
-        // ducklink is C-API-only across every platform — no internal-C++-ABI
-        // shim, no per-platform capability drift. The version string is still
-        // read for the `ducklink.host` discovery view, but nothing runtime-
-        // meaningful gates on it anymore.
+        // Read the host DuckDB library version. Ducklink is C-API-only on
+        // every platform — no internal C++ ABI probing, so nothing gates on
+        // the version at runtime; the string is surfaced through the
+        // `ducklink.host` discovery view only.
         let host_version = host_library_version();
 
         set_host_caps(HostCaps {
@@ -277,9 +271,9 @@ mod loadable {
         }
 
         let specs = component_specs_from_env();
-        // `db` is retained in the signature for backwards compatibility with
-        // callers that once threaded an advanced-tier register call through
-        // it — now a no-op inside register_components.
+        // `db` is unused inside `register_components` today but kept in the
+        // signature so re-adding a database-level registration path later
+        // doesn't churn every call-site.
         let registered =
             register_components(&con, have_raw.then_some(raw_con), Some(db), engine, &specs)
                 .map_err(stringify)?;

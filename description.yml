@@ -73,14 +73,10 @@ docs:
     summary/description/example override the catalog, tags union — so
     third-party modules can keep their own docs authoritative.
 
-    On Linux and macOS an advanced tier also enables a `DUCKLINK LOAD '<name>'`
-    SQL statement — an explicit alternative to `ducklink_load()` that reads
-    naturally in DDL:
-
-        DUCKLINK LOAD 'aba';                    -- WASM (default)
-        DUCKLINK LOAD 'aba' NATIVE;             -- prefer the native backing
-
-    `NATIVE` is the routing layer. When the catalog advertises a
+    Loading a module by catalog name uses the table function
+    `ducklink_load('aba', kind => 'wasm')` (WASM sandbox, the default) or
+    `ducklink_load('aba', kind => 'native')` (prefer the native backing).
+    `native` is the routing layer. When the catalog advertises a
     community-extensions entry for the same capability, ducklink dispatches
     `INSTALL <name> FROM community; LOAD <name>;` on your behalf — signed by
     the community-extensions key, no `-unsigned` needed. Otherwise it falls

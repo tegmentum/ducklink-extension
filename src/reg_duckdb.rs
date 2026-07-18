@@ -2161,8 +2161,8 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
 }
 
 /// Write a neutral value into row `i` of a raw result vector (type `code`). Takes
-/// the value by reference so the caller (advanced-tier pushdown scan) can walk
-/// its `Vec<Vec<DuckValue>>` without cloning each cell.
+/// the value by reference so the caller can walk its `Vec<Vec<DuckValue>>`
+/// without cloning each cell.
 pub(crate) unsafe fn write_ret_raw(
     code: u8,
     vector: ffi::duckdb_vector,
@@ -2236,9 +2236,9 @@ pub(crate) unsafe fn write_ret_raw(
     Ok(())
 }
 
-/// Column-hoisted analog of [`write_ret_raw`] for the advanced-tier pushdown
-/// scan: derive the typed data pointer + match on the return type ONCE per
-/// column, then walk the values in-place. Compared to the previous per-cell
+/// Column-hoisted analog of [`write_ret_raw`]: derive the typed data pointer
+/// + match on the return type ONCE per column, then walk the values in-place.
+/// Compared to the previous per-cell
 /// `write_ret_raw` loop, this saves `ncols * (nrows - 1)` FFI derefs of
 /// `duckdb_vector_get_data` and the same number of `(code, val)` pattern
 /// matches. For fixed-width columns it collapses to a straight pointer write
@@ -2957,9 +2957,8 @@ fn host_generation_major() -> u64 {
         .unwrap_or(0)
 }
 
-/// The capability kinds the COMMON tier (always present, stable C API) satisfies.
-/// A module whose `requires` are all in this set is compatible on any host; a
-/// module requiring anything else needs the advanced tier.
+/// The capability kinds this host satisfies (all through the stable DuckDB C API).
+/// A module whose `requires` are all in this set is compatible on any platform.
 const COMMON_TIER_KINDS: &[&str] = &[
     "scalar",
     "table",
@@ -2971,9 +2970,9 @@ const COMMON_TIER_KINDS: &[&str] = &[
 ];
 
 /// True when THIS host can satisfy every capability `kind` in `requires`.
-/// Ducklink ships the common tier only across every platform now; anything
-/// outside `COMMON_TIER_KINDS` is unsatisfied. Modules requiring parser /
-/// optimizer / storage / etc. are marked incompatible everywhere.
+/// Ducklink is C-API-only on every platform, so anything outside
+/// `COMMON_TIER_KINDS` (parser / optimizer / storage / …) is unsatisfied
+/// everywhere.
 fn module_compatible(requires: &[String], _caps: &HostCaps) -> bool {
     requires
         .iter()
@@ -3092,13 +3091,11 @@ fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
 }
 
 /// Load a component (by path or catalog name) into the GIVEN database handle and
-/// register its functions. The advanced-tier `LOAD WASM '<name>'` statement
-/// routes here from the C++ parser shim, which hands us a `duckdb_database`
-/// derived from the PARSER's live `ClientContext` (`context.db`) — the connection
-/// the statement actually runs on — instead of the process-captured `rt.db`. In
-/// the real loadable/CLI context the init-time `rt.db` handle does not survive to
-/// re-`duckdb_connect` later (observed: "connect error"), so reusing the live
-/// context db is what makes runtime loading work end to end there.
+/// register its functions. Takes the `duckdb_database` explicitly so callers
+/// can pass a handle derived from a live `ClientContext` — the init-time
+/// `rt.db` doesn't survive to re-`duckdb_connect` later (observed: "connect
+/// error") in the loadable/CLI context, so the caller's context-derived handle
+/// is what makes runtime loading work end to end.
 ///
 /// Returns Ok((name, scalars, tables, aggregates)) on success.
 ///
@@ -3504,12 +3501,10 @@ fn community_native_load(
     }
 
     // Generate aliases so both names — community's own and ducklink's
-    // chosen — are callable. On builds where the advanced tier is compiled
-    // in, we use the C++ catalog-alias shim (real CatalogEntry per pair,
-    // full aggregate modifier support). Otherwise we fall back to
-    // CREATE OR REPLACE MACRO with the documented aggregate caveat. Both
-    // paths surface a rolled-up count in the summary; per-pair errors are
-    // non-fatal so a mismapping doesn't block the rest of the load.
+    // chosen — are callable. Scalar/table aliases go through
+    // `CREATE OR REPLACE MACRO`; aggregate aliases go through the delegating
+    // C-API aggregate so DISTINCT / FILTER / GROUP BY propagate. Per-pair
+    // errors are non-fatal so a mismapping doesn't block the rest of the load.
     let alias_count = create_community_aliases(&con, &spec)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -3625,9 +3620,7 @@ fn create_community_aliases(
             .query_map([], |row| {
                 let ftype: String = row.get(0)?;
                 // parameters rendered as a CSV via array_to_string —
-                // duckdb-rs doesn't ship a FromSql impl for `Vec<String>`,
-                // and the CSV form is what the advanced-tier callsite uses
-                // too, so the two paths stay behaviourally identical.
+                // duckdb-rs doesn't ship a FromSql impl for `Vec<String>`.
                 let param_csv: Option<String> = row.get(1)?;
                 Ok((ftype, param_csv))
             })
@@ -3872,12 +3865,12 @@ fn type_name_to_code(name: &str) -> Result<u8, String> {
 // `ducklink.prefixes(alias, namespace)` and replayed automatically on the
 // next `FROM ducklink_load('name', kind => 'native')` after a reconnect.
 //
-// Aggregate transparency trade-off: aliases are `CREATE MACRO` shapes, so
-// DISTINCT / FILTER / ORDER BY / OVER modifiers don't propagate through
-// the alias for aggregates. Users still have community's original name
-// available with full modifier support. This is the documented cost of
-// running on the stable C API — the advanced-tier catalog-alias shim did
-// preserve modifiers but wasn't portable to Linux/Windows.
+// Aggregate transparency trade-off: prefix aliases are `CREATE MACRO`
+// shapes, so DISTINCT / FILTER / ORDER BY / OVER modifiers don't propagate
+// through the prefix alias for aggregates. Users can still call the
+// namespace-qualified form (`crypto.hash_agg(x)`) — which does go through
+// the delegating C-API aggregate registered by `create_community_aliases`
+// — with full modifier support.
 // ---------------------------------------------------------------------------
 
 /// Ensure `ducklink.prefixes(alias VARCHAR PRIMARY KEY, namespace VARCHAR)`
@@ -4376,7 +4369,7 @@ struct ModuleRow {
     /// THIS host — either a `kind:"native"` provider matching this host's
     /// platform + DuckDB ABI, or a `kind:"community-native"` provider (routed
     /// to `INSTALL ... FROM community`). From the user's perspective the two
-    /// are equivalent: `DUCKLINK LOAD '<name>' NATIVE` will succeed either way.
+    /// are equivalent: `ducklink_load('<name>', kind => 'native')` will succeed either way.
     /// Independent of `loaded` — a native artifact may be available without
     /// being loaded, and a module loaded as wasm may still have a native
     /// backing listed in the catalog.
@@ -4435,10 +4428,10 @@ impl VTab for WasmModules {
                     // EITHER a `kind:"native"` provider matching THIS host's
                     // platform + DuckDB ABI, OR a `kind:"community-native"`
                     // provider (dispatched via `INSTALL ... FROM community`).
-                    // Mirrors the resolution order in `DUCKLINK LOAD ... NATIVE`
-                    // (community-native preferred, ducklink-native fallback) —
-                    // from the user's perspective both mean "if I ask for
-                    // NATIVE, ducklink can deliver".
+                    // Mirrors the resolution order in `ducklink_load(kind =>
+                    // 'native')` (community-native preferred, ducklink-native
+                    // fallback) — from the user's perspective both mean "if I
+                    // ask for NATIVE, ducklink can deliver".
                     let native_available = e
                         .select_native_provider(
                             crate::catalog::NATIVE_PLATFORM,
@@ -4709,11 +4702,10 @@ struct WasmHostCapabilitiesBind {
     rows: Vec<HostCapabilityRow>,
 }
 
-/// `ducklink_host_capabilities()` — the HOST's capabilities: which capability kinds
-/// this artifact + host can satisfy. The row-set is the DEDUPED union of
-/// `COMMON_TIER_KINDS` and `ADVANCED_TIER_KINDS` — the exact vocabulary
-/// `module_compatible()` checks against — so anything that appears in a
-/// module's `kinds` column is guaranteed to have a row here.
+/// `ducklink_host_capabilities()` — the HOST's capabilities: which capability
+/// kinds this artifact + host can satisfy. The row-set is `COMMON_TIER_KINDS`
+/// — the exact vocabulary `module_compatible()` checks against — so anything
+/// that appears in a module's `kinds` column is guaranteed to have a row here.
 struct WasmHostCapabilities;
 
 impl VTab for WasmHostCapabilities {
@@ -5885,9 +5877,7 @@ pub fn register_components(
     engine: Arc<Engine2>,
     specs: &[ComponentSpec],
 ) -> anyhow::Result<usize> {
-    let _ = &db; // kept in the signature for backwards compatibility with
-                 // callers that once threaded an advanced-tier register call
-                 // through it — now a no-op.
+    let _ = &db; // reserved for a future database-level registration path
     let mut total = 0usize;
     for spec in specs {
         let loaded = {
@@ -5896,9 +5886,7 @@ pub fn register_components(
         };
         total += register_scalars(con, engine.clone(), &loaded.scalars)?;
         total += register_tables(con, engine.clone(), &loaded.tables)?;
-        let _ = db; // `db` is retained in the signature for compatibility with
-                    // callers that once threaded an advanced-tier register call
-                    // through it — now a no-op on every platform.
+        let _ = db; // reserved for a future database-level registration path
         match raw_con {
             Some(rc) => {
                 total += unsafe { register_aggregates(rc, engine.clone(), &loaded.aggregates)? };
@@ -6615,18 +6603,15 @@ mod tests {
         assert_eq!(out, 42);
     }
 
-    /// C-API-only namespace registration: without the advanced-tier shim,
-    /// `create_community_aliases` must still produce a callable
-    /// `<namespace>.<ours>(x)` binding by emitting `CREATE OR REPLACE
-    /// MACRO` in the namespace schema. This is what makes the
-    /// namespace-qualified surface work uniformly across every platform
-    /// via `CREATE OR REPLACE MACRO` in the namespace schema.
+    /// Namespace registration: `create_community_aliases` produces a
+    /// callable `<namespace>.<ours>(x)` binding by emitting
+    /// `CREATE OR REPLACE MACRO` in the namespace schema — works
+    /// uniformly across every platform on the stable C API.
     ///
-    /// Trade-off documented alongside: aggregate modifiers (DISTINCT /
-    /// FILTER / ORDER BY / OVER) don't propagate through a macro-aliased
-    /// aggregate — that limitation was the price of dropping the
-    /// internal-C++-ABI shim for portability. Community's original
-    /// function name still supports the modifiers.
+    /// Aggregate transparency: `create_community_aliases` now routes
+    /// aggregate aliases through a delegating C-API aggregate, so
+    /// DISTINCT / FILTER / GROUP BY propagate. This macro-only test
+    /// covers the SCALAR path only.
     #[test]
     fn alias_gen_namespace_registers_via_macro_when_shim_off() {
         let con = Connection::open_in_memory().expect("open");

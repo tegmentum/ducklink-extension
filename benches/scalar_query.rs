@@ -60,8 +60,7 @@ mod bundled {
             name: "sample_extension".to_string(),
             path,
         }];
-        // The advanced-tier `db` handle is unused by this bench (bundled DuckDB,
-        // common-tier only).
+        // No `db` handle needed — this bench uses only scalar registration.
         register_components(&con, Some(raw_con), None, engine, &specs)
             .expect("register components");
 

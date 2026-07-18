@@ -179,7 +179,7 @@ block, disabled by default, that mirrors the existing `plugin:` block but keys
 by digest and skips the community-extensions naming convention:
 
 ```bash
-# --- native (ducklink LOAD NATIVE) -------------------------------------------
+# --- native (ducklink_load(kind => 'native')) -------------------------------
 # NATIVE_FILES="aba=/path/to/aba.duckdb_extension creditcard=/path/to/..."
 # NATIVE_PLATFORM="linux_amd64"   (default: detect)
 for pair in $NATIVE_FILES; do

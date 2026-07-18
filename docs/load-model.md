@@ -11,27 +11,19 @@ until you name what you want:
 
 ```sql
 LOAD ducklink;
-DUCKLINK LOAD 'aba';                       -- WASM (default)
-SELECT aba_validate('021000021');          -- works
+FROM ducklink_load('aba');                       -- WASM (default)
+SELECT aba_validate('021000021');                -- works
 ```
 
-### Statement form
-
-```sql
-DUCKLINK LOAD '<name>' [WASM|NATIVE];
-```
-
-- Default kind: **WASM**. Safer trust posture (sandboxed; no `allow_unsigned_extensions` change needed).
-- `WASM` is redundant when the default is what you want; provided for symmetry.
-- `NATIVE` opts into the native `.duckdb_extension` build for perf, at the cost of `-unsigned`-required trust.
-
-### Function form
+### Call form
 
 ```sql
 FROM ducklink_load('<name>' [, kind => 'wasm' | 'native']);
 ```
 
-Same semantics, different surface. Useful when scripting, composing with `WHERE` clauses, or wanting the result summary in a query context.
+- Default kind: **WASM**. Safer trust posture (sandboxed; no `allow_unsigned_extensions` change needed).
+- `kind => 'wasm'` is redundant when the default is what you want; provided for symmetry.
+- `kind => 'native'` opts into the native `.duckdb_extension` build for perf, at the cost of `-unsigned`-required trust.
 
 ### Preloading via environment
 
@@ -52,7 +44,7 @@ Working around this from userspace requires either:
 - Intercepting all incoming SQL text (no such hook in DuckDB), or
 - Preloading everything at session start (unacceptable startup cost for 200+ modules).
 
-None of those are honest UX. We chose to require explicit `DUCKLINK LOAD` and be upfront about it.
+None of those are honest UX. We chose to require an explicit `ducklink_load()` call and be upfront about it.
 
 ## What's coming
 
@@ -65,7 +57,7 @@ LOAD ducklink;
 SELECT aba_validate('021000021');   -- ducklink autoloads aba WASM, query proceeds
 ```
 
-Until then: `DUCKLINK LOAD '<name>';` explicit, `DUCKLINK_COMPONENTS=…` env preload for known-set deployments.
+Until then: `FROM ducklink_load('<name>');` explicit, `DUCKLINK_COMPONENTS=…` env preload for known-set deployments.
 
 ## Collision resolution (when autoload eventually lands)
 
@@ -76,7 +68,7 @@ LOAD ducklink;
 SELECT some_shared_name('x');
 -- Error: 'some_shared_name' is exported by multiple ducklink modules:
 --   moduleA, moduleB, moduleC.
--- Load one explicitly:  DUCKLINK LOAD 'moduleA';
+-- Load one explicitly:  FROM ducklink_load('moduleA');
 ```
 
 This posture is safer than "first wins" (which introduces silent behaviour drift as the catalog grows) and clearer than "load them all" (which does more work than the user asked for and can introduce runtime cross-module conflicts).

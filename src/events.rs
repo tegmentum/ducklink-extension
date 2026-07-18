@@ -5,9 +5,9 @@
 //! fetches and fallbacks, cache hits/misses, blob downloads and sha256
 //! verification, provider selection, and the load lifecycle (start / ok /
 //! error). It is DELIBERATELY decoupled from the `DucklinkRuntime` handle — a
-//! plain `static` ring buffer — so ANY code path (catalog resolution deep in
-//! `catalog.rs`, the common-tier `ducklink_load` bind, the advanced-tier
-//! `LOAD WASM` bridge) can [`emit`] without threading a handle through.
+//! plain `static` ring buffer — so any code path (catalog resolution deep in
+//! `catalog.rs`, the `ducklink_load` bind, the `ducklink_prefix` bodies) can
+//! [`emit`] without threading a handle through.
 //!
 //! Every operation is panic-safe: a poisoned lock or a clock error is swallowed
 //! so instrumentation can NEVER break a load. Emitting is a best-effort side

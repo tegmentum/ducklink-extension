@@ -54,9 +54,7 @@ ducklink-runtime = { path = "runtime" }
 wasmtime = { version = "46.0.1", features = ["component-model"] }
 wasmtime-wasi = "46.0.1"
 anyhow = "1"
-# Parse the neutral plan-shape JSON the optimizer C++ shim flattens, into the
-# node tuples the component optimizer-dispatch consumes (advanced tier). Also
-# parses the published ducklink catalog (catalog.json / the bundled snapshot)
+# Parses the published ducklink catalog (catalog.json / the bundled snapshot)
 # for name->blob resolution in `ducklink_load`.
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

@@ -769,10 +769,8 @@ fn download_blob(digest: &str, name: &str) -> Result<Vec<u8>, String> {
 /// the matching native provider from the catalog. Native `.duckdb_extension`
 /// files are tightly coupled to a specific DuckDB version, so a strict-exact
 /// match is required. Kept in lock-step with the `libduckdb-sys` pin in
-/// `Cargo.toml` — the same version the advanced-tier C++ shim gates on. Shared
-/// with the common tier (visible to `ducklink.modules.native_available`) so the
-/// discovery view can decide native availability regardless of whether the
-/// `advanced` feature was built into this artifact.
+/// `Cargo.toml`; surfaced through `ducklink.modules.native_available` so the
+/// discovery view can decide native availability.
 pub const HOST_DUCKDB_VERSION: &str = "v1.5.4";
 
 /// DuckDB's platform identifier for this build, using DuckDB's own conventions
@@ -910,9 +908,7 @@ pub fn is_safe_identifier(s: &str) -> bool {
 ///                    skipped (users call community's name directly).
 ///
 /// When `ours_schema` is `Some`, the LHS becomes `<schema>.<ours>` so the
-/// alias is callable as `<schema>.<ours>(x)` from user SQL — this is the
-/// portable equivalent of what the advanced-tier catalog-alias shim used to
-/// do via `Catalog::CreateFunction` in a target schema, but implemented
+/// alias is callable as `<schema>.<ours>(x)` from user SQL. Implemented
 /// purely through DuckDB's own DDL so it works uniformly on every platform.
 ///
 /// Callers must first pass `ours`, `theirs`, `ours_schema` (if set), and
@@ -1509,9 +1505,8 @@ mod tests {
             s,
             "CREATE OR REPLACE MACRO sma(price, n) AS t_sma(price, n)"
         );
-        // Scalar — schema-qualified form. This is the C-API-only equivalent of
-        // what the advanced-tier catalog-alias shim used to do for the
-        // namespace-qualified `crypto.hash(x)` binding.
+        // Scalar — schema-qualified form. Produces the `crypto.hash(x)`
+        // binding via a CREATE MACRO in the target schema.
         let sq = build_alias_macro("scalar", Some("crypto"), "hash", "crypto_hash", &["x".into()])
             .expect("scalar schema-qualified");
         assert_eq!(

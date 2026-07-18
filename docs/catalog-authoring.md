@@ -351,38 +351,25 @@ implementation, so no signal is lost. A user who happens to know community
 uses `t_sma` can still call it directly; a user reading ducklink's docs
 sees `sma` and calls that.
 
-### How ducklink registers the alias, per build
+### How ducklink registers the alias
 
 After `LOAD <extension_name>` succeeds, ducklink discovers community's
 functions via `duckdb_functions()` and registers ducklink's chosen name
-per pair. The exact mechanism depends on which ducklink build is in use:
+per pair. Everything goes through the stable C API — same mechanism
+on every platform:
 
-* **Advanced-tier build (default in our distribution)** — the C++ shim
-  in `cpp/ducklink_alias.cpp` copies community's
-  `AggregateFunctionCatalogEntry` / `ScalarFunctionCatalogEntry` /
-  `TableFunctionCatalogEntry` into a fresh CatalogEntry under ducklink's
-  name. DuckDB's binder sees a real entry at the alias, so aggregate
-  `DISTINCT`, `FILTER (WHERE …)`, `ORDER BY`, and window-context
-  (`OVER (…)`) all work transparently through the alias. Zero per-row
-  overhead — same code path as calling community's original name.
+| Community kind | Registration | Modifiers |
+|---|---|---|
+| `scalar` | `CREATE OR REPLACE MACRO our(args) AS their(args);` | Inlined at plan time — zero overhead |
+| `table` / `table_macro` | `CREATE OR REPLACE MACRO our(args) AS TABLE SELECT * FROM their(args);` | Inlined at plan time — zero overhead |
+| `aggregate` | Real C-API `AggregateFunction` that delegates to `their` on a sibling connection | `DISTINCT` / `FILTER` / `GROUP BY` propagate transparently |
 
-* **Loadable-only build (the community-extensions CI ships this form —
-  `advanced` is stripped there)** — the shim isn't compiled in, so
-  ducklink falls back to `CREATE OR REPLACE MACRO`:
-
-  | Community kind | Macro emitted | Overhead |
-  |---|---|---|
-  | `scalar` | `CREATE OR REPLACE MACRO our(args) AS their(args);` | Inlined at plan time — zero |
-  | `table` / `table_macro` | `CREATE OR REPLACE MACRO our(args) AS TABLE SELECT * FROM their(args);` | Inlined at plan time — zero |
-  | `aggregate` (single-arg only) | `CREATE OR REPLACE MACRO our(x) AS list_aggregate(list(x), 'their');` | One `list()` build per group + `list_aggregate` dispatch |
-
-  In this build only, aggregate aliases do NOT propagate `DISTINCT` /
-  `FILTER` / `ORDER BY` / window modifiers, and multi-argument
-  aggregates are skipped. Community's original names remain callable —
-  a user who needs those modifiers writes `SELECT their_name(x)`.
-
-Same catalog authoring works for both builds — the aliasing story is
-build-transparent; only the mechanism differs.
+Aggregate ORDER-BY-inside and window `OVER (...)` don't currently
+propagate through the delegating wrapper — the sorted-aggregate /
+window C-API paths pass state through sparse arrays that the wrapper
+guards against but doesn't route. Community's original name remains
+callable with full modifier support (`SELECT their_name(x) ORDER BY
+...`).
 
 ### Function-name parity is a soft preference
 
@@ -395,8 +382,7 @@ the gap.
 
 ### Selection order when `kind: "native"` is requested
 
-`DUCKLINK LOAD 'name' NATIVE` and `FROM ducklink_load('name', kind => 'native')`
-consult providers in this order:
+`FROM ducklink_load('name', kind => 'native')` consults providers in this order:
 
 1. **community-native** if the entry has one — best trust posture (signed
    by the community key; no `-unsigned` needed); best perf (real native).
@@ -404,7 +390,7 @@ consult providers in this order:
    our own build, requires `-unsigned` because our signing key isn't in
    DuckDB's trust chain today.
 3. **Error** — no native backing available. The user should either use
-   the WASM path (`DUCKLINK LOAD 'name' WASM`, the default) or wait for
+   the WASM path (`ducklink_load('name')`, the default) or wait for
    a native provider to land.
 
 ### Example: names match — no aliasing needed
@@ -434,9 +420,9 @@ consult providers in this order:
 
 Behaviour:
 
-- `DUCKLINK LOAD 'shellfs';` → WASM (the safe default).
-- `DUCKLINK LOAD 'shellfs' WASM;` → WASM (explicit).
-- `DUCKLINK LOAD 'shellfs' NATIVE;` → routes to `INSTALL shellfs FROM community; LOAD shellfs;`. No aliases created because names already match; the user's `SELECT shellfs_read(...)` calls work either way.
+- `FROM ducklink_load('shellfs');` → WASM (the safe default).
+- `FROM ducklink_load('shellfs', kind => 'wasm');` → WASM (explicit).
+- `FROM ducklink_load('shellfs', kind => 'native');` → routes to `INSTALL shellfs FROM community; LOAD shellfs;`. No aliases created because names already match; the user's `SELECT shellfs_read(...)` calls work either way.
 
 ### Example: community uses a prefix — strip it via `community_prefix`
 
@@ -460,7 +446,7 @@ Community's tapa-technical-analysis extension registers everything as
 }
 ```
 
-`DUCKLINK LOAD 'ta' NATIVE;` INSTALLs + LOADs `tapa`, then generates
+`FROM ducklink_load('ta', kind => 'native');` INSTALLs + LOADs `tapa`, then generates
 `CREATE OR REPLACE MACRO sma(x) AS t_sma(x)`, etc. — one per exported
 function that matches the prefix. Both `SELECT sma(price)` and
 `SELECT t_sma(price)` work.
@@ -547,8 +533,8 @@ existing `providers[]`, not inside a provider):
 
 ### Load-time behaviour
 
-`DUCKLINK LOAD 'crypto' NATIVE` (or `ducklink_load('crypto', kind =>
-'native')`) INSTALLs the community extension, LOADs it, then:
+`FROM ducklink_load('crypto', kind => 'native')` INSTALLs the community
+extension, LOADs it, then:
 
 - **Without a `namespace`**: registers `hash` / `hash_agg` in `main`
   (existing behaviour).
@@ -586,7 +572,7 @@ crypto)`) as strings, so quoting is the price of C-API-only.
 
 Persistence: the declaration is stored in a `ducklink.prefixes(alias,
 namespace)` table inside the user's default catalog. On file-backed
-databases, `DUCKLINK LOAD 'crypto' NATIVE` after a reconnect
+databases, `FROM ducklink_load('crypto', kind => 'native')` after a reconnect
 automatically replays the persisted alias (no need to redeclare). On
 :memory: databases, prefixes die with the connection — the user's
 mental model matches DuckDB's own :memory: semantics.
@@ -640,7 +626,7 @@ worse than requiring an explicit opt-in.
 }
 ```
 
-After `DUCKLINK LOAD 'crypto' NATIVE`, users have `crypto_hash(x)`
+After `FROM ducklink_load('crypto', kind => 'native')`, users have `crypto_hash(x)`
 (community's own), `hash(x)` (ducklink's alias), and `crypto.hash(x)`
 (namespace-qualified) all working. Any user can layer
 `FROM ducklink_prefix('c', 'crypto');` to add `c.hash(x)`, persisted
