@@ -92,19 +92,18 @@ docs:
 
     When a native backing is a community extension, ducklink can re-expose its functions
     under its own chosen names via community-native aliases, keeping downstream SQL stable
-    across backing swaps. On the advanced tier the aliases are real catalog entries, so
-    DISTINCT, FILTER, ORDER BY, and window OVER clauses all propagate transparently through
-    aggregate aliases. On the loadable-only community-extensions build they are CREATE OR
-    REPLACE MACRO shapes: scalar and table zero-overhead, aggregate limited to plain GROUP BY.
+    across backing swaps. Scalar and table aliases are registered as CREATE OR REPLACE
+    MACRO shapes (zero overhead). Aggregate aliases are registered as real C-API
+    AggregateFunctions that delegate to the community target on a sibling connection, so
+    DISTINCT, FILTER, and GROUP BY propagate transparently through the alias.
 
     Catalog entries can further declare an optional `namespace` so their functions bind
     under both DuckDB's `main` schema (bare) and a schema-qualified form (`crypto.hash(x)`
     for `namespace: "crypto"`). Users layer session-scoped short aliases on top with
-    `DUCKLINK PREFIX c: crypto;` (persisted in `ducklink.prefixes` and replayed on the
-    next LOAD), and a parser-override hook rewrites SPARQL-flavored `c:hash(x)` to
-    `c.hash(x)` at parse time. All five forms — bare, ducklink-alias bare, namespace-
-    qualified, alias-qualified dot, alias-qualified colon — bind the same underlying
-    function set, so aggregate modifiers propagate through every one of them.
+    `FROM ducklink_prefix('c', 'crypto');` (persisted in `ducklink.prefixes` and replayed
+    on the next LOAD). All four forms — bare, ducklink-alias bare, namespace-qualified,
+    and alias-qualified — bind the same underlying function set, so aggregate modifiers
+    propagate through every one of them.
 
     A built-in `ducklink_version()` scalar is always available, so the
     extension is usable and testable before any module is loaded. For

@@ -3020,10 +3020,10 @@ pub fn register_load_function(
         loaded: Mutex::new(Vec::new()),
     });
     con.register_table_function::<WasmLoad>("ducklink_load")?;
-    // SPARQL-flavored alias schemas — the portable, C-API-only equivalent
-    // of the advanced-tier `DUCKLINK PREFIX c: crypto;` statement. Users
-    // invoke it as `FROM ducklink_prefix('c', 'crypto')`; the declaration
-    // is persisted in `ducklink.prefixes` and replayed on subsequent
+    // User-side alias schemas. `FROM ducklink_prefix('c', 'crypto')`
+    // creates a schema `c` and re-registers every function in schema
+    // `crypto` under `c.<fn>`. The declaration is persisted in
+    // `ducklink.prefixes` and replayed on subsequent
     // `ducklink_load('name', kind => 'native')` calls.
     con.register_table_function::<DucklinkPrefix>("ducklink_prefix")?;
     // The INTERNAL discovery table functions backing the public `ducklink.*`
@@ -3848,10 +3848,9 @@ fn type_name_to_code(name: &str) -> Result<u8, String> {
 }
 
 // ---------------------------------------------------------------------------
-// ducklink_prefix table function — SPARQL-flavored alias schemas on the C API.
+// ducklink_prefix table function — user-side alias schemas on the C API.
 //
-// Portable equivalent of the advanced-tier `DUCKLINK PREFIX c: crypto;`
-// statement: `FROM ducklink_prefix('c', 'crypto')` creates an alias schema
+// `FROM ducklink_prefix('c', 'crypto')` creates an alias schema
 // `c` populated with `CREATE OR REPLACE MACRO` entries mirroring every
 // function reachable in schema `crypto`. Both `crypto.hash(x)` and
 // `c.hash(x)` bind to the same underlying macro; users can layer whichever
@@ -4037,8 +4036,8 @@ fn replay_persisted_prefixes(con: &Connection) -> usize {
 }
 
 /// The `ducklink_prefix(alias, namespace)` table function: declares a
-/// SPARQL-flavored alias schema populated with C-API-only `CREATE OR
-/// REPLACE MACRO` entries. Returns a single-row summary
+/// user-side alias schema populated with C-API-only `CREATE OR REPLACE
+/// MACRO` entries. Returns a single-row summary
 /// `(alias, namespace, macros_created)`.
 struct DucklinkPrefix;
 
@@ -6578,8 +6577,8 @@ mod tests {
         assert_eq!(original, "sha2-256:ping");
     }
 
-    /// Portable equivalent of `DUCKLINK PREFIX c: crypto;` — the C-API-only
-    /// implementation. `create_prefix_aliases` populates the alias schema
+    /// `create_prefix_aliases` — the C-API-only implementation behind
+    /// `ducklink_prefix('c', 'crypto')`. Populates the alias schema
     /// with `CREATE OR REPLACE MACRO` entries mirroring the source schema.
     #[test]
     fn create_prefix_aliases_populates_alias_schema_via_macros() {

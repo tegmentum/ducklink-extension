@@ -267,9 +267,9 @@ pub struct CatalogEntry {
     pub namespace: Option<String>,
 
     /// Advisory short prefix hint for this entry's namespace. A discovery
-    /// signal for tools that want to suggest a default `DUCKLINK PREFIX`
-    /// alias to users (e.g. entry advertises `namespace: "crypto"` +
-    /// `prefix: "c"` → tools can suggest `DUCKLINK PREFIX c: crypto;`).
+    /// signal for tools that want to suggest a default alias to users
+    /// (e.g. entry advertises `namespace: "crypto"` + `prefix: "c"` →
+    /// tools can suggest `FROM ducklink_prefix('c', 'crypto');`).
     /// Does NOT auto-declare the prefix — users still opt in.
     #[serde(default)]
     pub prefix: Option<String>,
@@ -1203,7 +1203,7 @@ mod tests {
     fn namespace_and_prefix_round_trip_when_declared() {
         // A catalog entry that declares both fields deserializes into
         // `Some(...)`. Together these are what a community-native
-        // publisher writes to opt into the SPARQL-like prefix system:
+        // publisher writes to opt into the namespace + prefix system:
         // `crypto.hash(x)` becomes callable alongside `crypto_hash(x)`,
         // and tools can surface `c` as a suggested short alias.
         let json = r#"{
