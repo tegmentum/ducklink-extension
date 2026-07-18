@@ -91,7 +91,8 @@ docs:
     across backing swaps. Scalar and table aliases are registered as CREATE OR REPLACE
     MACRO shapes (zero overhead). Aggregate aliases are registered as real C-API
     AggregateFunctions that delegate to the community target on a sibling connection, so
-    DISTINCT, FILTER, and GROUP BY propagate transparently through the alias.
+    DISTINCT, FILTER, GROUP BY, OVER (...) window aggregates, and ORDER BY inside the
+    aggregate call all propagate transparently through the alias.
 
     Catalog entries can further declare an optional `namespace` so their functions bind
     under both DuckDB's `main` schema (bare) and a schema-qualified form (`crypto.hash(x)`

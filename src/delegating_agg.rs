@@ -17,14 +17,25 @@
 //!
 //! # Scope of the current implementation
 //!
-//! - Supports the common non-window / non-sorted-aggregate call shapes
-//!   (basic + `GROUP BY` + `DISTINCT` + `FILTER`). The C-API contract
-//!   DuckDB uses for `ORDER BY` inside the aggregate (sorted-aggregate
-//!   path) and `OVER` (window framework) passes states through a
-//!   sparse array that would need per-slot null checks — the current
-//!   code guards against nulls to avoid crashes but doesn't guarantee
-//!   correct semantics for those cases. A follow-up slice tightens
-//!   support once we've studied the sorted / window traversal.
+//! - Basic + `GROUP BY` + `DISTINCT` + `FILTER` — modifier propagation
+//!   through DuckDB's binder before the update callback ever sees a row.
+//! - `OVER (...)` window aggregates, including running windows via
+//!   `ORDER BY` inside `OVER`. Two contract details matter here:
+//!   - `combine` is non-destructive (clones rather than moves rows out
+//!     of the source), because DuckDB's segment-tree windowing may
+//!     combine the same source into several targets.
+//!   - `build_delegation_sql` emits `n_rows` synthetic rows when every
+//!     input column is constant across the group; the old one-row form
+//!     silently dropped cardinality (`sum(20) FROM (VALUES (1))` = 20
+//!     for two rows of value 20 instead of the correct 40).
+//! - `ORDER BY <expr>` INSIDE the aggregate call (sorted-aggregate
+//!   path) — supported IF the target aggregate is order-sensitive AND
+//!   the delegation SQL preserves DuckDB's supplied row order through
+//!   the `VALUES` clause. Sensitive aggregates like `string_agg` see
+//!   their input pre-sorted by DuckDB's sorted-aggregate wrapper before
+//!   our `update` callback runs, so our accumulator holds rows in the
+//!   right order; the `VALUES ... t(cN)` shape then hands them to the
+//!   target aggregate in insertion order.
 //! - Row-major state; per-row values are stored as `duckdb::types::Value`.
 //! - Multi-column signatures via row-major accumulation.
 //! - Types supported today: `BIGINT`, `INTEGER`, `DOUBLE`, `VARCHAR`,
@@ -215,8 +226,14 @@ pub unsafe extern "C" fn combine(
         if src.is_null() || tgt.is_null() {
             continue;
         }
-        let src_rows = std::mem::take(&mut (*src).rows);
-        (*tgt).rows.extend(src_rows);
+        // Clone rather than `mem::take`: DuckDB's window framework uses
+        // segment trees over partial states and may combine the same
+        // source into multiple targets (a stable segment-tree node feeds
+        // several overlapping frames). A destructive move would leave the
+        // source empty on the second visit, so later frames see only the
+        // rows appended after the destructive combine — the bug the OVER
+        // (...) snapshot test surfaced.
+        (*tgt).rows.extend((*src).rows.iter().cloned());
     }
 }
 
@@ -412,10 +429,25 @@ fn build_delegation_sql(
 
     if varying_ct == 0 {
         // All columns are constants — every row's target call is
-        // identical; degenerate case, just call once on a synthetic row.
-        // Reachable when the target aggregate is called with every arg
-        // constant across the group. Very rare in practice.
-        sql.push_str(" FROM (VALUES (1))");
+        // identical, but the ROW COUNT still matters (sum, count, avg,
+        // string_agg all depend on it). Emit `nrows` synthetic rows so
+        // the target aggregate sees exactly the same cardinality it
+        // would if the columns had varied.
+        //
+        // Reachable most often through window aggregates: a frame with
+        // repeated values (a running sum over [20,20,10] visits the
+        // (20,20) prefix) collapses to constant-inlining. Emitting one
+        // synthetic row would produce `sum(20) FROM (VALUES (1))` = 20
+        // instead of the correct 40 — the bug the OVER (...) snapshot
+        // test surfaced.
+        sql.push_str(" FROM (VALUES ");
+        for r in 0..nrows {
+            if r > 0 {
+                sql.push(',');
+            }
+            sql.push_str("(1)");
+        }
+        sql.push(')');
         return sql;
     }
 

@@ -6960,6 +6960,98 @@ mod tests {
         assert_eq!(groups[1].1.split(',').count(), 4);
     }
 
+    /// Window aggregates through a delegating alias produce the SAME
+    /// per-row output as the target aggregate does natively — for both
+    /// full-partition and running (`ORDER BY inside OVER`) window
+    /// frames.
+    ///
+    /// This asserts two fixes in `delegating_agg`:
+    ///
+    /// 1. `combine` clones its source rather than moving. DuckDB's
+    ///    window framework uses segment trees over partial states and
+    ///    may combine the SAME source into multiple targets; a
+    ///    destructive move would empty the source on the second visit.
+    /// 2. `build_delegation_sql`'s all-columns-constant path emits N
+    ///    synthetic rows, not one. A running-sum frame containing
+    ///    repeated values (two rows both with x=20) used to collapse
+    ///    into `sum(20) FROM (VALUES (1))` = 20 instead of 40.
+    #[test]
+    fn delegating_aggregate_over_window_matches_target() {
+        use duckdb::ffi;
+        use std::sync::{Arc, Mutex};
+
+        let (raw_con, con, sibling) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let sibling = con.try_clone().expect("clone");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con, sibling)
+        };
+        let sibling = Arc::new(Mutex::new(sibling));
+
+        use crate::delegating_agg::{register_delegating_aggregate, T_BIGINT};
+        unsafe {
+            register_delegating_aggregate(
+                raw_con,
+                "total",
+                "sum",
+                vec![T_BIGINT],
+                T_BIGINT,
+                sibling,
+            )
+            .expect("register total");
+        }
+
+        con.execute_batch(
+            "CREATE TABLE t(g INTEGER, x BIGINT, ord INTEGER); \
+             INSERT INTO t VALUES \
+               (1,10,3),(1,20,1),(1,20,2),(2,30,2),(2,40,1);",
+        )
+        .expect("seed");
+
+        let collect = |sql: &str| -> Vec<(i32, i64, Option<i64>)> {
+            let mut s = con.prepare(sql).expect("prepare");
+            s.query_map([], |r| {
+                Ok((
+                    r.get::<usize, i32>(0)?,
+                    r.get::<usize, i64>(1)?,
+                    r.get::<usize, Option<i64>>(2)?,
+                ))
+            })
+            .expect("query")
+            .filter_map(Result::ok)
+            .collect()
+        };
+
+        // Full-partition window: `sum(x) OVER (PARTITION BY g)`.
+        let native = collect(
+            "SELECT g, x, sum(x) OVER (PARTITION BY g) FROM t ORDER BY g, ord",
+        );
+        let ours = collect(
+            "SELECT g, x, total(x) OVER (PARTITION BY g) FROM t ORDER BY g, ord",
+        );
+        assert_eq!(ours, native, "OVER (PARTITION BY g) must match native");
+
+        // Running window: `sum(x) OVER (PARTITION BY g ORDER BY ord)`.
+        // Group 1 has values [20,20,10] in ord order — the running sums
+        // 20, 40, 50 exercise the repeat-value degenerate path.
+        let native = collect(
+            "SELECT g, x, sum(x) OVER (PARTITION BY g ORDER BY ord) FROM t ORDER BY g, ord",
+        );
+        let ours = collect(
+            "SELECT g, x, total(x) OVER (PARTITION BY g ORDER BY ord) FROM t ORDER BY g, ord",
+        );
+        assert_eq!(
+            ours, native,
+            "running window (ORDER BY inside OVER) must match native"
+        );
+    }
+
     /// End-to-end: `create_community_aliases` detects an aggregate
     /// function type in its scan and registers a REAL delegating
     /// aggregate under ducklink's chosen name. Modifiers propagate

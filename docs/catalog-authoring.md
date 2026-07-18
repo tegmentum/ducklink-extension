@@ -362,14 +362,13 @@ on every platform:
 |---|---|---|
 | `scalar` | `CREATE OR REPLACE MACRO our(args) AS their(args);` | Inlined at plan time — zero overhead |
 | `table` / `table_macro` | `CREATE OR REPLACE MACRO our(args) AS TABLE SELECT * FROM their(args);` | Inlined at plan time — zero overhead |
-| `aggregate` | Real C-API `AggregateFunction` that delegates to `their` on a sibling connection | `DISTINCT` / `FILTER` / `GROUP BY` propagate transparently |
+| `aggregate` | Real C-API `AggregateFunction` that delegates to `their` on a sibling connection | `DISTINCT` / `FILTER` / `GROUP BY` / `OVER (...)` / `ORDER BY` inside the call all propagate transparently |
 
-Aggregate ORDER-BY-inside and window `OVER (...)` don't currently
-propagate through the delegating wrapper — the sorted-aggregate /
-window C-API paths pass state through sparse arrays that the wrapper
-guards against but doesn't route. Community's original name remains
-callable with full modifier support (`SELECT their_name(x) ORDER BY
-...`).
+The delegating wrapper is a real `AggregateFunction`, so DuckDB's
+binder handles every modifier the same way it would for the community
+target. Window aggregates go through DuckDB's segment-tree machinery
+without needing a `remove` callback (we don't ship one — the wrapper
+supplies a non-destructive `combine`).
 
 ### Function-name parity is a soft preference
 
