@@ -42,18 +42,6 @@ pub mod catalog;
 #[cfg(feature = "duckdb-api")]
 pub mod reg_duckdb;
 
-/// The advanced dispatch tier (PARSER / OPTIMIZER / table FILTER pushdown): the
-/// Rust side of the C++ shim that binds DuckDB's internal C++ ABI. Compiled in
-/// only when the `advanced` feature is built AND the C++ shim was compiled —
-/// build.rs sets the `advanced_tier` cfg for non-Windows `--features advanced`
-/// builds. The DEFAULT community build does NOT enable `advanced` (it is off by
-/// default), and the shim's deferred-undefined-symbol linking model has no
-/// portable Windows PE/COFF equivalent, so on the default build and on Windows
-/// this module — along with every reference to its FFI — is compiled out,
-/// leaving the common tier only (scalar/table/aggregate on the stable C API)
-/// with a trivial build script and no undefined internal symbols.
-#[cfg(advanced_tier)]
-pub mod advanced;
 
 #[cfg(feature = "loadable")]
 mod loadable {
@@ -73,37 +61,18 @@ mod loadable {
         HostCaps,
     };
 
-    // The advanced-tier C++ shim, compiled against DuckDB's internal headers and
-    // linked into this extension (see build.rs). Internal C++ symbols it
-    // references are resolved at LOAD time against the host DuckDB. Only present
-    // in `advanced_tier` builds (non-Windows `--features advanced`); on the
-    // default community build and on Windows the shim is not compiled, so this
-    // declaration — and every call into it — is gated off, leaving no undefined
-    // internal symbol in the cdylib.
-    #[cfg(advanced_tier)]
-    extern "C" {
-        fn ducklink_advanced_probe(db: *mut std::ffi::c_void) -> i32;
-        /// Install the component-driven ParserExtension on `db` (idempotent).
-        /// Registered unconditionally when the advanced tier is active so the
-        /// `LOAD WASM '<name>'` statement is recognized even before any
-        /// component declares a parser of its own.
-        fn ducklink_register_parser(db: *mut std::ffi::c_void) -> i32;
-    }
-
-    /// The EXACT DuckDB version this extension's advanced-tier C++ shim was
-    /// compiled against, locked to the `libduckdb-sys` pin in `Cargo.toml`
-    /// (`1.10504.0` = DuckDB v1.5.4). The advanced tier (parser / optimizer /
-    /// filter pushdown) binds DuckDB's INTERNAL C++ ABI, which is NOT stable
-    /// across DuckDB versions, so it is enabled ONLY when the host DuckDB reports
-    /// this exact version. Keep in lock-step with the `duckdb` / `libduckdb-sys`
-    /// pin (a DuckDB bump re-anchors this one string + the C++ shim headers).
+    /// The minimum DuckDB C Extension API version this build targets. Passed
+    /// to `duckdb_rs_extension_api_init`; the loader accepts any host >=
+    /// this version (forward-compatible on the stable C API). Keep in
+    /// lock-step with the `libduckdb-sys` pin.
     const DUCKDB_ABI_VERSION: &str = "v1.5.4";
 
-    /// The host DuckDB's reported library version, read through the STABLE C API
-    /// (`duckdb_library_version`, populated in the loadable function-pointer
-    /// table by the API init above). `None` if the pointer is null or not UTF-8.
-    /// This is the gate that keeps a version mismatch from ever calling an
-    /// internal-ABI symbol.
+    /// The host DuckDB's reported library version, read through the stable C
+    /// API (`duckdb_library_version`, populated in the loadable
+    /// function-pointer table by the API init above). `None` if the pointer
+    /// is null or not UTF-8. Reported in `ducklink.host` for diagnostics —
+    /// no runtime gate depends on it anymore now that ducklink is
+    /// C-API-only.
     unsafe fn host_library_version() -> Option<String> {
         let ptr = ffi::duckdb_library_version();
         if ptr.is_null() {
@@ -262,86 +231,14 @@ mod loadable {
         // the host process. That ABI is NOT stable across DuckDB versions, so
         // calling into it on a host that differs from the version the shim was
         // compiled against could crash or corrupt state. We therefore enable the
-        // advanced tier ONLY when the host reports the EXACT built-against version
-        // and otherwise DEGRADE GRACEFULLY to the common tier (scalar / table /
-        // aggregate, all on the stable C API) — never touching an internal-ABI
-        // symbol (not even the probe). `DUCKLINK_DISABLE_ADVANCED` forces the
-        // degraded path regardless (testing / belt-and-suspenders).
-        //
-        // Note the stable C-API init above is a *minimum*-version check (forward
-        // compatible), so a NEWER host loads the common tier fine; this exact
-        // gate is what disables the unstable tier on that newer host.
+        // ducklink is C-API-only across every platform — no internal-C++-ABI
+        // shim, no per-platform capability drift. The version string is still
+        // read for the `ducklink.host` discovery view, but nothing runtime-
+        // meaningful gates on it anymore.
         let host_version = host_library_version();
-        let forced_off = std::env::var_os("DUCKLINK_DISABLE_ADVANCED").is_some();
 
-        // When the advanced tier is not compiled into this artifact (the default
-        // community build, or Windows — no C++ shim is built, see build.rs / the
-        // gated `advanced` module), it is always disabled at compile time and no
-        // internal-ABI symbol is ever referenced. When it IS compiled in
-        // (`advanced_tier`), the version guard enables it ONLY when the host
-        // reports the EXACT built-against DuckDB version, degrading gracefully to
-        // the common tier otherwise.
-        #[cfg(not(advanced_tier))]
-        let advanced_enabled = false;
-        #[cfg(advanced_tier)]
-        let advanced_enabled =
-            !forced_off && host_version.as_deref() == Some(DUCKDB_ABI_VERSION);
-
-        #[cfg(advanced_tier)]
-        if advanced_enabled {
-            // Internal C++ ABI call, resolved at load against the matching host:
-            // dereference the database to its internal DBConfig as a load-time
-            // proof the shim is reachable and the ABI resolved. Discarded — a
-            // segfault here would be the signal, not the value; the enabled
-            // state is queryable via `ducklink.capabilities`.
-            let _ = ducklink_advanced_probe(db.cast());
-            // Install the component-driven ParserExtension now (idempotent), so
-            // `LOAD WASM '<name>'` is recognized from the first statement — it
-            // routes through the parser bridge to the `ducklink_load` loader,
-            // independent of whether any component has declared a parser yet.
-            let prc = ducklink_register_parser(db.cast());
-            if prc != 0 {
-                eprintln!("[ducklink] failed to install LOAD WASM parser extension (rc={prc})");
-            }
-        } else {
-            let host = host_version.as_deref().unwrap_or("unknown");
-            let reason = if forced_off {
-                "forced off via DUCKLINK_DISABLE_ADVANCED".to_string()
-            } else {
-                format!("host DuckDB {host} does not match the built-against {DUCKDB_ABI_VERSION}")
-            };
-            eprintln!(
-                "[ducklink] advanced tier DISABLED ({reason}); parser / optimizer / \
-                 filter-pushdown are unavailable on this host. Common tier \
-                 (scalar/table/aggregate) is active."
-            );
-        }
-        #[cfg(not(advanced_tier))]
-        {
-            // Reference the otherwise-unused inputs so the common-tier-only build
-            // stays warning-clean.
-            let _ = (&host_version, forced_off);
-            let why = if cfg!(target_os = "windows") {
-                "not built on Windows (no portable PE/COFF equivalent)"
-            } else {
-                "not built in this artifact (build with --features advanced to enable)"
-            };
-            eprintln!(
-                "[ducklink] advanced tier {why}; parser / optimizer / \
-                 filter-pushdown are unavailable here. Common tier \
-                 (scalar/table/aggregate) is active."
-            );
-        }
-
-        // Record the host capability profile for the `ducklink.capabilities`
-        // discovery view (and the `ducklink.modules.compatible` column). Captures
-        // the tier gate decision just made, whether the advanced tier is compiled
-        // into this artifact at all, the host DuckDB version, and the wasm ABI.
         set_host_caps(HostCaps {
-            advanced_enabled,
-            advanced_built: cfg!(advanced_tier),
             host_version: host_version.clone(),
-            built_against: DUCKDB_ABI_VERSION.to_string(),
             abi_version: ducklink_runtime::CONTRACT_VERSION.to_string(),
         });
 
@@ -377,13 +274,11 @@ mod loadable {
         }
 
         let specs = component_specs_from_env();
-        // Only hand the raw `db` to the registrar when the advanced tier is
-        // enabled; with `None`, `register_components` skips ALL internal-ABI C++
-        // shim registration (parser / optimizer / filterable tables) and wires
-        // only the stable-C-API common tier.
-        let advanced_db = advanced_enabled.then_some(db);
+        // `db` is retained in the signature for backwards compatibility with
+        // callers that once threaded an advanced-tier register call through
+        // it — now a no-op inside register_components.
         let registered =
-            register_components(&con, have_raw.then_some(raw_con), advanced_db, engine, &specs)
+            register_components(&con, have_raw.then_some(raw_con), Some(db), engine, &specs)
                 .map_err(stringify)?;
 
         // The aggregate functions are now in the database catalog; the sibling

@@ -2919,24 +2919,16 @@ fn capture_live_sigs(loaded: &crate::engine::LoadedComponent) -> Vec<LoadedFuncS
     out
 }
 
-/// The host capability profile captured at `LOAD ducklink` time: which tiers are
-/// active on THIS artifact + host, so `ducklink_host_capabilities()` can report them
-/// and `ducklink_modules().compatible` can be decided. Set once by the entry
-/// point via [`set_host_caps`]; read by the capability + module views.
+/// The host capability profile captured at `LOAD ducklink` time. Ducklink
+/// is C-API-only across every platform now, so the only fields carried are
+/// the reported DuckDB library version (informational, for
+/// `ducklink.host`) and the wasm component contract version this host
+/// speaks (used by `ducklink.modules.compatible`). Set once by the entry
+/// point via [`set_host_caps`].
 #[derive(Clone, Default)]
 pub struct HostCaps {
-    /// The advanced tier (parser / optimizer / internal-ABI) is active: the
-    /// artifact was built with `--features advanced` AND the host DuckDB version
-    /// matched the built-against gate.
-    pub advanced_enabled: bool,
-    /// The advanced tier was compiled into this artifact at all (`cfg(advanced_tier)`).
-    pub advanced_built: bool,
     /// The host DuckDB library version string, if known.
     pub host_version: Option<String>,
-    /// The DuckDB version this artifact's advanced tier was built against (the
-    /// exact-version gate). The advanced tier is active only when `host_version`
-    /// equals this.
-    pub built_against: String,
     /// The wasm component ABI / WIT contract version this host speaks.
     pub abi_version: String,
 }
@@ -2978,26 +2970,14 @@ const COMMON_TIER_KINDS: &[&str] = &[
     "compose-dynlink",
 ];
 
-/// The capability kinds the ADVANCED tier adds (internal C++ ABI). Present only
-/// when the advanced tier is active on this host.
-const ADVANCED_TIER_KINDS: &[&str] =
-    &["parser", "optimizer", "storage", "index", "catalog", "query", "window"];
-
-/// True when THIS host can satisfy every capability `kind` in `requires`. The
-/// common tier is always available; advanced-only kinds need the advanced tier
-/// active. An unknown kind is treated as advanced-only (conservative: report it
-/// incompatible unless the advanced tier is up).
-fn module_compatible(requires: &[String], caps: &HostCaps) -> bool {
-    requires.iter().all(|r| {
-        if COMMON_TIER_KINDS.contains(&r.as_str()) {
-            true
-        } else if ADVANCED_TIER_KINDS.contains(&r.as_str()) {
-            caps.advanced_enabled
-        } else {
-            // Unknown / host-component requirement: satisfiable only if advanced.
-            caps.advanced_enabled
-        }
-    })
+/// True when THIS host can satisfy every capability `kind` in `requires`.
+/// Ducklink ships the common tier only across every platform now; anything
+/// outside `COMMON_TIER_KINDS` is unsatisfied. Modules requiring parser /
+/// optimizer / storage / etc. are marked incompatible everywhere.
+fn module_compatible(requires: &[String], _caps: &HostCaps) -> bool {
+    requires
+        .iter()
+        .all(|r| COMMON_TIER_KINDS.contains(&r.as_str()))
 }
 
 // SAFETY: `db` is a stable, process-lifetime handle DuckDB owns; we only read it
@@ -4506,27 +4486,9 @@ impl VTab for WasmHostCapabilities {
             bind.add_result_column("available", LogicalTypeHandle::from(LogicalTypeId::Boolean));
             bind.add_result_column("detail", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
-            let caps = host_caps();
-            let adv_detail = if caps.advanced_enabled {
-                format!(
-                    "advanced tier: active (host DuckDB {})",
-                    caps.host_version.as_deref().unwrap_or("unknown"),
-                )
-            } else if caps.advanced_built {
-                format!(
-                    "advanced tier: built but inactive (requires osx/linux + host DuckDB {}; host reports {})",
-                    caps.built_against,
-                    caps.host_version.as_deref().unwrap_or("unknown")
-                )
-            } else {
-                "advanced tier: not built in this artifact (build with --features advanced to enable)".to_string()
-            };
-
-            // One row per DEDUPED tier kind. Common-tier kinds are always
-            // available; advanced-tier kinds gate on the tier state captured
-            // at load. `catalog` is intentionally listed in both tier
-            // constants (any host provides it), so it emits a single
-            // common-tier row here.
+            // Ducklink ships the C-API common tier only on every platform.
+            // One row per common-tier kind; deduped in case the constant
+            // ever grows synonyms.
             let mut rows: Vec<HostCapabilityRow> = Vec::new();
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for name in COMMON_TIER_KINDS {
@@ -4538,25 +4500,6 @@ impl VTab for WasmHostCapabilities {
                     });
                 }
             }
-            for name in ADVANCED_TIER_KINDS {
-                if seen.insert(*name) {
-                    rows.push(HostCapabilityRow {
-                        name: (*name).to_string(),
-                        available: caps.advanced_enabled,
-                        detail: adv_detail.clone(),
-                    });
-                }
-            }
-            // `LOAD WASM 'name'` — the SQL statement — is gated on the parser
-            // hook installed only when the advanced tier is active. Not in
-            // the tier-kind constants (it's a host feature, not something a
-            // module declares), but useful to advertise here alongside the
-            // kinds that gate on the same thing.
-            rows.push(HostCapabilityRow {
-                name: "load_wasm".to_string(),
-                available: caps.advanced_enabled,
-                detail: adv_detail,
-            });
             rows.sort_by(|a, b| a.name.cmp(&b.name));
 
             Ok(WasmHostCapabilitiesBind { rows })
@@ -4612,8 +4555,6 @@ impl VTab for WasmHostCapabilities {
 struct HostRow {
     wasm_abi: String,
     duckdb_version: String,
-    duckdb_built_against: String,
-    advanced_tier: String,
 }
 
 struct WasmHostBind {
@@ -4621,9 +4562,8 @@ struct WasmHostBind {
 }
 
 /// `ducklink_host()` — a single-row view of host metadata: the WIT contract
-/// version this host speaks (`wasm_abi`, in `duckdb:extension@X.Y.Z` form),
-/// the host DuckDB version, the DuckDB version the advanced tier was compiled
-/// against, and the advanced tier's current state.
+/// version this host speaks (`wasm_abi`, in `duckdb:extension@X.Y.Z` form)
+/// and the host DuckDB library version.
 struct WasmHost;
 
 impl VTab for WasmHost {
@@ -4635,27 +4575,15 @@ impl VTab for WasmHost {
             let vc = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
             bind.add_result_column("wasm_abi", vc());
             bind.add_result_column("duckdb_version", vc());
-            bind.add_result_column("duckdb_built_against", vc());
-            bind.add_result_column("advanced_tier", vc());
 
             let caps = host_caps();
             let wasm_abi = normalize_generation(Some(caps.abi_version.clone()));
             let duckdb_version = caps.host_version.clone().unwrap_or_default();
-            let advanced_tier = if caps.advanced_enabled {
-                "active"
-            } else if caps.advanced_built {
-                "inactive"
-            } else {
-                "not_built"
-            }
-            .to_string();
 
             Ok(WasmHostBind {
                 row: HostRow {
                     wasm_abi,
                     duckdb_version,
-                    duckdb_built_against: caps.built_against.clone(),
-                    advanced_tier,
                 },
             })
         })
@@ -4674,7 +4602,6 @@ impl VTab for WasmHost {
         guard("ducklink_host scan", || {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
-            // Exactly one row, emitted on the first scan.
             let start = init.cursor.load(Ordering::Relaxed);
             let n = 1usize.saturating_sub(start);
             if n == 0 {
@@ -4683,8 +4610,6 @@ impl VTab for WasmHost {
             }
             output.flat_vector(0).insert(0, bind.row.wasm_abi.as_str());
             output.flat_vector(1).insert(0, bind.row.duckdb_version.as_str());
-            output.flat_vector(2).insert(0, bind.row.duckdb_built_against.as_str());
-            output.flat_vector(3).insert(0, bind.row.advanced_tier.as_str());
             init.cursor.store(1, Ordering::Relaxed);
             output.set_len(1);
             Ok(())
@@ -5720,11 +5645,9 @@ pub fn register_components(
     engine: Arc<Engine2>,
     specs: &[ComponentSpec],
 ) -> anyhow::Result<usize> {
-    // The advanced-tier `db` handle is unused when the advanced module is not
-    // compiled in (the default community build, or Windows); reference it so the
-    // common-tier-only build is clean.
-    #[cfg(not(advanced_tier))]
-    let _ = &db;
+    let _ = &db; // kept in the signature for backwards compatibility with
+                 // callers that once threaded an advanced-tier register call
+                 // through it — now a no-op.
     let mut total = 0usize;
     for spec in specs {
         let loaded = {
@@ -6154,12 +6077,12 @@ mod tests {
             // ducklink.host_capabilities always has the common-tier rows.
             let n_caps: i64 = con
                 .query_row(
-                    "SELECT count(*) FROM ducklink.host_capabilities WHERE name IN ('scalar','load_wasm')",
+                    "SELECT count(*) FROM ducklink.host_capabilities WHERE name IN ('scalar','table')",
                     [],
                     |r| r.get(0),
                 )
                 .expect("capabilities rows");
-            assert_eq!(n_caps, 2, "scalar + load_wasm capability rows present");
+            assert_eq!(n_caps, 2, "scalar + table capability rows present");
 
             // ducklink.module_compatibility lists aba's provider row (its
             // provider carries a stale @2.2.0 abi label). aba is a gen-4 ENTRY,
@@ -6397,9 +6320,6 @@ mod tests {
         // Simulate a community-registered scalar under community's name.
         con.execute("CREATE MACRO t_add_one(x) AS x + 1", [])
             .expect("create t_add_one");
-        // Pass null raw_conn — these tests exercise the macro fallback
-        // path uniformly (the C++ shim would only fire when advanced_tier
-        // is compiled AND raw_conn is live).
         let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
             .expect("alias gen");
         assert!(n >= 1, "expected >=1 alias, got {n}");
@@ -6446,9 +6366,6 @@ mod tests {
         let con = Connection::open_in_memory().expect("open");
         con.execute("CREATE MACRO t_double(x) AS x * 2", [])
             .expect("create t_double");
-        // Pass null raw_conn — these tests exercise the macro fallback
-        // path uniformly (the C++ shim would only fire when advanced_tier
-        // is compiled AND raw_conn is live).
         let n = create_community_aliases(&con, &spec_with(Some("t_"), &[]))
             .expect("alias gen");
         assert!(n >= 1);
@@ -6462,8 +6379,8 @@ mod tests {
     /// `create_community_aliases` must still produce a callable
     /// `<namespace>.<ours>(x)` binding by emitting `CREATE OR REPLACE
     /// MACRO` in the namespace schema. This is what makes the
-    /// namespace-qualified surface work uniformly across every platform,
-    /// including Linux (where advanced_tier is off).
+    /// namespace-qualified surface work uniformly across every platform
+    /// via `CREATE OR REPLACE MACRO` in the namespace schema.
     ///
     /// Trade-off documented alongside: aggregate modifiers (DISTINCT /
     /// FILTER / ORDER BY / OVER) don't propagate through a macro-aliased

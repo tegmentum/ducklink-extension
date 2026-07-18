@@ -18,16 +18,13 @@ name = "ducklink"
 [features]
 # The community-extensions CI runs a plain `cargo build --release` (no
 # --features), so the loadable .duckdb_extension build must be the default.
-# `advanced` ships the internal-C++-ABI tier (the `LOAD WASM` statement);
-# it auto-compiles out on Windows (build.rs) and community-extensions
-# rebuilds per DuckDB version, so the exact-version gate self-aligns.
 # `network` pulls in reqwest + rustls + sha2 for HTTPS catalog fetch and
 # blob download-and-verify; without it, the extension serves only the
 # bundled snapshot and refuses to download uncached blobs (~5-8 MB smaller
 # binary, for air-gapped / minimal-distribution use).
-default = ["loadable", "advanced", "network"]
-# Code that talks to the duckdb crate: the Direction-2 registration + dispatch
-# bridge (reg_duckdb.rs).
+default = ["loadable", "network"]
+# Code that talks to the duckdb crate: the registration + dispatch bridge
+# (reg_duckdb.rs).
 duckdb-api = ["dep:duckdb", "duckdb/vscalar"]
 # Build the loadable .duckdb_extension (links the DuckDB C Extension API,
 # resolved by the loading process). The deployable artifact.
@@ -39,21 +36,9 @@ loadable = [
 ]
 # Compile an in-process DuckDB from source, for the end-to-end Rust tests.
 bundled = ["duckdb-api", "duckdb/bundled"]
-# The ADVANCED native dispatch tier (parser / optimizer / table FILTER
-# pushdown). It binds DuckDB's INTERNAL C++ ABI through a C++ shim compiled by
-# build.rs (pulls the `cc` build-dependency) and is therefore OPT-IN and OFF by
-# default: the community-extensions CI runs a plain `cargo build --release`
-# (default features only), so it gets the COMMON tier with a trivial no-op build
-# script — guaranteed-portable across every platform (this is why v0.4.0, which
-# had no build.rs, built green everywhere). Our own native distribution builds
-# `--features loadable,advanced` to ship the full tier. The shim has no portable
-# Windows PE/COFF equivalent, so it is compiled out on Windows regardless (see
-# build.rs).
-advanced = ["dep:cc", "duckdb-api"]
 # HTTPS catalog fetch + on-demand blob download. Pulls in reqwest + rustls +
 # webpki-roots + sha2. Enabled by default; disable for air-gapped or
-# minimum-binary-size builds (`cargo build --release --no-default-features
-# --features loadable,advanced`). Without `network`, ducklink resolves only
+# minimum-binary-size builds. Without `network`, ducklink resolves only
 # names in the bundled snapshot AND refuses to load anything not already in
 # the on-disk cache.
 network = ["dep:reqwest", "dep:sha2"]
@@ -88,16 +73,6 @@ sha2 = { version = "0.10", optional = true }
 # the community-extensions CI builds against (v1.5.4); bumped per release.
 duckdb = { version = "1.10504.0", optional = true, default-features = false }
 libduckdb-sys = { version = "1.10504.0", features = ["loadable-extension"], optional = true }
-
-[build-dependencies]
-# Compiles the advanced-tier C++ shim (cpp/ducklink_*.cpp) against DuckDB's
-# INTERNAL headers and links it into the loadable extension. Headers are taken
-# from the version-locked libduckdb-sys bundled source (v1.5.4). See build.rs.
-# OPTIONAL and gated behind the `advanced` feature so the DEFAULT (community)
-# build does not pull `cc` into the build script at all — the build-script-build
-# binary then links exactly like the trivial runtime one (which builds green in
-# the community macOS CI), instead of the cc-linked one that fails to exec there.
-cc = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
