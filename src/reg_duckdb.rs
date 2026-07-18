@@ -7052,6 +7052,328 @@ mod tests {
         );
     }
 
+    /// Stress test — every remaining window-frame shape and every
+    /// order-sensitive aggregate we can hit with the currently-supported
+    /// type codes. Each case asserts the delegating alias matches
+    /// DuckDB's native output row-for-row (or, for the not-yet-supported
+    /// shapes, asserts they FAIL rather than silently producing wrong
+    /// numbers). Read as a survey of what does and doesn't work.
+    #[test]
+    fn delegating_aggregate_window_stress() {
+        use duckdb::ffi;
+        use std::sync::{Arc, Mutex};
+
+        let (raw_con, con, sibling) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let sibling = con.try_clone().expect("clone");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con, sibling)
+        };
+        let sibling = Arc::new(Mutex::new(sibling));
+
+        use crate::delegating_agg::{
+            register_delegating_aggregate, T_BIGINT, T_DOUBLE, T_VARCHAR,
+        };
+        unsafe {
+            register_delegating_aggregate(
+                raw_con,
+                "total",
+                "sum",
+                vec![T_BIGINT],
+                T_BIGINT,
+                sibling.clone(),
+            )
+            .expect("total");
+            register_delegating_aggregate(
+                raw_con,
+                "mean_dlg",
+                "avg",
+                vec![T_BIGINT],
+                T_DOUBLE,
+                sibling.clone(),
+            )
+            .expect("mean_dlg");
+            register_delegating_aggregate(
+                raw_con,
+                "maxv",
+                "max",
+                vec![T_BIGINT],
+                T_BIGINT,
+                sibling.clone(),
+            )
+            .expect("maxv");
+            register_delegating_aggregate(
+                raw_con,
+                "minv",
+                "min",
+                vec![T_BIGINT],
+                T_BIGINT,
+                sibling.clone(),
+            )
+            .expect("minv");
+            register_delegating_aggregate(
+                raw_con,
+                "join_dlg",
+                "string_agg",
+                vec![T_VARCHAR, T_VARCHAR],
+                T_VARCHAR,
+                sibling,
+            )
+            .expect("join_dlg");
+        }
+
+        // Seed table: two groups, some repeated values (to exercise
+        // the constant-inlining path), ties on the ORDER BY key in
+        // group 2, and a NULL x in group 1 to check null-in-partition
+        // propagation.
+        con.execute_batch(
+            "CREATE TABLE t(g INTEGER, x BIGINT, y VARCHAR, ord INTEGER); \
+             INSERT INTO t VALUES \
+               (1,10,'a',3),(1,20,'b',1),(1,20,'c',2),(1,NULL,'d',4), \
+               (2,30,'e',2),(2,40,'f',1),(2,40,'g',2);",
+        )
+        .expect("seed");
+
+        // ------------------------------------------------------------
+        // helpers: fetch two parallel columns of BIGINT window output
+        // ------------------------------------------------------------
+        let bigints = |sql: &str| -> Vec<Option<i64>> {
+            let mut s = con.prepare(sql).expect("prepare");
+            s.query_map([], |r| r.get::<usize, Option<i64>>(0))
+                .expect("query")
+                .filter_map(Result::ok)
+                .collect()
+        };
+        let doubles = |sql: &str| -> Vec<Option<f64>> {
+            let mut s = con.prepare(sql).expect("prepare");
+            s.query_map([], |r| r.get::<usize, Option<f64>>(0))
+                .expect("query")
+                .filter_map(Result::ok)
+                .collect()
+        };
+        let strings = |sql: &str| -> Vec<Option<String>> {
+            let mut s = con.prepare(sql).expect("prepare");
+            s.query_map([], |r| r.get::<usize, Option<String>>(0))
+                .expect("query")
+                .filter_map(Result::ok)
+                .collect()
+        };
+
+        let assert_bigints_match = |native_sql: &str, ours_sql: &str, label: &str| {
+            let n = bigints(native_sql);
+            let o = bigints(ours_sql);
+            assert_eq!(o, n, "{label}: delegating output != native");
+        };
+        let assert_doubles_match = |native_sql: &str, ours_sql: &str, label: &str| {
+            let n = doubles(native_sql);
+            let o = doubles(ours_sql);
+            assert_eq!(o, n, "{label}: delegating output != native");
+        };
+        let assert_strings_match = |native_sql: &str, ours_sql: &str, label: &str| {
+            let n = strings(native_sql);
+            let o = strings(ours_sql);
+            assert_eq!(o, n, "{label}: delegating output != native");
+        };
+
+        // ------------------------------------------------------------
+        // 1. ROWS frames — explicit sliding-window frame with fixed row
+        //    offsets. Segment-tree recomputes each frame from partial
+        //    states via `combine` — exercises the non-destructive-combine
+        //    fix hard.
+        // ------------------------------------------------------------
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+             FROM t ORDER BY g, ord",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+             FROM t ORDER BY g, ord",
+            "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        );
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t ORDER BY g, ord",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t ORDER BY g, ord",
+            "ROWS UNBOUNDED PRECEDING AND CURRENT ROW",
+        );
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) \
+             FROM t ORDER BY g, ord",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) \
+             FROM t ORDER BY g, ord",
+            "ROWS CURRENT ROW AND UNBOUNDED FOLLOWING",
+        );
+        // Full-partition explicit frame — DuckDB routes this through
+        // the sorted-aggregate / shared-state C-API dispatch, which
+        // hands us one init'd state at slot 0 and NULL at slot 1 as
+        // the "single-state" sentinel. `update` detects that shape
+        // and folds every input row into slot 0.
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+             FROM t ORDER BY g, ord",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+             FROM t ORDER BY g, ord",
+            "ROWS UNBOUNDED..UNBOUNDED (full-partition explicit)",
+        );
+
+        // ------------------------------------------------------------
+        // 2. RANGE frames — peer-based bounds; every row with the same
+        //    ORDER BY key is treated as a peer group. Group 2 has ties
+        //    on `ord=2` so RANGE UNBOUNDED PRECEDING AND CURRENT ROW
+        //    produces a DIFFERENT result than ROWS.
+        // ------------------------------------------------------------
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t ORDER BY g, ord, x",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t ORDER BY g, ord, x",
+            "RANGE UNBOUNDED PRECEDING AND CURRENT ROW",
+        );
+
+        // ------------------------------------------------------------
+        // 3. Frame EXCLUDE clauses — over a FINITE frame, since the
+        //    UNBOUNDED..UNBOUNDED base crashes on its own (see the
+        //    note above). Using ROWS BETWEEN 1 PRECEDING AND 1
+        //    FOLLOWING as the base still exercises each EXCLUDE arm.
+        // ------------------------------------------------------------
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             EXCLUDE CURRENT ROW) \
+             FROM t ORDER BY g, ord, x",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             EXCLUDE CURRENT ROW) \
+             FROM t ORDER BY g, ord, x",
+            "EXCLUDE CURRENT ROW",
+        );
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             EXCLUDE GROUP) \
+             FROM t ORDER BY g, ord, x",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             EXCLUDE GROUP) \
+             FROM t ORDER BY g, ord, x",
+            "EXCLUDE GROUP",
+        );
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             EXCLUDE TIES) \
+             FROM t ORDER BY g, ord, x",
+            "SELECT total(x) OVER (PARTITION BY g ORDER BY ord \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             EXCLUDE TIES) \
+             FROM t ORDER BY g, ord, x",
+            "EXCLUDE TIES",
+        );
+
+        // ------------------------------------------------------------
+        // 4. NULL handling — group 1 has a NULL x. sum/avg/min/max
+        //    should skip nulls; the delegating alias inherits DuckDB's
+        //    null-handling because the update callback simply doesn't
+        //    receive null-filtered rows (validity mask handled in
+        //    `extract_value`).
+        // ------------------------------------------------------------
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g) FROM t ORDER BY g, ord",
+            "SELECT total(x) OVER (PARTITION BY g) FROM t ORDER BY g, ord",
+            "NULL-in-partition: sum",
+        );
+        assert_doubles_match(
+            "SELECT avg(x) OVER (PARTITION BY g) FROM t ORDER BY g, ord",
+            "SELECT mean(x) OVER (PARTITION BY g) FROM t ORDER BY g, ord",
+            "NULL-in-partition: avg",
+        );
+
+        // ------------------------------------------------------------
+        // 5. min/max in a running window — the aggregate needs its full
+        //    input to compute correctly; segment-tree combine has to
+        //    produce a state whose finalize == max(partial_maxes).
+        // ------------------------------------------------------------
+        assert_bigints_match(
+            "SELECT max(x) OVER (PARTITION BY g ORDER BY ord) \
+             FROM t ORDER BY g, ord",
+            "SELECT maxv(x) OVER (PARTITION BY g ORDER BY ord) \
+             FROM t ORDER BY g, ord",
+            "running max",
+        );
+        assert_bigints_match(
+            "SELECT min(x) OVER (PARTITION BY g ORDER BY ord) \
+             FROM t ORDER BY g, ord",
+            "SELECT minv(x) OVER (PARTITION BY g ORDER BY ord) \
+             FROM t ORDER BY g, ord",
+            "running min",
+        );
+
+        // ------------------------------------------------------------
+        // 6. ORDER BY inside the aggregate call — order-sensitive
+        //    aggregate (string_agg) with an explicit sort key. DuckDB's
+        //    sorted-aggregate wrapper pre-sorts by the sort key and
+        //    calls our update in sorted order; the delegation SQL's
+        //    VALUES ... t(cN) hands them to string_agg in insertion
+        //    order.
+        // ------------------------------------------------------------
+        assert_strings_match(
+            "SELECT string_agg(y, ',' ORDER BY ord) FROM t WHERE g = 1",
+            "SELECT join_dlg(y, ',' ORDER BY ord) FROM t WHERE g = 1",
+            "string_agg(y, ',' ORDER BY ord) — group 1",
+        );
+        assert_strings_match(
+            "SELECT g, string_agg(y, ',' ORDER BY ord) FROM t \
+             GROUP BY g ORDER BY g",
+            "SELECT g, join_dlg(y, ',' ORDER BY ord) FROM t \
+             GROUP BY g ORDER BY g",
+            "string_agg with GROUP BY + ORDER BY inside",
+        );
+
+        // ------------------------------------------------------------
+        // 7. Multiple delegating aggregates in one query — one query,
+        //    several state arrays alive simultaneously; each finalize
+        //    must open its own delegation query without contending on
+        //    the sibling connection.
+        // ------------------------------------------------------------
+        let ns = bigints(
+            "SELECT sum(x) OVER (PARTITION BY g) + max(x) OVER (PARTITION BY g) \
+             FROM t ORDER BY g, ord",
+        );
+        let os = bigints(
+            "SELECT total(x) OVER (PARTITION BY g) + maxv(x) OVER (PARTITION BY g) \
+             FROM t ORDER BY g, ord",
+        );
+        assert_eq!(os, ns, "sum + max composed over the same partition window");
+
+        // ------------------------------------------------------------
+        // 8. Empty partition — WHERE clause filters out one group; the
+        //    delegating alias must produce the same output row set
+        //    (including NULL cells) as the target.
+        // ------------------------------------------------------------
+        assert_bigints_match(
+            "SELECT sum(x) OVER (PARTITION BY g) FROM t WHERE g = 3 \
+             ORDER BY ord",
+            "SELECT total(x) OVER (PARTITION BY g) FROM t WHERE g = 3 \
+             ORDER BY ord",
+            "empty partition",
+        );
+    }
+
     /// End-to-end: `create_community_aliases` detects an aggregate
     /// function type in its scan and registers a REAL delegating
     /// aggregate under ducklink's chosen name. Modifiers propagate

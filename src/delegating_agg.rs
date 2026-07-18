@@ -17,30 +17,45 @@
 //!
 //! # Scope of the current implementation
 //!
-//! - Basic + `GROUP BY` + `DISTINCT` + `FILTER` — modifier propagation
-//!   through DuckDB's binder before the update callback ever sees a row.
-//! - `OVER (...)` window aggregates, including running windows via
-//!   `ORDER BY` inside `OVER`. Two contract details matter here:
-//!   - `combine` is non-destructive (clones rather than moves rows out
-//!     of the source), because DuckDB's segment-tree windowing may
-//!     combine the same source into several targets.
-//!   - `build_delegation_sql` emits `n_rows` synthetic rows when every
-//!     input column is constant across the group; the old one-row form
-//!     silently dropped cardinality (`sum(20) FROM (VALUES (1))` = 20
-//!     for two rows of value 20 instead of the correct 40).
+//! Modifier propagation — all through DuckDB's binder before our
+//! callbacks see any rows — is exhaustive:
+//!
+//! - `DISTINCT`, `FILTER (WHERE ...)`, `GROUP BY`.
+//! - `OVER (...)` window aggregates, both the implicit-frame form
+//!   (`OVER (PARTITION BY g)`) and every explicit `ROWS`/`RANGE` frame
+//!   with `PRECEDING`/`FOLLOWING`/`CURRENT ROW`/`UNBOUNDED` bounds.
+//! - Frame `EXCLUDE` clauses (`CURRENT ROW`, `GROUP`, `TIES`, `NO OTHERS`).
 //! - `ORDER BY <expr>` INSIDE the aggregate call (sorted-aggregate
-//!   path) — supported IF the target aggregate is order-sensitive AND
-//!   the delegation SQL preserves DuckDB's supplied row order through
-//!   the `VALUES` clause. Sensitive aggregates like `string_agg` see
-//!   their input pre-sorted by DuckDB's sorted-aggregate wrapper before
-//!   our `update` callback runs, so our accumulator holds rows in the
-//!   right order; the `VALUES ... t(cN)` shape then hands them to the
-//!   target aggregate in insertion order.
-//! - Row-major state; per-row values are stored as `duckdb::types::Value`.
-//! - Multi-column signatures via row-major accumulation.
-//! - Types supported today: `BIGINT`, `INTEGER`, `DOUBLE`, `VARCHAR`,
-//!   `BLOB`, `BOOLEAN`. Extending is a matter of adding branches in
-//!   [`extract_value`] and the type-code mapping.
+//!   path). DuckDB pre-sorts by the sort key and calls our `update` in
+//!   sorted order; our row-major accumulator preserves that order, and
+//!   the delegation `VALUES ... t(cN)` clause hands rows to the target
+//!   aggregate in insertion order. Multi-argument aggregates
+//!   (`string_agg(x, sep ORDER BY y)`) work.
+//!
+//! Four contract details make the above hold together:
+//!
+//! - `combine` is non-destructive (clones rows out of the source
+//!   rather than moving), because DuckDB's segment-tree windowing may
+//!   combine the same source into several overlapping frames.
+//! - `finalize` honours its `offset` parameter so window aggregates
+//!   that split a result vector across multiple finalize calls write
+//!   to the right output slots.
+//! - `build_delegation_sql` emits `n_rows` synthetic rows in the
+//!   all-columns-constant degenerate path, so a running-sum frame with
+//!   repeated values (`sum(20) FROM ...` over two rows) returns 40
+//!   rather than 20.
+//! - `update` detects DuckDB's "shared-state" call convention —
+//!   sorted-aggregate and full-partition-frame paths hand us one
+//!   initialised state at slot 0 and NULL at slot 1 as the sentinel;
+//!   we fold every row of the input chunk into slot 0 rather than
+//!   dereferencing the uninitialised slots (which contain arbitrary
+//!   memory, not zeroed).
+//!
+//! Storage: row-major, per-row `duckdb::types::Value` accumulator.
+//! Multi-column signatures via row-major accumulation.
+//! Types today: `BIGINT`, `INTEGER`, `DOUBLE`, `VARCHAR`, `BLOB`,
+//! `BOOLEAN`. Extending is a matter of adding a branch in
+//! [`extract_value`] and the type-code mapping.
 
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
@@ -188,11 +203,43 @@ pub unsafe extern "C" fn update(
         .map(|c| ffi::duckdb_data_chunk_get_vector(input, c as u64))
         .collect();
 
+    // Detect the "shared-state" call pattern DuckDB uses for sorted
+    // aggregates and full-partition window frames. In that mode, DuckDB
+    // hands us one initialised state at slot 0 and leaves slots 1..N
+    // as uninitialised memory (NOT zero-filled) — so probing them
+    // reads garbage pointers and dereferencing crashes on unmapped
+    // pages. The DuckDB signal is: slot 0 is a valid pointer, slot 1
+    // (when present) is a NULL sentinel. When we see that shape, fold
+    // every input row into slot 0.
+    if n >= 1 {
+        let slot0 = *states as *mut *mut DelegatingAggState;
+        let single_state = if !slot0.is_null() && n >= 2 {
+            let slot1 = *states.add(1) as *mut *mut DelegatingAggState;
+            slot1.is_null()
+        } else {
+            false
+        };
+        if single_state {
+            let state_ptr = *slot0;
+            if !state_ptr.is_null() {
+                for r in 0..n {
+                    let row_values: Vec<Value> = extra
+                        .arg_types
+                        .iter()
+                        .enumerate()
+                        .map(|(c, &t)| extract_value(vectors[c], r, t))
+                        .collect();
+                    (*state_ptr).rows.push(row_values);
+                }
+            }
+            return;
+        }
+    }
+
     for r in 0..n {
         let slot = *states.add(r) as *mut *mut DelegatingAggState;
         if slot.is_null() {
-            // Sorted-aggregate / window paths sometimes hand us sparse
-            // state arrays. Skip rather than crash.
+            // Sparse per-row slot — nothing to do for this row.
             continue;
         }
         let state_ptr = *slot;
@@ -242,35 +289,42 @@ pub unsafe extern "C" fn finalize(
     source: *mut ffi::duckdb_aggregate_state,
     result: ffi::duckdb_vector,
     count: ffi::idx_t,
-    _offset: ffi::idx_t,
+    offset: ffi::idx_t,
 ) {
     let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const DelegatingAggExtra);
     ffi::duckdb_vector_ensure_validity_writable(result);
+    let base = offset as usize;
 
     for i in 0..count as usize {
+        // `i` indexes the STATE array (source[0..count]); the RESULT
+        // vector slot is `base + i`. Window aggregates split a result
+        // vector across multiple finalize calls with different offsets;
+        // ignoring `offset` writes past the vector's end / into other
+        // frames' cells.
+        let out_idx = base + i;
         let slot = *source.add(i) as *mut *mut DelegatingAggState;
         if slot.is_null() {
-            write_result_null(result, i);
+            write_result_null(result, out_idx);
             continue;
         }
         let state_ptr = *slot;
         if state_ptr.is_null() {
-            write_result_null(result, i);
+            write_result_null(result, out_idx);
             continue;
         }
         let state = &mut *state_ptr;
 
         if state.rows.is_empty() {
-            write_result_null(result, i);
+            write_result_null(result, out_idx);
             continue;
         }
 
-        if let Err(e) = run_delegation_and_write(extra, &state.rows, result, i) {
+        if let Err(e) = run_delegation_and_write(extra, &state.rows, result, out_idx) {
             eprintln!(
                 "[ducklink] delegating aggregate '{}' finalize failed: {e}",
                 extra.target_name
             );
-            write_result_null(result, i);
+            write_result_null(result, out_idx);
         }
     }
 }
@@ -308,57 +362,88 @@ fn run_delegation_and_write(
     let params: &[&dyn ToSql] = &flat;
     let con = extra.con.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Read the result cell using the RETURN TYPE's native Rust type. Each
-    // arm reads the exact type the target aggregate is declared to
-    // produce, then writes to the output vector without going through
-    // the generic Value enum (which loses precision for i32 vs i64 etc).
+    // Read the result cell using the RETURN TYPE's native Rust type.
+    // Every arm reads through `Option<T>` so a legitimate NULL from the
+    // target aggregate — e.g. `sum` of an all-null column, or an empty
+    // window frame after `EXCLUDE CURRENT ROW` — writes a NULL rather
+    // than erroring from a null→T coercion.
     unsafe {
         match extra.return_type {
             T_BIGINT => {
-                let v: i64 = con.query_row(&sql, params, |r| r.get(0))?;
-                let data = ffi::duckdb_vector_get_data(result) as *mut i64;
-                *data.add(idx) = v;
-                set_valid(result, idx);
+                let v: Option<i64> = con.query_row(&sql, params, |r| r.get(0))?;
+                match v {
+                    Some(v) => {
+                        let data = ffi::duckdb_vector_get_data(result) as *mut i64;
+                        *data.add(idx) = v;
+                        set_valid(result, idx);
+                    }
+                    None => write_result_null(result, idx),
+                }
             }
             T_INTEGER => {
-                let v: i32 = con.query_row(&sql, params, |r| r.get(0))?;
-                let data = ffi::duckdb_vector_get_data(result) as *mut i32;
-                *data.add(idx) = v;
-                set_valid(result, idx);
+                let v: Option<i32> = con.query_row(&sql, params, |r| r.get(0))?;
+                match v {
+                    Some(v) => {
+                        let data = ffi::duckdb_vector_get_data(result) as *mut i32;
+                        *data.add(idx) = v;
+                        set_valid(result, idx);
+                    }
+                    None => write_result_null(result, idx),
+                }
             }
             T_DOUBLE => {
-                let v: f64 = con.query_row(&sql, params, |r| r.get(0))?;
-                let data = ffi::duckdb_vector_get_data(result) as *mut f64;
-                *data.add(idx) = v;
-                set_valid(result, idx);
+                let v: Option<f64> = con.query_row(&sql, params, |r| r.get(0))?;
+                match v {
+                    Some(v) => {
+                        let data = ffi::duckdb_vector_get_data(result) as *mut f64;
+                        *data.add(idx) = v;
+                        set_valid(result, idx);
+                    }
+                    None => write_result_null(result, idx),
+                }
             }
             T_BOOLEAN => {
-                let v: bool = con.query_row(&sql, params, |r| r.get(0))?;
-                let data = ffi::duckdb_vector_get_data(result) as *mut u8;
-                *data.add(idx) = v as u8;
-                set_valid(result, idx);
+                let v: Option<bool> = con.query_row(&sql, params, |r| r.get(0))?;
+                match v {
+                    Some(v) => {
+                        let data = ffi::duckdb_vector_get_data(result) as *mut u8;
+                        *data.add(idx) = v as u8;
+                        set_valid(result, idx);
+                    }
+                    None => write_result_null(result, idx),
+                }
             }
             T_VARCHAR => {
-                let v: String = con.query_row(&sql, params, |r| r.get(0))?;
-                let bytes = v.as_bytes();
-                let c = std::ffi::CString::new(bytes).unwrap_or_default();
-                ffi::duckdb_vector_assign_string_element_len(
-                    result,
-                    idx as u64,
-                    c.as_ptr(),
-                    bytes.len() as u64,
-                );
-                set_valid(result, idx);
+                let v: Option<String> = con.query_row(&sql, params, |r| r.get(0))?;
+                match v {
+                    Some(v) => {
+                        let bytes = v.as_bytes();
+                        let c = std::ffi::CString::new(bytes).unwrap_or_default();
+                        ffi::duckdb_vector_assign_string_element_len(
+                            result,
+                            idx as u64,
+                            c.as_ptr(),
+                            bytes.len() as u64,
+                        );
+                        set_valid(result, idx);
+                    }
+                    None => write_result_null(result, idx),
+                }
             }
             T_BLOB => {
-                let v: Vec<u8> = con.query_row(&sql, params, |r| r.get(0))?;
-                ffi::duckdb_vector_assign_string_element_len(
-                    result,
-                    idx as u64,
-                    v.as_ptr() as *const std::os::raw::c_char,
-                    v.len() as u64,
-                );
-                set_valid(result, idx);
+                let v: Option<Vec<u8>> = con.query_row(&sql, params, |r| r.get(0))?;
+                match v {
+                    Some(v) => {
+                        ffi::duckdb_vector_assign_string_element_len(
+                            result,
+                            idx as u64,
+                            v.as_ptr() as *const std::os::raw::c_char,
+                            v.len() as u64,
+                        );
+                        set_valid(result, idx);
+                    }
+                    None => write_result_null(result, idx),
+                }
             }
             other => {
                 eprintln!(
