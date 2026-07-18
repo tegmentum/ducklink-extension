@@ -3,124 +3,201 @@
 //!
 //! Ducklink registers a REAL `AggregateFunction` via the DuckDB C API under
 //! ducklink's chosen name (e.g. `crypto.hash_agg`), whose implementation
-//! accumulates input values into a per-group state and then, at
-//! `finalize`, runs a nested SQL query invoking the community aggregate on
-//! the accumulated values.
+//! accumulates every input row's column values into a per-group state and
+//! then, at `finalize`, runs a nested SQL query invoking the community
+//! aggregate on the accumulated rows.
 //!
 //! Because ducklink's wrapper IS a real aggregate to DuckDB's binder, every
-//! aggregate modifier (`DISTINCT`, `FILTER`, `ORDER BY`, `OVER`) works
-//! transparently: the binder deduplicates / filters / orders / windows the
-//! input rows BEFORE our `update` callback sees them, so our accumulator
-//! ends up holding exactly the values DuckDB has determined the target
-//! aggregate should see. `finalize` then invokes the community aggregate
-//! on that pre-processed input via a nested query on a sibling connection.
+//! aggregate modifier (`DISTINCT`, `FILTER`, `GROUP BY`) works transparently:
+//! the binder deduplicates / filters / groups the input rows BEFORE our
+//! `update` callback sees them, so our accumulator ends up holding exactly
+//! the values the target aggregate should see. `finalize` then invokes the
+//! target on that pre-processed input via a nested query on a sibling
+//! connection.
 //!
-//! # Prototype scope (this file)
+//! # Scope of the current implementation
 //!
-//! This first cut hardwires the wrapper to a single signature: one
-//! `BIGINT` input, one `BIGINT` output, delegating to a built-in target
-//! aggregate (`sum` by default). Enough to prove the delegation mechanism
-//! end-to-end against all four modifier shapes without needing an
-//! INSTALL FROM community; generalization to arbitrary community-aggregate
-//! signatures follows once the prototype is green.
+//! - Supports the common non-window / non-sorted-aggregate call shapes
+//!   (basic + `GROUP BY` + `DISTINCT` + `FILTER`). The C-API contract
+//!   DuckDB uses for `ORDER BY` inside the aggregate (sorted-aggregate
+//!   path) and `OVER` (window framework) passes states through a
+//!   sparse array that would need per-slot null checks — the current
+//!   code guards against nulls to avoid crashes but doesn't guarantee
+//!   correct semantics for those cases. A follow-up slice tightens
+//!   support once we've studied the sorted / window traversal.
+//! - Row-major state; per-row values are stored as `duckdb::types::Value`.
+//! - Multi-column signatures via row-major accumulation.
+//! - Types supported today: `BIGINT`, `INTEGER`, `DOUBLE`, `VARCHAR`,
+//!   `BLOB`, `BOOLEAN`. Extending is a matter of adding branches in
+//!   [`extract_value`] and the type-code mapping.
 
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 
 use duckdb::ffi;
+use duckdb::ffi::duckdb_string_t;
+use duckdb::types::{DuckString, ToSql, Value};
 use duckdb::Connection;
 
+/// Ducklink type-code enum — matches the small ints ducklink uses across the
+/// rest of the extension to identify DuckDB logical types by code. Only the
+/// types the delegating wrapper reads today are enumerated; extending is a
+/// matter of adding a variant and a branch in [`extract_value`].
+///
+/// The u8 encoding here matches ducklink's `type_code` scheme (see
+/// `reg_duckdb::type_code`) so callers can pass the codes they already
+/// have from `duckdb_functions()` introspection.
+pub const T_BIGINT: u8 = 3;
+pub const T_INTEGER: u8 = 2;
+pub const T_DOUBLE: u8 = 6;
+pub const T_VARCHAR: u8 = 10;
+pub const T_BLOB: u8 = 11;
+pub const T_BOOLEAN: u8 = 0;
+
+/// Convert a ducklink `type_code` to a `duckdb_type` for C API calls.
+fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
+    match code {
+        T_BOOLEAN => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
+        T_INTEGER => ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER,
+        T_BIGINT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+        T_DOUBLE => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
+        T_VARCHAR => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        T_BLOB => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+        _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+    }
+}
+
 /// Per-registration metadata retrieved from every callback via
-/// `duckdb_aggregate_function_get_extra_info`.
+/// `duckdb_aggregate_function_get_extra_info`. Boxed onto the heap and
+/// handed to DuckDB via `set_extra_info(fn, ptr, destroy)`.
 ///
 /// The sibling `Connection` is held in an `Arc<Mutex<...>>` so `finalize`
 /// (which may run concurrently across groups on the same aggregate
 /// instance) serialises access to the underlying DuckDB connection while
 /// keeping the accumulator lock-free per group.
 pub struct DelegatingAggExtra {
-    /// Bare name of the community aggregate ducklink is delegating to
-    /// (e.g. `"sum"`, `"crypto_hash_agg"`). Spliced into the nested
-    /// `finalize` query verbatim; must have been validated by the caller
-    /// via `crate::catalog::is_safe_identifier`.
+    /// Bare name of the target aggregate ducklink is delegating to
+    /// (e.g. `"sum"`, `"crypto_hash_agg"`, `"string_agg"`). Spliced
+    /// directly into the nested `finalize` query; the caller must have
+    /// validated it via `crate::catalog::is_safe_identifier`.
     pub target_name: String,
+    /// Per-argument type codes, in call order.
+    pub arg_types: Vec<u8>,
+    /// Return type code — must match the target aggregate's return type.
+    pub return_type: u8,
     /// A sibling connection on the same DuckDB database, opened once at
     /// registration and reused for every `finalize` nested query. Avoids
     /// contention on the runtime's main connection.
     pub con: Arc<Mutex<Connection>>,
 }
 
-/// Per-group accumulator state. `AtomicUsize` isn't required here —
-/// DuckDB serialises per-group state access — so a plain `Vec` is fine.
-///
-/// The state stores raw `i64` values in the prototype; when the wrapper
-/// generalises to arbitrary types, this becomes a `Vec<duckdb::types::Value>`
-/// with per-column columnar storage.
+/// Per-group accumulator. Row-major so building the nested query's
+/// `VALUES` clause is a straight iteration.
 #[derive(Default)]
 pub struct DelegatingAggState {
-    pub values: Vec<i64>,
+    /// One entry per input row; each inner `Vec` has `arg_types.len()`
+    /// elements, one per column, in argument order.
+    pub rows: Vec<Vec<Value>>,
 }
 
-/// Size of the per-group state slot DuckDB should allocate. The slot
-/// itself holds a `*mut DelegatingAggState`; the actual state is
-/// heap-allocated once and pointed to by that slot.
+/// Extract one row's value from a DuckDB vector as a `duckdb::types::Value`.
+/// Returns `Value::Null` for null cells.
+///
+/// # Safety
+/// `vec` must be a live `duckdb_vector` for the current chunk; `row` must
+/// be in bounds; `type_code` must match the vector's actual logical type.
+unsafe fn extract_value(
+    vec: ffi::duckdb_vector,
+    row: usize,
+    type_code: u8,
+) -> Value {
+    let validity = ffi::duckdb_vector_get_validity(vec) as *const u64;
+    if !validity.is_null() {
+        let word = *validity.add(row / 64);
+        if (word >> (row % 64)) & 1 == 0 {
+            return Value::Null;
+        }
+    }
+    match type_code {
+        T_BIGINT => {
+            let data = ffi::duckdb_vector_get_data(vec) as *const i64;
+            Value::BigInt(*data.add(row))
+        }
+        T_INTEGER => {
+            let data = ffi::duckdb_vector_get_data(vec) as *const i32;
+            Value::Int(*data.add(row))
+        }
+        T_DOUBLE => {
+            let data = ffi::duckdb_vector_get_data(vec) as *const f64;
+            Value::Double(*data.add(row))
+        }
+        T_BOOLEAN => {
+            let data = ffi::duckdb_vector_get_data(vec) as *const u8;
+            Value::Boolean(*data.add(row) != 0)
+        }
+        T_VARCHAR => {
+            let data = ffi::duckdb_vector_get_data(vec) as *const duckdb_string_t;
+            let mut t = *data.add(row);
+            Value::Text(DuckString::new(&mut t).as_str().into_owned())
+        }
+        T_BLOB => {
+            let data = ffi::duckdb_vector_get_data(vec) as *const duckdb_string_t;
+            let mut t = *data.add(row);
+            Value::Blob(DuckString::new(&mut t).as_bytes().to_vec())
+        }
+        _ => Value::Null,
+    }
+}
+
+// -- C API callbacks ----------------------------------------------------------
+
 pub unsafe extern "C" fn state_size(_info: ffi::duckdb_function_info) -> ffi::idx_t {
     std::mem::size_of::<*mut DelegatingAggState>() as ffi::idx_t
 }
 
-/// Called once per group before its first `update`. Allocates a fresh
-/// state on the heap and writes a pointer into the DuckDB-owned slot.
 pub unsafe extern "C" fn init(_info: ffi::duckdb_function_info, state: ffi::duckdb_aggregate_state) {
     let slot = state as *mut *mut DelegatingAggState;
     *slot = Box::into_raw(Box::new(DelegatingAggState::default()));
 }
 
-/// Called for a batch of input rows. Each row's state pointer is at
-/// `*states.add(row_index)`; multiple rows may point at the SAME state
-/// (grouped aggregation). Copies the input column's raw `i64` values
-/// into each row's per-group `Vec`.
 pub unsafe extern "C" fn update(
-    _info: ffi::duckdb_function_info,
+    info: ffi::duckdb_function_info,
     input: ffi::duckdb_data_chunk,
     states: *mut ffi::duckdb_aggregate_state,
 ) {
+    let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const DelegatingAggExtra);
     let n = ffi::duckdb_data_chunk_get_size(input) as usize;
     if n == 0 {
         return;
     }
-    // Prototype signature: one BIGINT column at position 0.
-    let vec = ffi::duckdb_data_chunk_get_vector(input, 0);
-    let data = ffi::duckdb_vector_get_data(vec) as *const i64;
-    let validity = ffi::duckdb_vector_get_validity(vec) as *const u64;
+    // Fetch each column's vector once — the vector handle is stable for
+    // the whole chunk, so `duckdb_data_chunk_get_vector` on every row
+    // would be pure overhead.
+    let vectors: Vec<ffi::duckdb_vector> = (0..extra.arg_types.len())
+        .map(|c| ffi::duckdb_data_chunk_get_vector(input, c as u64))
+        .collect();
+
     for r in 0..n {
-        // Skip NULLs — mirrors the way DuckDB's own SUM behaves.
-        if !validity.is_null() {
-            let word = *validity.add(r / 64);
-            if (word >> (r % 64)) & 1 == 0 {
-                continue;
-            }
-        }
-        let value = *data.add(r);
-        // The slot at `states.add(r)` is a `duckdb_aggregate_state`
-        // (opaque pointer). DuckDB allocated `state_size` bytes at that
-        // address; our `init` wrote a `*mut DelegatingAggState` into
-        // those bytes. Reach the state via one indirection.
         let slot = *states.add(r) as *mut *mut DelegatingAggState;
         if slot.is_null() {
-            // Some C-API calling conventions (sorted-aggregate,
-            // window-framework) pass a states array with sparse entries
-            // where only certain rows carry a valid state pointer.
-            // Skip rather than crash; the wrapper's prototype scope
-            // targets the flat / grouped / distinct / filtered paths.
+            // Sorted-aggregate / window paths sometimes hand us sparse
+            // state arrays. Skip rather than crash.
             continue;
         }
         let state_ptr = *slot;
-        (*state_ptr).values.push(value);
+        if state_ptr.is_null() {
+            continue;
+        }
+        let row_values: Vec<Value> = extra
+            .arg_types
+            .iter()
+            .enumerate()
+            .map(|(c, &t)| extract_value(vectors[c], r, t))
+            .collect();
+        (*state_ptr).rows.push(row_values);
     }
 }
 
-/// Merge one state into another. Called when DuckDB parallelises the
-/// aggregation and needs to reduce partial results. For our list-of-values
-/// accumulator, this is just an extend.
 pub unsafe extern "C" fn combine(
     _info: ffi::duckdb_function_info,
     source: *mut ffi::duckdb_aggregate_state,
@@ -130,86 +207,300 @@ pub unsafe extern "C" fn combine(
     for i in 0..count as usize {
         let src_slot = *source.add(i) as *mut *mut DelegatingAggState;
         let tgt_slot = *target.add(i) as *mut *mut DelegatingAggState;
+        if src_slot.is_null() || tgt_slot.is_null() {
+            continue;
+        }
         let src = *src_slot;
         let tgt = *tgt_slot;
-        let src_values = std::mem::take(&mut (*src).values);
-        (*tgt).values.extend(src_values);
+        if src.is_null() || tgt.is_null() {
+            continue;
+        }
+        let src_rows = std::mem::take(&mut (*src).rows);
+        (*tgt).rows.extend(src_rows);
     }
 }
 
-/// Produce one output row per group. This is where the delegation
-/// happens: for each group, we invoke the target community aggregate on
-/// the accumulated values via a nested SQL query on the sibling connection.
-///
-/// Prototype: hardwired to invoke `SELECT <target>(unnest(?::BIGINT[]))`
-/// on each group's `Vec<i64>`. Result assumed to be a `BIGINT`.
 pub unsafe extern "C" fn finalize(
     info: ffi::duckdb_function_info,
     source: *mut ffi::duckdb_aggregate_state,
     result: ffi::duckdb_vector,
     count: ffi::idx_t,
-    offset: ffi::idx_t,
+    _offset: ffi::idx_t,
 ) {
     let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const DelegatingAggExtra);
-    let out_data = ffi::duckdb_vector_get_data(result) as *mut i64;
-    // Every extension writing to a vector should also touch the validity
-    // mask; DuckDB defaults new vectors' validity to all-invalid.
     ffi::duckdb_vector_ensure_validity_writable(result);
-    let out_validity = ffi::duckdb_vector_get_validity(result) as *mut u64;
 
     for i in 0..count as usize {
         let slot = *source.add(i) as *mut *mut DelegatingAggState;
         if slot.is_null() {
+            write_result_null(result, i);
             continue;
         }
         let state_ptr = *slot;
+        if state_ptr.is_null() {
+            write_result_null(result, i);
+            continue;
+        }
         let state = &mut *state_ptr;
-        let out_idx = offset as usize + i;
 
-        if state.values.is_empty() {
-            // Empty group → NULL (matches SUM semantics).
-            set_bit(out_validity, out_idx, false);
+        if state.rows.is_empty() {
+            write_result_null(result, i);
             continue;
         }
 
-        // Build a nested query: SELECT <target>(v) FROM (VALUES (10),(20),...) t(v).
-        // Values are i64 — validated on the way in — so string
-        // interpolation is safe. This dodges duckdb-rs's current
-        // limitation ("binding List parameters is not yet supported"); a
-        // future duckdb-rs version could let us switch to a bound
-        // BIGINT[] parameter without touching the outer contract.
-        let values_clause: String = state
-            .values
-            .iter()
-            .map(|v| format!("({v})"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT {t}(v) FROM (VALUES {values_clause}) x(v)",
-            t = extra.target_name
-        );
-
-        let con = extra.con.lock().unwrap_or_else(|e| e.into_inner());
-        let query_result: Result<i64, _> = con.query_row(&sql, [], |r| r.get(0));
-        match query_result {
-            Ok(v) => {
-                *out_data.add(out_idx) = v;
-                set_bit(out_validity, out_idx, true);
-            }
-            Err(e) => {
-                eprintln!("[ducklink] delegating aggregate '{}' finalize failed: {e}", extra.target_name);
-                set_bit(out_validity, out_idx, false);
-            }
+        if let Err(e) = run_delegation_and_write(extra, &state.rows, result, i) {
+            eprintln!(
+                "[ducklink] delegating aggregate '{}' finalize failed: {e}",
+                extra.target_name
+            );
+            write_result_null(result, i);
         }
     }
 }
 
-/// Free the per-group state's heap allocation. Signature matches
-/// `duckdb_aggregate_destroy_t`.
-pub unsafe extern "C" fn destroy(
-    state: *mut ffi::duckdb_aggregate_state,
-    count: ffi::idx_t,
-) {
+/// Build the nested delegation SQL, invoke it on the sibling connection,
+/// read the result cell as the target Rust type, and write it into
+/// `result[idx]`. Returns Err on any of those steps.
+fn run_delegation_and_write(
+    extra: &DelegatingAggExtra,
+    rows: &[Vec<Value>],
+    result: ffi::duckdb_vector,
+    idx: usize,
+) -> duckdb::Result<()> {
+    // Detect columns whose value is constant across every row of this
+    // group. Target aggregates like `string_agg` and community's
+    // `crypto_hash_agg` require certain arguments to be constants at
+    // bind time — DuckDB refuses to bind them if we pass a per-row
+    // placeholder. Inlining constants as literals in the SQL sidesteps
+    // the "must be a constant" error and matches the semantics users
+    // wrote in the outer query (a constant arg IS constant per group).
+    let constant_cols: Vec<Option<String>> = (0..extra.arg_types.len())
+        .map(|col| constant_literal_for_col(rows, col, extra.arg_types[col]))
+        .collect();
+    let sql = build_delegation_sql(extra, rows.len(), &constant_cols);
+    // Only bind params for the columns that aren't constant.
+    let flat: Vec<&dyn ToSql> = rows
+        .iter()
+        .flat_map(|row| {
+            row.iter()
+                .enumerate()
+                .filter(|(c, _)| constant_cols[*c].is_none())
+                .map(|(_, v)| v as &dyn ToSql)
+        })
+        .collect();
+    let params: &[&dyn ToSql] = &flat;
+    let con = extra.con.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Read the result cell using the RETURN TYPE's native Rust type. Each
+    // arm reads the exact type the target aggregate is declared to
+    // produce, then writes to the output vector without going through
+    // the generic Value enum (which loses precision for i32 vs i64 etc).
+    unsafe {
+        match extra.return_type {
+            T_BIGINT => {
+                let v: i64 = con.query_row(&sql, params, |r| r.get(0))?;
+                let data = ffi::duckdb_vector_get_data(result) as *mut i64;
+                *data.add(idx) = v;
+                set_valid(result, idx);
+            }
+            T_INTEGER => {
+                let v: i32 = con.query_row(&sql, params, |r| r.get(0))?;
+                let data = ffi::duckdb_vector_get_data(result) as *mut i32;
+                *data.add(idx) = v;
+                set_valid(result, idx);
+            }
+            T_DOUBLE => {
+                let v: f64 = con.query_row(&sql, params, |r| r.get(0))?;
+                let data = ffi::duckdb_vector_get_data(result) as *mut f64;
+                *data.add(idx) = v;
+                set_valid(result, idx);
+            }
+            T_BOOLEAN => {
+                let v: bool = con.query_row(&sql, params, |r| r.get(0))?;
+                let data = ffi::duckdb_vector_get_data(result) as *mut u8;
+                *data.add(idx) = v as u8;
+                set_valid(result, idx);
+            }
+            T_VARCHAR => {
+                let v: String = con.query_row(&sql, params, |r| r.get(0))?;
+                let bytes = v.as_bytes();
+                let c = std::ffi::CString::new(bytes).unwrap_or_default();
+                ffi::duckdb_vector_assign_string_element_len(
+                    result,
+                    idx as u64,
+                    c.as_ptr(),
+                    bytes.len() as u64,
+                );
+                set_valid(result, idx);
+            }
+            T_BLOB => {
+                let v: Vec<u8> = con.query_row(&sql, params, |r| r.get(0))?;
+                ffi::duckdb_vector_assign_string_element_len(
+                    result,
+                    idx as u64,
+                    v.as_ptr() as *const std::os::raw::c_char,
+                    v.len() as u64,
+                );
+                set_valid(result, idx);
+            }
+            other => {
+                eprintln!(
+                    "[ducklink] delegating aggregate: unsupported return type code {other}"
+                );
+                write_result_null(result, idx);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the parameterised SQL. `constant_cols[c]` is `Some(literal)`
+/// when column `c` was detected as constant across every row of this
+/// group; that column is REMOVED from the FROM subquery and its literal
+/// is spliced directly into the target function's arg list. Non-constant
+/// columns contribute `?` placeholders to the VALUES clause and their
+/// column names to the function call.
+///
+/// This matters because DuckDB's binder rejects "argument must be a
+/// constant" requirements (e.g. `string_agg`'s separator, community
+/// aggregates that pin a config arg) when the argument is a column
+/// reference — even a constant-valued one. Only a LITERAL in the call
+/// expression itself satisfies the binder.
+///
+/// Shape:
+/// ```text
+/// SELECT <target>(<lit_or_col>, <lit_or_col>, ...)
+/// FROM (VALUES (?, ?, ...), ...) t(<varying_col_names>)
+/// ```
+fn build_delegation_sql(
+    extra: &DelegatingAggExtra,
+    nrows: usize,
+    constant_cols: &[Option<String>],
+) -> String {
+    let ncols = extra.arg_types.len();
+
+    // Names of the columns that varied — the ones actually present in the
+    // FROM subquery. `varying_col_names[c]` is `Some("cN")` when column c
+    // is passed as a `?` placeholder, `None` when it's a constant literal.
+    let mut varying_col_names: Vec<Option<String>> = Vec::with_capacity(ncols);
+    let mut varying_ct = 0usize;
+    for cc in constant_cols.iter() {
+        if cc.is_some() {
+            varying_col_names.push(None);
+        } else {
+            varying_col_names.push(Some(format!("c{varying_ct}")));
+            varying_ct += 1;
+        }
+    }
+
+    // The target function's argument list: literals for constant columns,
+    // column references for varying ones. Argument ORDER is preserved.
+    let call_args: Vec<String> = (0..ncols)
+        .map(|c| match &constant_cols[c] {
+            Some(lit) => lit.clone(),
+            None => varying_col_names[c].clone().unwrap(),
+        })
+        .collect();
+    let call_args_str = call_args.join(", ");
+
+    let mut sql = String::with_capacity(64 + nrows * (varying_ct * 3 + 3));
+    sql.push_str("SELECT ");
+    sql.push_str(&extra.target_name);
+    sql.push('(');
+    sql.push_str(&call_args_str);
+    sql.push(')');
+
+    if varying_ct == 0 {
+        // All columns are constants — every row's target call is
+        // identical; degenerate case, just call once on a synthetic row.
+        // Reachable when the target aggregate is called with every arg
+        // constant across the group. Very rare in practice.
+        sql.push_str(" FROM (VALUES (1))");
+        return sql;
+    }
+
+    sql.push_str(" FROM (VALUES ");
+    for r in 0..nrows {
+        if r > 0 {
+            sql.push(',');
+        }
+        sql.push('(');
+        let mut first = true;
+        for c in 0..ncols {
+            if constant_cols[c].is_some() {
+                continue;
+            }
+            if !first {
+                sql.push(',');
+            }
+            first = false;
+            sql.push('?');
+        }
+        sql.push(')');
+    }
+    let varying_names: Vec<String> = varying_col_names.into_iter().flatten().collect();
+    sql.push_str(") t(");
+    sql.push_str(&varying_names.join(", "));
+    sql.push(')');
+    sql
+}
+
+/// If every row's value in `col` is equal, return a SQL literal for it;
+/// otherwise return `None` (the caller then uses a `?` placeholder for
+/// that column). Handles the "argument must be a constant" case for
+/// target aggregates like `string_agg`.
+fn constant_literal_for_col(rows: &[Vec<Value>], col: usize, type_code: u8) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let first = &rows[0][col];
+    for r in 1..rows.len() {
+        if !values_equal(first, &rows[r][col]) {
+            return None;
+        }
+    }
+    value_to_sql_literal(first, type_code)
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::BigInt(x), Value::BigInt(y)) => x == y,
+        (Value::Double(x), Value::Double(y)) => x == y,
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Blob(x), Value::Blob(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Render a `Value` as a SQL literal. Used only for constant-inlining;
+/// only handles the types the delegating wrapper supports today.
+fn value_to_sql_literal(v: &Value, type_code: u8) -> Option<String> {
+    match (type_code, v) {
+        (_, Value::Null) => Some("NULL".to_string()),
+        (T_BOOLEAN, Value::Boolean(b)) => Some(if *b { "TRUE" } else { "FALSE" }.to_string()),
+        (T_INTEGER, Value::Int(x)) => Some(x.to_string()),
+        (T_BIGINT, Value::BigInt(x)) => Some(x.to_string()),
+        (T_DOUBLE, Value::Double(x)) => Some(x.to_string()),
+        (T_VARCHAR, Value::Text(s)) => Some(format!("'{}'", s.replace('\'', "''"))),
+        (T_BLOB, Value::Blob(bytes)) => {
+            // BLOB literals: `'\x01\x02'::BLOB`. Escape every byte as
+            // `\xHH`. Only used for constants — a per-row varying BLOB
+            // would need placeholder binding anyway.
+            let mut out = String::from("'");
+            for b in bytes {
+                out.push_str(&format!("\\x{b:02X}"));
+            }
+            out.push_str("'::BLOB");
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+pub unsafe extern "C" fn destroy(state: *mut ffi::duckdb_aggregate_state, count: ffi::idx_t) {
     for i in 0..count as usize {
         let slot = *state.add(i) as *mut *mut DelegatingAggState;
         if slot.is_null() {
@@ -222,43 +513,50 @@ pub unsafe extern "C" fn destroy(
     }
 }
 
-/// Free the boxed extra info when the aggregate function is unregistered.
 pub unsafe extern "C" fn extra_destroy(ptr: *mut c_void) {
     if !ptr.is_null() {
         drop(Box::from_raw(ptr as *mut DelegatingAggExtra));
     }
 }
 
-fn set_bit(mask: *mut u64, idx: usize, value: bool) {
-    if mask.is_null() {
+// -- helpers ------------------------------------------------------------------
+
+unsafe fn write_result_null(result: ffi::duckdb_vector, idx: usize) {
+    let validity = ffi::duckdb_vector_get_validity(result) as *mut u64;
+    if validity.is_null() {
         return;
     }
-    unsafe {
-        let word = mask.add(idx / 64);
-        let bit = 1u64 << (idx % 64);
-        if value {
-            *word |= bit;
-        } else {
-            *word &= !bit;
-        }
-    }
+    let word = validity.add(idx / 64);
+    let bit = 1u64 << (idx % 64);
+    *word &= !bit;
 }
 
-/// Register `<alias_schema>.<alias_name>(BIGINT) -> BIGINT` as a real
-/// aggregate delegating to `target_name(BIGINT) -> BIGINT`.
-///
-/// Prototype signature only. In the generalised form the caller supplies
-/// arg / return types from `duckdb_functions()`, and this fn builds the
-/// C-API metadata to match.
+unsafe fn set_valid(result: ffi::duckdb_vector, idx: usize) {
+    let validity = ffi::duckdb_vector_get_validity(result) as *mut u64;
+    if validity.is_null() {
+        return;
+    }
+    let word = validity.add(idx / 64);
+    let bit = 1u64 << (idx % 64);
+    *word |= bit;
+}
+
+// -- public registration API --------------------------------------------------
+
+/// Register a real C-API `AggregateFunction` under `alias_name` that
+/// delegates to `target_name`. Users can then call `alias_name(...)`
+/// with any modifier and DuckDB's binder handles them; delegation happens
+/// per-group inside `finalize`.
 ///
 /// # Safety
 /// `raw_con` must be a valid, live `duckdb_connection`. `sibling` must be
-/// a valid duckdb-rs Connection to the SAME database.
-pub unsafe fn register_bigint_delegating_aggregate(
+/// a duckdb-rs Connection to the SAME database.
+pub unsafe fn register_delegating_aggregate(
     raw_con: ffi::duckdb_connection,
-    alias_schema: Option<&str>,
     alias_name: &str,
     target_name: &str,
+    arg_types: Vec<u8>,
+    return_type: u8,
     sibling: Arc<Mutex<Connection>>,
 ) -> Result<(), String> {
     if !crate::catalog::is_safe_identifier(alias_name)
@@ -269,30 +567,24 @@ pub unsafe fn register_bigint_delegating_aggregate(
              (alias='{alias_name}', target='{target_name}')"
         ));
     }
-    if let Some(s) = alias_schema {
-        if !crate::catalog::is_safe_identifier(s) {
-            return Err(format!("delegating aggregate: schema='{s}' unsafe"));
-        }
-    }
 
     let func = ffi::duckdb_create_aggregate_function();
-    // Aggregate name — `set_schema` in DuckDB C API is limited; instead
-    // for the prototype we register a fully-qualified name. If a schema
-    // is present it's spliced into `set_name` via a `schema.name` form;
-    // DuckDB accepts that in some builds. If not, follow-up work moves
-    // to `duckdb_aggregate_function_set_schema` when we generalise.
-    let bare = std::ffi::CString::new(alias_name).map_err(|e| e.to_string())?;
-    ffi::duckdb_aggregate_function_set_name(func, bare.as_ptr());
+    let cname = std::ffi::CString::new(alias_name).map_err(|e| e.to_string())?;
+    ffi::duckdb_aggregate_function_set_name(func, cname.as_ptr());
 
-    let mut arg = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT);
-    ffi::duckdb_aggregate_function_add_parameter(func, arg);
-    ffi::duckdb_destroy_logical_type(&mut arg);
-    let mut ret = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT);
+    for &code in &arg_types {
+        let mut arg = ffi::duckdb_create_logical_type(duckdb_type_of(code));
+        ffi::duckdb_aggregate_function_add_parameter(func, arg);
+        ffi::duckdb_destroy_logical_type(&mut arg);
+    }
+    let mut ret = ffi::duckdb_create_logical_type(duckdb_type_of(return_type));
     ffi::duckdb_aggregate_function_set_return_type(func, ret);
     ffi::duckdb_destroy_logical_type(&mut ret);
 
     let extra = Box::into_raw(Box::new(DelegatingAggExtra {
         target_name: target_name.to_string(),
+        arg_types,
+        return_type,
         con: sibling,
     })) as *mut c_void;
     ffi::duckdb_aggregate_function_set_extra_info(func, extra, Some(extra_destroy));

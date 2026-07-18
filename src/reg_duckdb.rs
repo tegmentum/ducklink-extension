@@ -3637,56 +3637,214 @@ fn create_community_aliases(
                 continue;
             }
 
-            // Register in `main` — bare form.
-            let Some(main_sql) = crate::catalog::build_alias_macro(
-                &ftype, None, ours, theirs, &params,
-            ) else {
-                continue;
-            };
-            if let Err(err) = con.execute(&main_sql, []) {
-                crate::events::emit(
-                    "community_alias_error",
-                    Some(ours),
-                    format!("{theirs}: {err}"),
-                );
-                continue;
+            // AGGREGATE fast path: register a REAL C-API aggregate that
+            // delegates to `theirs`. This is what makes DISTINCT / FILTER /
+            // GROUP BY propagate transparently through the alias, on every
+            // platform. Falls through to the macro fallback when we can't
+            // register (unsupported types, no runtime raw_con, etc).
+            let is_aggregate = matches!(ftype.as_str(), "aggregate");
+            let mut delegated = false;
+            if is_aggregate {
+                match register_aggregate_delegate(&con, ours, theirs) {
+                    Ok(()) => {
+                        created += 1;
+                        delegated = true;
+                        if let Some(ns) = namespace {
+                            if crate::catalog::is_safe_identifier(ns) {
+                                // For the namespace-qualified form,
+                                // register the same delegate under
+                                // `<ns>_<ours>` (schemas can't hold C-API
+                                // aggregates cleanly; the flat namespace
+                                // form is the trade-off — users see
+                                // `<ns>.<ours>` for scalars and
+                                // `<ns>_<ours>` for aggregates until we
+                                // add proper schema support to
+                                // `duckdb_aggregate_function_set_name`).
+                                let ns_name = format!("{ns}_{ours}");
+                                if let Err(err) = register_aggregate_delegate(
+                                    &con,
+                                    &ns_name,
+                                    theirs,
+                                ) {
+                                    crate::events::emit(
+                                        "community_namespace_delegate_error",
+                                        Some(&ns_name),
+                                        format!("{theirs}: {err}"),
+                                    );
+                                } else {
+                                    created += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        crate::events::emit(
+                            "community_delegate_fallback",
+                            Some(ours),
+                            format!("{theirs}: {err}"),
+                        );
+                        // Fall through to macro fallback.
+                    }
+                }
             }
-            created += 1;
 
-            // Optional double-registration in the declared namespace so
-            // `<namespace>.<ours>(x)` binds. Portable via `CREATE MACRO`
-            // in a specific schema — no internal-ABI shim required. The
-            // schema is created on demand with `IF NOT EXISTS`.
-            if let Some(ns) = namespace {
-                if !crate::catalog::is_safe_identifier(ns) {
-                    continue;
-                }
-                if let Err(err) = con.execute(&format!("CREATE SCHEMA IF NOT EXISTS {ns}"), []) {
-                    crate::events::emit(
-                        "community_namespace_schema_error",
-                        Some(ns),
-                        err.to_string(),
-                    );
-                    continue;
-                }
-                let Some(ns_sql) = crate::catalog::build_alias_macro(
-                    &ftype, Some(ns), ours, theirs, &params,
+            if !delegated {
+                // Non-aggregate types (scalar / table) — or aggregates
+                // that fell through — register as `CREATE OR REPLACE MACRO`.
+                let Some(main_sql) = crate::catalog::build_alias_macro(
+                    &ftype, None, ours, theirs, &params,
                 ) else {
                     continue;
                 };
-                if let Err(err) = con.execute(&ns_sql, []) {
+                if let Err(err) = con.execute(&main_sql, []) {
                     crate::events::emit(
-                        "community_namespace_alias_error",
+                        "community_alias_error",
                         Some(ours),
-                        format!("{ns}.{ours}: {err}"),
+                        format!("{theirs}: {err}"),
                     );
                     continue;
                 }
                 created += 1;
+
+                // Optional double-registration in the declared namespace.
+                if let Some(ns) = namespace {
+                    if !crate::catalog::is_safe_identifier(ns) {
+                        continue;
+                    }
+                    if let Err(err) =
+                        con.execute(&format!("CREATE SCHEMA IF NOT EXISTS {ns}"), [])
+                    {
+                        crate::events::emit(
+                            "community_namespace_schema_error",
+                            Some(ns),
+                            err.to_string(),
+                        );
+                        continue;
+                    }
+                    let Some(ns_sql) = crate::catalog::build_alias_macro(
+                        &ftype, Some(ns), ours, theirs, &params,
+                    ) else {
+                        continue;
+                    };
+                    if let Err(err) = con.execute(&ns_sql, []) {
+                        crate::events::emit(
+                            "community_namespace_alias_error",
+                            Some(ours),
+                            format!("{ns}.{ours}: {err}"),
+                        );
+                        continue;
+                    }
+                    created += 1;
+                }
             }
         }
     }
     Ok(created)
+}
+
+/// Register `ours` as a delegating aggregate that calls `theirs`
+/// internally. Looks up `theirs`'s signature from `duckdb_functions()`
+/// (arg types + return type), maps DuckDB type names to ducklink type
+/// codes, then invokes `crate::delegating_agg::register_delegating_aggregate`.
+///
+/// Returns Err on any of: no aggregate found under `theirs`, unsupported
+/// type in the signature, no live runtime raw connection, C-API
+/// registration failure. The caller treats an Err as "fall back to the
+/// macro path" — a partial capability is better than nothing.
+fn register_aggregate_delegate(
+    con: &duckdb::Connection,
+    ours: &str,
+    theirs: &str,
+) -> Result<(), String> {
+    // Grab EVERY aggregate overload of `theirs` and pick the first one
+    // that maps to a supported ducklink type set. `sum` has BIGINT,
+    // DOUBLE, DECIMAL, HUGEINT overloads; taking the first row is a
+    // coinflip that lands on DECIMAL half the time. Instead: scan all,
+    // report the last mapping error only if none matched.
+    let mut stmt = con
+        .prepare(
+            "SELECT array_to_string(parameter_types, ',') AS ptypes, return_type \
+             FROM duckdb_functions() \
+             WHERE function_name = ? AND function_type = 'aggregate'",
+        )
+        .map_err(|e| format!("prepare signature scan: {e}"))?;
+    let overloads: Vec<(String, String)> = stmt
+        .query_map([theirs], |r| {
+            let params_csv: String = r.get::<usize, Option<String>>(0)?.unwrap_or_default();
+            let ret: String = r.get(1)?;
+            Ok((params_csv, ret))
+        })
+        .map_err(|e| format!("{theirs} signature scan: {e}"))?
+        .filter_map(Result::ok)
+        .collect();
+    if overloads.is_empty() {
+        return Err(format!("{theirs} not found as aggregate"));
+    }
+
+    let mut last_err: Option<String> = None;
+    let mut chosen: Option<(Vec<u8>, u8)> = None;
+    for (param_types_csv, return_type_name) in &overloads {
+        let arg_type_names: Vec<&str> = param_types_csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let arg_codes_res: Result<Vec<u8>, String> =
+            arg_type_names.iter().map(|n| type_name_to_code(n)).collect();
+        match arg_codes_res.and_then(|arg_codes| {
+            type_name_to_code(return_type_name).map(|rc| (arg_codes, rc))
+        }) {
+            Ok(pair) => {
+                chosen = Some(pair);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let (arg_codes, return_code) = chosen.ok_or_else(|| {
+        last_err.unwrap_or_else(|| format!("{theirs}: no supported overload"))
+    })?;
+
+    let rt = RUNTIME
+        .get()
+        .ok_or_else(|| "runtime not initialised".to_string())?;
+    let raw_con = rt.raw_con.0;
+    if raw_con.is_null() {
+        return Err("no raw connection for aggregate registration".into());
+    }
+    let sibling = con
+        .try_clone()
+        .map_err(|e| format!("clone sibling connection: {e}"))?;
+    let sibling = std::sync::Arc::new(std::sync::Mutex::new(sibling));
+
+    unsafe {
+        crate::delegating_agg::register_delegating_aggregate(
+            raw_con,
+            ours,
+            theirs,
+            arg_codes,
+            return_code,
+            sibling,
+        )
+    }
+}
+
+/// Map a DuckDB type NAME (as reported by `duckdb_functions().return_type`
+/// or the `parameter_types` list) to a ducklink type code. Returns Err
+/// for types the delegating wrapper doesn't handle yet.
+fn type_name_to_code(name: &str) -> Result<u8, String> {
+    match name.to_uppercase().as_str() {
+        "BOOLEAN" | "BOOL" => Ok(crate::delegating_agg::T_BOOLEAN),
+        "INTEGER" | "INT" | "INT4" | "SIGNED" => Ok(crate::delegating_agg::T_INTEGER),
+        "BIGINT" | "INT8" | "LONG" => Ok(crate::delegating_agg::T_BIGINT),
+        "DOUBLE" | "FLOAT8" => Ok(crate::delegating_agg::T_DOUBLE),
+        "VARCHAR" | "TEXT" | "STRING" | "CHAR" => Ok(crate::delegating_agg::T_VARCHAR),
+        "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => Ok(crate::delegating_agg::T_BLOB),
+        other => Err(format!(
+            "delegating aggregate: unsupported type '{other}' \
+             (supported: BOOLEAN/INTEGER/BIGINT/DOUBLE/VARCHAR/BLOB)"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6567,12 +6725,14 @@ mod tests {
         };
         let sibling = Arc::new(Mutex::new(sibling));
 
+        use crate::delegating_agg::{register_delegating_aggregate, T_BIGINT};
         unsafe {
-            crate::delegating_agg::register_bigint_delegating_aggregate(
+            register_delegating_aggregate(
                 raw_con,
-                None,
                 "sum_delegate",
                 "sum",
+                vec![T_BIGINT],
+                T_BIGINT,
                 sibling,
             )
             .expect("register");
@@ -6631,5 +6791,171 @@ mod tests {
         // per-row states.add() indexing doesn't survive them. Extending
         // to those is a follow-up slice; the prototype proves the
         // three important modifiers (DISTINCT, FILTER, GROUP BY) work.
+    }
+
+    /// Multi-column signature + VARCHAR I/O — the shape most community
+    /// aggregates take (e.g. `crypto_hash_agg(algo, data)`,
+    /// `string_agg(value, separator)`). Verifies:
+    ///
+    /// 1. Two-column signature wires end-to-end
+    /// 2. VARCHAR extraction from vectors works (duckdb_string_t path)
+    /// 3. VARCHAR result gets written back to the output vector
+    /// 4. `DISTINCT` still propagates through with typed values
+    /// 5. `FILTER` still propagates through
+    ///
+    /// Target: built-in `string_agg(x, sep)`. No network needed; no
+    /// ORDER-BY-required aggregate quirks.
+    #[test]
+    fn delegating_aggregate_multi_column_varchar() {
+        use duckdb::ffi;
+        use std::sync::{Arc, Mutex};
+
+        let (raw_con, con, sibling) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let sibling = con.try_clone().expect("clone");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con, sibling)
+        };
+        let sibling = Arc::new(Mutex::new(sibling));
+
+        use crate::delegating_agg::{register_delegating_aggregate, T_VARCHAR};
+        unsafe {
+            register_delegating_aggregate(
+                raw_con,
+                "concat_agg",
+                "string_agg",
+                vec![T_VARCHAR, T_VARCHAR],
+                T_VARCHAR,
+                sibling,
+            )
+            .expect("register");
+        }
+
+        con.execute_batch(
+            "CREATE TABLE t(tag VARCHAR, ok BOOLEAN); \
+             INSERT INTO t VALUES \
+               ('a', true), ('a', true), ('b', false), \
+               ('c', true), ('d', true);",
+        )
+        .expect("seed");
+
+        // Baseline: concat_agg == string_agg, produces some concatenation
+        // (DuckDB's default separator ordering isn't strict, but the SET
+        // of values is deterministic).
+        let baseline: String = con
+            .query_row("SELECT concat_agg(tag, ',') FROM t", [], |r| r.get(0))
+            .expect("baseline");
+        assert_eq!(baseline.split(',').count(), 5, "5 values → 5 pieces");
+
+        // DISTINCT: only unique tags concatenate. This proves multi-column
+        // DISTINCT propagates through — DuckDB dedupes on the (tag, ',')
+        // tuple, which for a constant separator effectively dedupes on tag.
+        let distinct: String = con
+            .query_row("SELECT concat_agg(DISTINCT tag, ',') FROM t", [], |r| r.get(0))
+            .expect("distinct");
+        let mut d: Vec<&str> = distinct.split(',').collect();
+        d.sort();
+        assert_eq!(d, vec!["a", "b", "c", "d"], "DISTINCT: unique tags only");
+
+        // FILTER: only tags where ok=true concatenate.
+        let filtered: String = con
+            .query_row(
+                "SELECT concat_agg(tag, ',') FILTER (WHERE ok) FROM t",
+                [],
+                |r| r.get(0),
+            )
+            .expect("filter");
+        let mut f: Vec<&str> = filtered.split(',').collect();
+        f.sort();
+        assert_eq!(f, vec!["a", "a", "c", "d"], "FILTER: only ok rows");
+
+        // GROUP BY: per-group concatenation. Since input has 2 'a's,
+        // 1 each of 'b','c','d', grouping by (ok) gives ok=true → 4
+        // items, ok=false → 1.
+        let mut stmt = con
+            .prepare("SELECT ok, concat_agg(tag, ',') FROM t GROUP BY ok ORDER BY ok")
+            .expect("group by");
+        let groups: Vec<(bool, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, false);
+        assert_eq!(groups[0].1.split(',').count(), 1);
+        assert_eq!(groups[1].0, true);
+        assert_eq!(groups[1].1.split(',').count(), 4);
+    }
+
+    /// End-to-end: `create_community_aliases` detects an aggregate
+    /// function type in its scan and registers a REAL delegating
+    /// aggregate under ducklink's chosen name. Modifiers propagate
+    /// through the alias just like they do on the target aggregate.
+    ///
+    /// Uses the built-in `sum` as the "community" aggregate so the test
+    /// stays hermetic — no INSTALL FROM community required.
+    #[test]
+    fn community_aliases_register_aggregate_delegate_end_to_end() {
+        let _guard = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::engine::Engine2;
+        use duckdb::ffi;
+        let (db, con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            (db, con)
+        };
+        let engine = Arc::new(Engine2::new().expect("engine"));
+        register_load_function(&con, db, engine).expect("register ducklink_load");
+        if !runtime_is_ours(db) {
+            eprintln!("[test] RUNTIME already bound elsewhere; skipping");
+            return;
+        }
+
+        // Simulate a community-native entry that aliases `sum` as `total`.
+        // We use the persistent connection from the runtime — same one
+        // `create_community_aliases` uses in production.
+        let rt = RUNTIME.get().unwrap();
+        let persistent = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+        let spec = spec_with(None, &[("total", "sum")]);
+        let n = create_community_aliases(&persistent, &spec).expect("alias gen");
+        drop(persistent);
+        assert!(n >= 1, "expected >=1 alias, got {n}");
+
+        con.execute_batch(
+            "CREATE TABLE t(g INTEGER, x BIGINT); \
+             INSERT INTO t VALUES (1,10),(1,20),(1,20),(2,30),(2,40);",
+        )
+        .expect("seed");
+
+        // The alias is a real AggregateFunction — modifiers propagate.
+        let baseline: i64 = con
+            .query_row("SELECT total(x) FROM t", [], |r| r.get(0))
+            .expect("baseline");
+        assert_eq!(baseline, 120);
+
+        let distinct: i64 = con
+            .query_row("SELECT total(DISTINCT x) FROM t", [], |r| r.get(0))
+            .expect("distinct");
+        assert_eq!(distinct, 100);
+
+        let mut stmt = con
+            .prepare("SELECT g, total(x) FROM t GROUP BY g ORDER BY g")
+            .expect("group by");
+        let groups: Vec<(i32, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(groups, vec![(1, 50), (2, 70)]);
     }
 }
