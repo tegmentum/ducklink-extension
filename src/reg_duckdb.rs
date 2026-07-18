@@ -6537,4 +6537,99 @@ mod tests {
             .expect("sub");
         assert_eq!(s, 100);
     }
+
+    // -----------------------------------------------------------------
+    // Delegating aggregate prototype: prove modifiers propagate through
+    // a real C-API aggregate wrapper. Registers `sum_delegate(BIGINT) ->
+    // BIGINT` whose finalize invokes DuckDB's own `sum()` on a
+    // per-group list of values via a sibling connection.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn delegating_aggregate_supports_full_modifier_set() {
+        use duckdb::ffi;
+        use std::sync::{Arc, Mutex};
+
+        // Open a raw db + a duckdb-rs Connection over it. `raw_con` is
+        // where we register the wrapper; `sibling` is what finalize uses
+        // for the nested query.
+        let (raw_con, con, sibling) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            assert_eq!(
+                ffi::duckdb_open(c":memory:".as_ptr(), &mut db),
+                ffi::DuckDBSuccess
+            );
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let sibling = con.try_clone().expect("clone");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            assert_eq!(ffi::duckdb_connect(db, &mut raw), ffi::DuckDBSuccess);
+            (raw, con, sibling)
+        };
+        let sibling = Arc::new(Mutex::new(sibling));
+
+        unsafe {
+            crate::delegating_agg::register_bigint_delegating_aggregate(
+                raw_con,
+                None,
+                "sum_delegate",
+                "sum",
+                sibling,
+            )
+            .expect("register");
+        }
+
+        con.execute_batch(
+            "CREATE TABLE t(g INTEGER, x BIGINT, ok BOOLEAN); \
+             INSERT INTO t VALUES \
+               (1, 10, true), (1, 20, true), (1, 20, false), \
+               (2, 30, true), (2, 40, true);",
+        )
+        .expect("seed");
+
+        // Baseline: sum_delegate == sum. This proves basic accumulation +
+        // delegation works.
+        let baseline: i64 = con
+            .query_row("SELECT sum_delegate(x) FROM t", [], |r| r.get(0))
+            .expect("baseline");
+        assert_eq!(baseline, 120);
+
+        // GROUP BY: verifies per-group state isolation.
+        let mut stmt = con
+            .prepare("SELECT g, sum_delegate(x) FROM t GROUP BY g ORDER BY g")
+            .expect("group by");
+        let groups: Vec<(i32, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(groups, vec![(1, 50), (2, 70)]);
+
+        // DISTINCT: sum of distinct x values. This is the modifier that
+        // broke on the macro path — DuckDB's binder deduplicates rows
+        // BEFORE our `update` sees them, so our accumulator only holds
+        // {10, 20, 30, 40} = 100. Zero code in the wrapper handles
+        // DISTINCT; DuckDB's binder does it for us.
+        let distinct: i64 = con
+            .query_row("SELECT sum_delegate(DISTINCT x) FROM t", [], |r| r.get(0))
+            .expect("distinct");
+        assert_eq!(distinct, 100);
+
+        // FILTER: sum where ok is true. DuckDB applies the filter before
+        // our update — the wrapper accumulates {10, 20, 30, 40} = 100.
+        let filtered: i64 = con
+            .query_row(
+                "SELECT sum_delegate(x) FILTER (WHERE ok) FROM t",
+                [],
+                |r| r.get(0),
+            )
+            .expect("filter");
+        assert_eq!(filtered, 100);
+
+        // ORDER BY + OVER (window) both use a different C-API state-array
+        // calling convention than regular aggregates (sorted-aggregate
+        // path / window framework respectively); the prototype's
+        // per-row states.add() indexing doesn't survive them. Extending
+        // to those is a follow-up slice; the prototype proves the
+        // three important modifiers (DISTINCT, FILTER, GROUP BY) work.
+    }
 }

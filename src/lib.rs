@@ -42,6 +42,9 @@ pub mod catalog;
 #[cfg(feature = "duckdb-api")]
 pub mod reg_duckdb;
 
+#[cfg(feature = "duckdb-api")]
+pub mod delegating_agg;
+
 
 #[cfg(feature = "loadable")]
 mod loadable {
