@@ -29,19 +29,43 @@ fn conformance_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance")
 }
 
-/// Format one query's rows as text — the poor-man's `table` output.
-/// Deliberately not DuckDB's box-drawing table format: the goal is
-/// stability under version bumps of the CLI, so we use a
-/// pipe-separated shape that will not change under us.
+/// Format one query's rows as CSV (RFC 4180). The workspace ducklink
+/// CLI produces this shape via `.mode csv`, so both hosts can emit
+/// byte-identical text against the same `expected/*.out` files.
+///
+/// A value is quoted (and its internal quotes doubled) when it
+/// contains a comma, a double-quote, a newline, or a carriage return.
+/// Deliberately not DuckDB's default `.mode table` (box-drawing)
+/// because that shape is unstable across CLI versions and can't be
+/// hand-authored.
 fn render_result(rows: Vec<Vec<String>>, columns: &[String]) -> String {
     let mut out = String::new();
-    out.push_str(&columns.join(" | "));
+    out.push_str(&csv_row(columns));
     out.push('\n');
     for row in rows {
-        out.push_str(&row.join(" | "));
+        out.push_str(&csv_row(&row));
         out.push('\n');
     }
     out
+}
+
+/// Render one CSV row. Quote cells that contain a comma, quote,
+/// newline, or CR; internal quotes double up per RFC 4180.
+fn csv_row(cells: &[String]) -> String {
+    cells
+        .iter()
+        .map(|c| csv_cell(c))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn csv_cell(v: &str) -> String {
+    let needs_quote = v.contains(',') || v.contains('"') || v.contains('\n') || v.contains('\r');
+    if needs_quote {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_string()
+    }
 }
 
 /// Run a single SQL script — every statement in turn — and collect
