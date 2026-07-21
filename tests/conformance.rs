@@ -133,8 +133,12 @@ fn run_script(con: &Connection, script: &str) -> Result<String, String> {
                         .collect();
                 }
                 if !columns.is_empty() {
+                    // No trailing blank line between statement blocks:
+                    // DuckDB's `.mode csv` (which the workspace runner
+                    // uses) emits `col,col\nval,val\n` with no
+                    // separator, so this runner has to match to stay
+                    // byte-compatible.
                     out.push_str(&render_result(rows, &columns));
-                    out.push('\n');
                 }
             }
             Err(_) => {
