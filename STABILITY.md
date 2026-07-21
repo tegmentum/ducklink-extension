@@ -139,7 +139,28 @@ Currently deprecated for future MAJOR removal (see CHANGELOG v5.0.0):
 - Rust types `reg::ParserReg`, `reg::OptimizerReg`,
   `reg::FilterableTableReg` in `ducklink-runtime`.
 
-## 4. Breaking-change discipline
+## 4. The conformance suite
+
+The surfaces named in §§ 1.1–1.2 are backed by a cross-host
+conformance suite at `conformance/`. Every entry point and every
+discovery view is exercised by a portable SQL script with a golden
+`.out` file; any implementation of the ducklink surface — the native
+extension in this repo, the standalone workspace host at
+`~/git/ducklink/crates/ducklink-host`, and anything built later —
+must produce byte-identical output for the same scripts.
+
+Adding a new committed surface to §§ 1.1–1.2 requires a matching
+conformance script in the same commit. Removing or changing a
+surface requires the corresponding golden update AND a CHANGELOG
+entry for the release.
+
+The conformance runner for this repo lives at `tests/conformance.rs`
+and is exercised by
+`cargo test --release --no-default-features --features bundled --test conformance`.
+Other hosts add their own runner; the SQL scripts and `.out` files
+are shared across hosts and are the source of truth.
+
+## 5. Breaking-change discipline
 
 Anything below constitutes a MAJOR bump:
 
@@ -168,7 +189,7 @@ Anything below is PATCH:
 - Documentation-only changes.
 - Adding conformance tests.
 
-## 5. Version support window
+## 6. Version support window
 
 Ducklink commits to shipping bug fixes for the current MAJOR series
 and PATCH releases for the previous MAJOR series for six months
@@ -178,7 +199,7 @@ projects have a predictable window to migrate.
 Concretely: when v6.0.0 ships, v5.x will continue to receive
 security and correctness patches for at least six months.
 
-## 6. What this means in practice
+## 7. What this means in practice
 
 If you're building a notebook plugin, a data-pipeline stage, or
 another DuckDB extension that calls into ducklink, you can:

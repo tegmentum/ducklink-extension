@@ -2986,10 +2986,95 @@ unsafe impl Sync for DucklinkRuntime {}
 
 static RUNTIME: std::sync::OnceLock<DucklinkRuntime> = std::sync::OnceLock::new();
 
-/// Register the `ducklink_load(path)` table function and capture the
-/// process-wide runtime handle it needs. Idempotent: the handle is set once
-/// (the first `LOAD ducklink` in the process wins); the table function is
+/// `ducklink_version()` -> the extension's version string. Registered
+/// unconditionally (needs no WebAssembly component), so
+/// `LOAD ducklink; SELECT ducklink_version();` is a self-contained smoke
+/// test that the extension built and loaded.
+///
+/// Kept here rather than in `src/lib.rs` so `register_load_function` — the
+/// SHARED entry point for the loadable-extension init AND any in-process
+/// integration test — registers the entire STABILITY.md § 1.1 surface in
+/// one place. That's the "one implementation, N surfaces" invariant
+/// applied internally.
+pub(crate) struct DucklinkVersion;
+
+impl VScalar for DucklinkVersion {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let out = output.flat_vector();
+        let version = concat!("ducklink ", env!("CARGO_PKG_VERSION"));
+        for i in 0..len {
+            out.insert(i, version);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![],
+            LogicalTypeId::Varchar.into(),
+        )]
+    }
+}
+
+/// `ducklink_help(name)` — pretty-printed markdown for a single function
+/// or module. Reads its input per row and renders the doc rows from
+/// `ducklink.docs` in a scalar-friendly single VARCHAR output.
+pub(crate) struct DucklinkHelp;
+
+impl VScalar for DucklinkHelp {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let mut in_col = input.flat_vector(0);
+        let out = output.flat_vector();
+        let names: Vec<String> = unsafe {
+            let s = in_col.as_mut_slice_with_len::<duckdb_string_t>(len);
+            (0..len)
+                .map(|i| {
+                    let mut t = s[i];
+                    DuckString::new(&mut t).as_str().into_owned()
+                })
+                .collect()
+        };
+        for (i, name) in names.iter().enumerate() {
+            let rendered = render_help(name);
+            out.insert(i, rendered.as_str());
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Varchar.into(),
+        )]
+    }
+}
+
+/// Register the ducklink SQL surface committed in STABILITY.md § 1.1 and
+/// the discovery views committed in § 1.2, and capture the process-wide
+/// runtime handle they depend on. Idempotent: the handle is set once (the
+/// first `LOAD ducklink` in the process wins); the functions are
 /// registered on `con` each call (a no-op duplicate is tolerated by DuckDB).
+///
+/// This is the SHARED entry point. Both `ducklink_init_c_api` (the
+/// loadable-extension entry) and the in-process conformance runner call
+/// it, so the registered surface can't drift between them.
+///
+/// The function name is retained for backward compatibility with existing
+/// callers that once threaded through only the `ducklink_load` TF.
 pub fn register_load_function(
     con: &Connection,
     db: ffi::duckdb_database,
@@ -3029,6 +3114,10 @@ pub fn register_load_function(
     // The TF and scalar coexist under one name because DuckDB's binder
     // routes `FROM foo(...)` to the TF and `SELECT foo(...)` to the scalar.
     con.register_scalar_function::<DucklinkPrefixScalar>("ducklink_prefix")?;
+    // The two always-available built-ins. Kept alongside the rest of the
+    // STABILITY.md § 1.1 surface so a single call registers everything.
+    con.register_scalar_function::<DucklinkVersion>("ducklink_version")?;
+    con.register_scalar_function::<DucklinkHelp>("ducklink_help")?;
     // Shorter macro that just delegates to the scalar. Users still need
     // to quote the two identifiers — `SELECT PREFIX('c','crypto');` —
     // because DuckDB has no parser hook to reinterpret bare idents as
@@ -3076,6 +3165,10 @@ pub fn register_load_function(
 /// Create the `ducklink` schema and its system views over the internal discovery
 /// table functions. Idempotent (`CREATE SCHEMA IF NOT EXISTS` + `CREATE OR
 /// REPLACE VIEW`), so re-running on every `LOAD ducklink` is safe.
+///
+/// The set of views and the empty `prefixes` table must match STABILITY.md
+/// § 1.2 exactly. Adding a new view is a MINOR change; renaming or removing
+/// one is MAJOR. The conformance suite asserts this shape.
 fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
     con.execute_batch(
         "CREATE SCHEMA IF NOT EXISTS ducklink;
@@ -3086,7 +3179,19 @@ fn create_ducklink_schema(con: &Connection) -> duckdb::Result<()> {
          CREATE OR REPLACE VIEW ducklink.module_compatibility AS SELECT * FROM ducklink_module_compatibility();
          CREATE OR REPLACE VIEW ducklink.events AS SELECT * FROM ducklink_events();
          CREATE OR REPLACE VIEW ducklink.host AS SELECT * FROM ducklink_host();
-         CREATE OR REPLACE VIEW ducklink.docs AS SELECT * FROM ducklink_docs();",
+         CREATE OR REPLACE VIEW ducklink.docs AS SELECT * FROM ducklink_docs();
+         CREATE TABLE IF NOT EXISTS ducklink.prefixes (
+             alias VARCHAR PRIMARY KEY,
+             namespace VARCHAR NOT NULL
+         );",
+    )?;
+    // `ducklink.search` needs a bound argument — the query text — so it
+    // can't be a plain view over `ducklink_search()`. Expose it as a MACRO
+    // that takes the same argument shape and forwards to the TF, so users
+    // write `SELECT * FROM ducklink.search('query')` matching the pattern
+    // of the other discovery entries.
+    con.execute_batch(
+        "CREATE OR REPLACE MACRO ducklink.search(query) AS TABLE SELECT * FROM ducklink_search(query);",
     )
 }
 

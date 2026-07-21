@@ -93,8 +93,29 @@ no-ops.
     scalar; separate `ducklink-vegalite-native` /
     `ducklink-vegalite-wasm` crates outside this repo.
 - **`STABILITY.md`** — the stability policy this release commits to.
+- **Conformance suite** (`conformance/`, `tests/conformance.rs`) —
+  portable SQL scripts + golden outputs that any implementation of
+  the ducklink surface must pass. Runs against this repo's native
+  extension today; the workspace host at
+  `~/git/ducklink/crates/ducklink-host` and any future host must
+  produce byte-identical output. See STABILITY.md § 4.
 
 ### Fixed
+
+Registration drift caught by bootstrapping the conformance suite:
+
+- `ducklink_help` and `ducklink_version` scalars only registered
+  through the loadable entry point, not through
+  `register_load_function`. Consolidated: the two scalars now live
+  in `src/reg_duckdb.rs` and register through the single
+  `register_load_function` path, so the entry point and the
+  in-process conformance runner produce the same surface.
+- `ducklink.search` and `ducklink.prefixes` were missing from
+  `create_ducklink_schema`. The underlying `ducklink_search()` TF
+  registered, but the `ducklink.search` macro wrapping it did not;
+  `ducklink.prefixes` only appeared after a user set the first
+  prefix (lazy). Both now created eagerly on load, matching the
+  STABILITY.md § 1.2 commitment.
 
 Bugs surfaced by the aggregate delegation stress test:
 

@@ -52,10 +52,7 @@ mod loadable {
     use std::ffi::{CStr, CString};
     use std::sync::Arc;
 
-    use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeId};
     use duckdb::ffi;
-    use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
-    use duckdb::vtab::arrow::WritableVector;
     use duckdb::Connection;
 
     use crate::engine::Engine2;
@@ -84,84 +81,12 @@ mod loadable {
         CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string())
     }
 
-    /// `ducklink_version()` -> the extension's version string. Registered
-    /// unconditionally (needs no WebAssembly component), so
-    /// `LOAD ducklink; SELECT ducklink_version();` is a self-contained smoke
-    /// test that the extension built and loaded.
-    struct DucklinkVersion;
-
-    impl VScalar for DucklinkVersion {
-        type State = ();
-
-        fn invoke(
-            _: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn Error>> {
-            let len = input.len();
-            let out = output.flat_vector();
-            let version = concat!("ducklink ", env!("CARGO_PKG_VERSION"));
-            for i in 0..len {
-                out.insert(i, version);
-            }
-            Ok(())
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![ScalarFunctionSignature::exact(
-                vec![],
-                LogicalTypeId::Varchar.into(),
-            )]
-        }
-    }
-
-    /// `ducklink_help(name)` — pretty-printed markdown for a single function
-    /// or module. Reads its input per row and renders the doc rows from
-    /// `ducklink.docs` in a scalar-friendly single VARCHAR output. Used
-    /// interactively (`SELECT ducklink_help('aba_validate');`) and by tools
-    /// that render markdown (Jupyter magics, docs generators). The heavy
-    /// lifting lives in `reg_duckdb::render_help` — the scalar is a thin
-    /// FFI translator.
-    struct DucklinkHelp;
-
-    impl VScalar for DucklinkHelp {
-        type State = ();
-
-        fn invoke(
-            _: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn Error>> {
-            let len = input.len();
-            let mut in_col = input.flat_vector(0);
-            let out = output.flat_vector();
-            // Input is a per-row VARCHAR; read each name, render help, emit
-            // the markdown blob. The slice deref is unsafe because the DuckDB
-            // string_t handles borrow from the chunk's per-row storage.
-            let names: Vec<String> = unsafe {
-                let s = in_col
-                    .as_mut_slice_with_len::<duckdb::ffi::duckdb_string_t>(len);
-                (0..len)
-                    .map(|i| {
-                        let mut t = s[i];
-                        duckdb::types::DuckString::new(&mut t).as_str().into_owned()
-                    })
-                    .collect()
-            };
-            for (i, name) in names.iter().enumerate() {
-                let rendered = crate::reg_duckdb::render_help(name);
-                out.insert(i, rendered.as_str());
-            }
-            Ok(())
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![ScalarFunctionSignature::exact(
-                vec![LogicalTypeId::Varchar.into()],
-                LogicalTypeId::Varchar.into(),
-            )]
-        }
-    }
+    // `DucklinkVersion` and `DucklinkHelp` — the two always-available
+    // scalars — live in `src/reg_duckdb.rs` alongside the rest of the
+    // STABILITY.md § 1.1 surface. `register_load_function` registers all
+    // of them in one call, so `ducklink_init_c_api` (this file) and the
+    // in-process conformance runner (`tests/conformance.rs`) share one
+    // implementation. See the module-level docstring in `reg_duckdb.rs`.
 
     /// Loadable-extension entry point, named `ducklink_init_c_api` as DuckDB
     /// expects. Mirrors what the `duckdb_entrypoint_c_api` macro generates, but
@@ -248,26 +173,18 @@ mod loadable {
         let have_raw =
             ffi::duckdb_connect(db, &mut raw_con) == ffi::DuckDBSuccess && !raw_con.is_null();
 
-        // Always-available built-in, so the extension is usable (and testable)
-        // even before any component is configured. No `COMMENT ON FUNCTION`
-        // description is set: DuckDB blocks it for entries in the system
-        // catalog (which is where loadable-extension functions land), and the
-        // stable C API has no scalar-function description setter.
-        con.register_scalar_function::<DucklinkHelp>("ducklink_help")
-            .map_err(stringify)?;
-        con.register_scalar_function::<DucklinkVersion>("ducklink_version")
-            .map_err(stringify)?;
         let engine = Arc::new(Engine2::new().map_err(stringify)?);
 
-        // Register `ducklink_load(path)`: the in-SQL analogue of DuckDB's `LOAD`,
-        // which loads a component at RUNTIME (from a SQL statement) and registers
-        // its functions on the live database for use in later statements. It
-        // captures the process-wide `db` handle + shared `engine` so its static
-        // table-function bind can re-open a sibling connection to register. Shares
-        // the SAME `engine` as the env-driven components below. Non-fatal: a
-        // failure here must not break `LOAD ducklink`.
+        // Register the STABILITY.md § 1.1 SQL surface — `ducklink_load`
+        // (TF), `ducklink_prefix` (TF + scalar), `PREFIX` (macro),
+        // `ducklink_version` (scalar), `ducklink_help` (scalar) — plus
+        // the § 1.2 discovery views. One call, one code path, so the
+        // extension entry point and the in-process conformance runner
+        // register the same set. Non-fatal: a failure here must not
+        // break `LOAD ducklink` for the built-in scalars that were
+        // registered earlier.
         if let Err(e) = register_load_function(&con, db, engine.clone()) {
-            eprintln!("[ducklink] could not register ducklink_load: {e}");
+            eprintln!("[ducklink] could not register ducklink surface: {e}");
         }
 
         let specs = component_specs_from_env();
