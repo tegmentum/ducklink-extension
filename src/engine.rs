@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{anyhow, Context, Result};
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder};
 
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::{
     column_types as extension_column_types, runtime as extension_runtime, types as extension_types,
@@ -248,12 +248,33 @@ impl Engine2 {
         // http, httpfs, ...) work. Best-effort, not a sandbox: a component that
         // does not use sockets is unaffected. (A future opt-in gate could mirror
         // the host's DUCKLINK_NETWORK_GRANT.)
-        let wasi: WasiCtx = WasiCtxBuilder::new()
+        //
+        // Also grant filesystem access — preopen `/` at `/` with full perms.
+        // The DuckDB process the extension is loaded into already has native
+        // OS-level filesystem access; a wasm extension being MORE restricted
+        // than a native `.duckdb_extension` is a footgun (component authors
+        // reach for `read_text(...)` workarounds), not a security feature.
+        // Matches the pattern in `ducklink-host` (crates/ducklink-host/src/lib.rs:6053).
+        // A future opt-in gate could mirror the network story: read
+        // `DUCKLINK_FS_GRANT=<host>::<guest>[:...]` and preopen only those.
+        let mut builder = WasiCtxBuilder::new();
+        builder
             .inherit_env()
             .inherit_stdio()
             .inherit_network()
-            .allow_ip_name_lookup(true)
-            .build();
+            .allow_ip_name_lookup(true);
+        // The preopen call can fail (e.g. `/` doesn't exist? — never on unix,
+        // but conceivable in an unusual test env). If it does, we log and
+        // continue without fs access — matches the pattern for the network
+        // grant, which is also best-effort.
+        if let Err(err) = builder.preopened_dir("/", "/", DirPerms::all(), FilePerms::all()) {
+            eprintln!(
+                "[ducklink] warning: could not preopen '/' for component '{extension}': {err}; \
+                 std::fs::* from inside the component will fail — use DuckDB `read_text(...)` \
+                 instead"
+            );
+        }
+        let wasi: WasiCtx = builder.build();
         let mut instance = load_component(
             &self.engine,
             &component,
