@@ -2223,6 +2223,10 @@ pub struct ExtensionInstance {
     // write_log_entry, or for non-log-sink extensions).
     log_storage_bindings:
         Option<crate::duckdb_extension_log_storage_bindings::DuckdbExtensionLogStorage>,
+    // 4.0.0: lazily-built arrow-ext-dispatch bindings (None until first
+    // call-arrow-open, or for non-arrow-producer extensions).
+    arrow_ext_bindings:
+        Option<crate::duckdb_extension_arrow_ext_bindings::DuckdbExtensionArrowExt>,
 }
 
 fn map_extension_trap(err: wasmtime::Error) -> extension_types::Duckerror {
@@ -2417,6 +2421,10 @@ impl ExtensionInstance {
             // write-log-entry the direction-specific sink forwards to this
             // component. Non-log-sink extensions never build them.
             log_storage_bindings: None,
+            // 4.0.0: arrow-ext-dispatch bindings are None until the first
+            // call-arrow-open the direction-specific sink forwards to this
+            // component. Non-arrow-producer extensions never build them.
+            arrow_ext_bindings: None,
         }
     }
 
@@ -3460,6 +3468,82 @@ impl ExtensionInstance {
         let store = &mut self.store;
         guest
             .call_write_log_entry(store.as_context_mut(), handle, &entry)
+            .map_err(map_extension_trap)?
+    }
+
+    // --- 4.0.0: arrow-ext-dispatch re-entry ---
+    // Drives the guest's 3-fn cursor (`call-arrow-open` / `-next` / `-close`)
+    // for a component that registered a named Arrow producer via
+    // `arrow-ext.register-arrow-table`. Cursor state lives entirely on the
+    // guest; the host holds only the opaque cursor u32 and pulls row-vector
+    // batches (`resultset`) until an empty resultset signals EOF. Bindings are
+    // built lazily from the SAME loaded component instance so a non-arrow-
+    // producer extension pays nothing.
+
+    fn arrow_ext_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_arrow_ext_bindings::DuckdbExtensionArrowExt,
+        extension_types::Duckerror,
+    > {
+        if self.arrow_ext_bindings.is_none() {
+            let built =
+                crate::duckdb_extension_arrow_ext_bindings::DuckdbExtensionArrowExt::new(
+                    self.store.as_context_mut(),
+                    &self.instance,
+                )
+                .map_err(map_extension_trap)?;
+            self.arrow_ext_bindings = Some(built);
+        }
+        Ok(self.arrow_ext_bindings.as_ref().unwrap())
+    }
+
+    /// Open a scan cursor against the arrow producer named by `callback_handle`.
+    /// Returns the guest-side opaque cursor id (which the host then threads
+    /// through subsequent `dispatch_arrow_next` / `dispatch_arrow_close` calls).
+    pub fn dispatch_arrow_open(
+        &mut self,
+        callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        self.arrow_ext_bindings()?;
+        let bindings = self.arrow_ext_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_arrow_ext_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_arrow_open(store.as_context_mut(), callback_handle)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Pull the next batch of rows from the guest cursor. An empty resultset
+    /// signals EOF; the caller then invokes `dispatch_arrow_close` to release
+    /// the cursor state.
+    pub fn dispatch_arrow_next(
+        &mut self,
+        callback_handle: u32,
+        cursor: u32,
+    ) -> Result<extension_runtime::Resultset, extension_types::Duckerror> {
+        self.arrow_ext_bindings()?;
+        let bindings = self.arrow_ext_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_arrow_ext_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_arrow_next(store.as_context_mut(), callback_handle, cursor)
+            .map_err(map_extension_trap)?
+    }
+
+    /// Close the guest cursor and release its state. Returns whether the
+    /// cursor was known to the guest.
+    pub fn dispatch_arrow_close(
+        &mut self,
+        callback_handle: u32,
+        cursor: u32,
+    ) -> Result<bool, extension_types::Duckerror> {
+        self.arrow_ext_bindings()?;
+        let bindings = self.arrow_ext_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_arrow_ext_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_call_arrow_close(store.as_context_mut(), callback_handle, cursor)
             .map_err(map_extension_trap)?
     }
 

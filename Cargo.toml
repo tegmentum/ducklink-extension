@@ -66,6 +66,12 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # Verify a downloaded component blob's bytes against the catalog entry's
 # content_digest (sha256) before caching/loading it.
 sha2 = { version = "0.10", optional = true }
+# Row->Arrow encoder for the ArrowArrayStream sink. Matches the arrow version
+# duckdb 1.10504.0 depends on (58.x), so the Arrow C Data Interface ABI passed
+# across the DuckDB boundary comes from a single arrow-rs version. `default-features
+# = false` drops csv/ipc/json (~1 MB of dead code); only the FFI + array/schema
+# glue is needed for the encoder.
+arrow = { version = "58", default-features = false, features = ["ffi"] }
 
 # DuckDB C Extension API (loadable-extension build). Pinned to the DuckDB version
 # the community-extensions CI builds against (v1.5.4); bumped per release.

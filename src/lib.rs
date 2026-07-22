@@ -16,6 +16,14 @@
 
 pub mod engine;
 
+/// Row -> Arrow encoder for the ArrowArrayStream sink. Takes the guest's
+/// row-major `Vec<Vec<DuckValue>>` batch plus the target column schema and
+/// hands DuckDB a self-contained `(FFI_ArrowArray, FFI_ArrowSchema)` pair
+/// across the Arrow C Data Interface. Independent of both the DuckDB
+/// toolchain and wasmtime — depends only on the runtime crate's neutral
+/// `reg::*` types and arrow-rs.
+pub mod arrow_encoder;
+
 /// Read a component's optional `duckdb.docs` wasm custom section (JSON
 /// per-function docs the guest can bundle inside the component itself) and
 /// merge it into `ducklink.docs` at query time. Pure std + serde_json + a

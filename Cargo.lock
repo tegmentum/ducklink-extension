@@ -1105,6 +1105,7 @@ name = "ducklink-extension"
 version = "5.0.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "criterion",
  "duckdb",
  "ducklink-runtime",

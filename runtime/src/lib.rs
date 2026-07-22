@@ -589,6 +589,25 @@ pub mod duckdb_extension_log_storage_bindings {
     });
 }
 
+/// Bindings for the arrow-ext world (`duckdb-extension-arrow-ext`, 4.0.0), which
+/// additionally exports `arrow-ext-dispatch`. Only components that back a named
+/// Arrow producer (registered via `arrow-ext.register-arrow-table`) satisfy this;
+/// the runtime builds these bindings lazily from an already-loaded instance.
+/// The 3-fn cursor (`call-arrow-open` / `-next` / `-close`) keeps state on the
+/// guest — the host holds only an opaque cursor u32 and pulls row-vector
+/// batches (`resultset`) until an empty resultset signals EOF; no arrow-rs types
+/// cross the WIT boundary.
+pub mod duckdb_extension_arrow_ext_bindings {
+    wasmtime::component::bindgen!({
+        path: "./wit",
+        world: "duckdb:extension-host/duckdb-extension-arrow-ext",
+        require_store_data_send: true,
+        with: {
+            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+        },
+    });
+}
+
 /// The kind of callback a handle dispatches to inside an extension component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallbackKind {

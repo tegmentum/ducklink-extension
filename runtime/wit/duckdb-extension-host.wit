@@ -46,6 +46,10 @@ use duckdb:extension/table-stream@4.0.0;
 // duckdb_register_log_storage C API).
 use duckdb:extension/log-storage@4.0.0;
 use duckdb:extension/log-storage-dispatch@4.0.0;
+// 4.0.0 additive interface: arrow-backed producer dispatch (3-fn cursor:
+// open/next/close). Cursor state lives on the guest; the host holds only an
+// opaque cursor u32 and pulls row-vector batches until an empty resultset (EOF).
+use duckdb:extension/arrow-ext-dispatch@4.0.0;
 use duckdb:extension/guest@4.0.0;
 
 // Base extension world: every loadable extension exports these. storage-dispatch
@@ -380,6 +384,30 @@ world duckdb-extension-log-storage {
   export duckdb:extension/guest@4.0.0;
   export callback-dispatch;
   export log-storage-dispatch;
+}
+
+// Arrow-ext world (4.0.0): additionally imports the arrow-ext registration
+// surface and exports arrow-ext-dispatch (the host drives the component's
+// `call-arrow-open` / `-next` / `-close` for each scan of a registered Arrow
+// producer). Only components that back a named Arrow producer (registered via
+// arrow-ext.register-arrow-table) satisfy this; the runtime instantiates its
+// bindings lazily from an already-loaded ExtensionInstance. Cursor state lives
+// on the guest — the host holds only an opaque cursor u32 and pulls row-vector
+// batches (`resultset`) until an empty resultset signals EOF; no arrow-rs types
+// cross the WIT boundary.
+world duckdb-extension-arrow-ext {
+  import duckdb:extension/runtime@4.0.0;
+  import duckdb:extension/config@4.0.0;
+  import duckdb:extension/logging@4.0.0;
+  import duckdb:extension/catalog@4.0.0;
+  import duckdb:extension/files@4.0.0;
+  import duckdb:extension/storage@4.0.0;
+  import duckdb:extension/index@4.0.0;
+  import duckdb:extension/collation@4.0.0;
+  import duckdb:extension/arrow-ext@4.0.0;
+  export duckdb:extension/guest@4.0.0;
+  export callback-dispatch;
+  export arrow-ext-dispatch;
 }
 
 // OPERATOR extensions are intentionally OUT OF SCOPE for the v3 surface.

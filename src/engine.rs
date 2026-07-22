@@ -1496,6 +1496,82 @@ impl Engine2 {
             .dispatch_write_log_entry(callback_handle, entry)
             .map_err(|e| anyhow!("write_log_entry dispatch failed: {e:?}"))
     }
+
+    /// Open a scan cursor against the arrow producer named by `callback_handle`
+    /// (the value the component passed to `arrow-ext.register-arrow-table`).
+    /// Resolves through the shared callback registry to the owning component
+    /// instance and its guest `arrow-ext-dispatch` binding. Wraps
+    /// [`ExtensionInstance::dispatch_arrow_open`].
+    pub fn dispatch_arrow_open(&self, callback_handle: u32) -> Result<u32> {
+        let instance_arc = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry_ref = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            match entry_ref.instance.upgrade() {
+                Some(arc) => arc,
+                None => self.instance_arc(&entry_ref.extension)?,
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        instance
+            .dispatch_arrow_open(callback_handle)
+            .map_err(|e| anyhow!("arrow_open dispatch failed: {e:?}"))
+    }
+
+    /// Pull the next batch of rows from the guest cursor. An empty
+    /// `Vec<Vec<DuckValue>>` signals EOF; the caller then invokes
+    /// [`Self::dispatch_arrow_close`] to release the cursor state. Wraps
+    /// [`ExtensionInstance::dispatch_arrow_next`], flattening the returned
+    /// `Resultset` from WIT `Duckvalue`s to neutral `reg::DuckValue`s.
+    pub fn dispatch_arrow_next(
+        &self,
+        callback_handle: u32,
+        cursor: u32,
+    ) -> Result<Vec<Vec<reg::DuckValue>>> {
+        let instance_arc = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry_ref = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            match entry_ref.instance.upgrade() {
+                Some(arc) => arc,
+                None => self.instance_arc(&entry_ref.extension)?,
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        let rs = instance
+            .dispatch_arrow_next(callback_handle, cursor)
+            .map_err(|e| anyhow!("arrow_next dispatch failed: {e:?}"))?;
+        Ok(rs
+            .into_iter()
+            .map(|row| row.into_iter().map(wit_to_neutral).collect())
+            .collect())
+    }
+
+    /// Close the guest cursor and release its state. Returns whether the
+    /// cursor was known to the guest. Wraps
+    /// [`ExtensionInstance::dispatch_arrow_close`].
+    pub fn dispatch_arrow_close(
+        &self,
+        callback_handle: u32,
+        cursor: u32,
+    ) -> Result<bool> {
+        let instance_arc = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry_ref = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            match entry_ref.instance.upgrade() {
+                Some(arc) => arc,
+                None => self.instance_arc(&entry_ref.extension)?,
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        instance
+            .dispatch_arrow_close(callback_handle, cursor)
+            .map_err(|e| anyhow!("arrow_close dispatch failed: {e:?}"))
+    }
 }
 
 fn neutral_to_wit(v: reg::DuckValue) -> extension_types::Duckvalue {

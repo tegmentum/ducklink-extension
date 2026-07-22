@@ -3366,12 +3366,21 @@ pub unsafe fn load_wasm_into_db(
         if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
             eprintln!("[ducklink] register_log_storages failed: {e}");
         }
-    }
-    if let Err(e) = register_arrow_tables(rt.engine.clone(), &loaded.arrow_tables) {
-        // Fail-loud stub: register_arrow_tables always errors when the
-        // component declared any arrow tables (bindings lack a callback-
-        // driven install). Surface the message here so LOAD reports it.
-        eprintln!("[ducklink] register_arrow_tables: {e}");
+        if !raw_con.is_null() {
+            match register_arrow_tables(raw_con, rt.engine.clone(), &loaded.arrow_tables) {
+                Ok(n) if n > 0 => {
+                    eprintln!("[ducklink] register_arrow_tables: installed {n} producer(s)");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[ducklink] register_arrow_tables: {e}"),
+            }
+        } else if !loaded.arrow_tables.is_empty() {
+            eprintln!(
+                "[ducklink] skipping {} arrow_table(s) from '{}': no raw connection available",
+                loaded.arrow_tables.len(),
+                name
+            );
+        }
     }
     {
         let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
@@ -3600,9 +3609,21 @@ impl VTab for WasmLoad {
                 if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
                     eprintln!("[ducklink] register_log_storages failed: {e}");
                 }
-            }
-            if let Err(e) = register_arrow_tables(rt.engine.clone(), &loaded.arrow_tables) {
-                eprintln!("[ducklink] register_arrow_tables: {e}");
+                if !raw_con.is_null() {
+                    match register_arrow_tables(raw_con, rt.engine.clone(), &loaded.arrow_tables) {
+                        Ok(n) if n > 0 => {
+                            eprintln!("[ducklink] register_arrow_tables: installed {n} producer(s)");
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[ducklink] register_arrow_tables: {e}"),
+                    }
+                } else if !loaded.arrow_tables.is_empty() {
+                    eprintln!(
+                        "[ducklink] skipping {} arrow_table(s) from '{}': no raw connection available",
+                        loaded.arrow_tables.len(),
+                        name
+                    );
+                }
             }
             {
                 let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
@@ -8412,34 +8433,32 @@ unsafe fn read_arg_neutral(code: u8, vec: ffi::duckdb_vector, row: usize) -> reg
 // ---------------------------------------------------------------------------
 // 3. register_arrow_tables — Arrow C Data Interface producer.
 //
-// STATUS (major-4): FAIL-LOUD documented Err. The shipped bindings DO expose
-// `duckdb_arrow_scan(con, table_name, duckdb_arrow_stream)` — an install site
-// that DuckDB re-enters on every pull via the Arrow C Data Interface
-// ArrowArrayStream ABI. The producer-side blocker is upstream, in the WIT:
+// The producer end-to-end: for each declared arrow-table, allocate a
+// `DucklinkArrowStream` state carrier + `ArrowArrayStream` vtable, and
+// install it via `duckdb_arrow_scan(con, name, stream)`. DuckDB re-enters
+// the four vtable fns (`get_schema`, `get_next`, `get_last_error`,
+// `release`) as it materialises the scan; each `get_next` batches pulls
+// row-major DuckValues from the guest via
+// `Engine2::dispatch_arrow_{open,next,close}`, funnels them through
+// `crate::arrow_encoder::ArrowEncoder`, and hands DuckDB an Arrow C Data
+// Interface batch. Guest-side cursor state is lazily opened on the first
+// pull and closed on stream release, so a stream is one open cursor +
+// N pulls + one close.
 //
-//   * `duckdb:extension/arrow-ext@4.0.0` exposes `register-arrow-table` only.
-//     No `call-arrow-table` guest export exists (checked
-//     wit-canonical/duckdb-extension/arrow-ext.wit + callback-dispatch.wit).
-//   * `Engine2::dispatch_table` (row-major duckvalue return) IS callable via
-//     the existing `callback-dispatch/call-table` export, so a producer could
-//     be built by row-to-arrow encoding all 22 `reg::LogicalType` variants.
-//   * WIT modification is forbidden by the enclosing task; adding a proper
-//     columnar `call-arrow-table` (returning arrow-shaped batches directly)
-//     is the correct long-term surface but requires a bindings bump.
-//
-// Rather than ship a producer that silently corrupts memory on the first
-// unsupported logical type (blob / decimal / uuid / interval / complex /
-// nested), FAIL LOUD: log + return an error so LOAD surfaces the shortfall.
-// The scaffolding below (`ArrowArrayStream`, `DucklinkArrowStream`, the four
-// extern "C" fn signatures) documents the ABI a full implementation would
-// use, so a follow-up can wire it up once one of:
-//
-//   (a) a `call-arrow-table` WIT export is added to arrow-ext.wit, letting
-//       the guest emit Arrow record batches directly (batch_index parameter,
-//       Option<Vec<Vec<NeutralValue>>>-style pull), OR
-//   (b) a per-type row→Arrow encoder covering every reg::LogicalType variant
-//       is written on top of the existing `dispatch_table`.
+// INSTALL PATH (one-shot fallback): the existing `REPLACEMENT_SCAN_REGISTRY`
+// is keyed by *file extension* and rewrites the unbound table name to a
+// registered *table function call* — it can't install a fresh
+// `duckdb_arrow_scan` per invocation for an exact table name. `duckdb.h`
+// also does not expose a "install arrow-scan lazily on unbound name" hook.
+// We therefore call `duckdb_arrow_scan` ONCE at register time and log a
+// warning: a second `SELECT * FROM <name>` after the first drains the
+// cursor to EOF will return an empty result until the component is
+// reloaded. A proper per-query fresh-stream path would need either a
+// dedicated table-function shim (materialising the stream inside its
+// bind) or an extended replacement scan hook — both are follow-up work.
 // ---------------------------------------------------------------------------
+
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
 /// Arrow C Data Interface `ArrowArrayStream` ABI (spec v1.5+). Defined
 /// locally because libduckdb-sys 1.10504.0 exposes only `ArrowArray` and
@@ -8449,7 +8468,6 @@ unsafe fn read_arg_neutral(code: u8, vec: ffi::duckdb_vector, row: usize) -> reg
 /// Layout is fixed by the spec:
 /// <https://arrow.apache.org/docs/format/CDataInterface.html#stream-structure>.
 #[repr(C)]
-#[allow(dead_code)]
 pub struct ArrowArrayStream {
     /// Get the top-level schema of the stream. Called ONCE by DuckDB at
     /// bind time. Returns 0 on success.
@@ -8479,28 +8497,43 @@ pub struct ArrowArrayStream {
     pub private_data: *mut c_void,
 }
 
-/// Producer state a `DucklinkArrowStream` would carry. `_columns` drives the
-/// schema encoded by `get_schema`; `_callback_handle` routes pull calls back
-/// through `Engine2::dispatch_arrow_table` (see engine.rs) to the guest.
+/// Producer state a `DucklinkArrowStream` carries across the four ABI
+/// callbacks. `columns` drives the schema encoded by `get_schema`;
+/// `callback_handle` routes pull calls back through
+/// `Engine2::dispatch_arrow_{open,next,close}` to the guest;
+/// `cursor` holds the guest-side cursor handle, opened lazily on the first
+/// `get_next` and released by `release`.
 ///
-/// Not currently instantiated: see the `register_arrow_tables` doc block
-/// above for the WIT-side blocker.
-#[allow(dead_code)]
+/// `Cell<Option<u32>>` for `cursor` is sound here because DuckDB drives the
+/// four vtable fns serially on a single thread per stream — the stream
+/// pointer is never handed to a different consumer while one call is in
+/// flight. Cell is !Sync but we hold this only behind a raw pointer, so
+/// Rust does not require it.
 struct DucklinkArrowStream {
     engine: std::sync::Weak<Engine2>,
     callback_handle: u32,
+    #[allow(dead_code)]
     extension: String,
+    #[allow(dead_code)]
     table_name: String,
+    #[allow(dead_code)]
     columns: Vec<reg::ColumnDef>,
-    batch_index: std::sync::atomic::AtomicU32,
+    /// Guest-side cursor. `None` before the first `get_next` pulls it via
+    /// `dispatch_arrow_open`; `Some(id)` while the stream is live.
+    cursor: std::cell::Cell<Option<u32>>,
+    /// Row -> Arrow encoder built once from `columns` at install time.
+    /// Shared through `Arc` so a future per-query fresh-stream path can
+    /// reuse the schema/field list without rebuilding it.
+    encoder: Arc<crate::arrow_encoder::ArrowEncoder>,
+    /// Latest error message surfaced to `get_last_error`. Held as a
+    /// `CString` so the returned pointer stays valid until the next
+    /// error write.
     last_error: Mutex<Option<CString>>,
 }
 
 /// Process-wide registry mirroring `REPLACEMENT_SCAN_REGISTRY`. Keyed by
-/// (extension, table_name); the boxed streams outlive the connection so
-/// DuckDB can re-consume them across queries (`duckdb_arrow_scan` installs
-/// per-connection, but each query pulls afresh via a fresh stream — that
-/// distinction only matters once the producer is wired up).
+/// (extension, table_name); an idempotency guard so a re-load of the same
+/// component does not stack duplicate installations.
 #[allow(dead_code)]
 struct ArrowTableRegistration {
     extension: String,
@@ -8511,42 +8544,287 @@ struct ArrowTableRegistration {
 
 static ARROW_TABLE_REGISTRY: OnceLock<Mutex<Vec<ArrowTableRegistration>>> = OnceLock::new();
 
-#[allow(dead_code)]
 fn arrow_table_registry() -> &'static Mutex<Vec<ArrowTableRegistration>> {
     ARROW_TABLE_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-pub fn register_arrow_tables(
-    _engine: Arc<Engine2>,
+/// Dereference a stream's `private_data` back to its `DucklinkArrowStream`
+/// state. Returns `None` if the pointer or its private data is null so the
+/// caller can surface a stream-level error instead of dereferencing.
+unsafe fn stream_state<'a>(stream: *mut ArrowArrayStream) -> Option<&'a DucklinkArrowStream> {
+    if stream.is_null() {
+        return None;
+    }
+    let pd = (*stream).private_data;
+    if pd.is_null() {
+        return None;
+    }
+    Some(&*(pd as *const DucklinkArrowStream))
+}
+
+/// Store an error message on the stream so `get_last_error` can surface it.
+/// Also logs to stderr for out-of-band diagnostics — DuckDB may or may not
+/// query `get_last_error` depending on how it interprets the non-zero
+/// return, and the log line keeps the failure debuggable regardless.
+fn arrow_stream_set_error(state: &DucklinkArrowStream, msg: &str) {
+    if let Ok(mut g) = state.last_error.lock() {
+        *g = CString::new(msg).ok();
+    }
+    eprintln!("[ducklink] arrow stream error: {msg}");
+}
+
+/// `get_schema`: copy the encoder's `FFI_ArrowSchema` into the caller-owned
+/// out slot. `FFI_ArrowSchema` is layout-compatible with
+/// `libduckdb_sys::ArrowSchema` (verified in libduckdb-sys's own layout
+/// test), so a `ptr::write` transfers ownership without a re-encode.
+unsafe extern "C" fn ducklink_arrow_stream_get_schema(
+    stream: *mut ArrowArrayStream,
+    out: *mut ffi::ArrowSchema,
+) -> std::os::raw::c_int {
+    let state = match stream_state(stream) {
+        Some(s) => s,
+        None => return 1,
+    };
+    if out.is_null() {
+        arrow_stream_set_error(state, "get_schema: null out ptr");
+        return 1;
+    }
+    let schema = state.encoder.schema_ffi();
+    std::ptr::write(out as *mut FFI_ArrowSchema, schema);
+    0
+}
+
+/// `get_next`: on first call, open a guest cursor via
+/// `dispatch_arrow_open`; on every call, pull the next batch of rows via
+/// `dispatch_arrow_next`. An empty batch signals EOF — we write a
+/// released `ArrowArray` sentinel (release = None) per the C Data Interface
+/// contract and return 0. A non-empty batch is encoded through
+/// `ArrowEncoder::encode_batch`, whose `FFI_ArrowArray` (layout-compatible
+/// with `ffi::ArrowArray`) is `ptr::write`d into the out slot — the
+/// encoder installs the release callback, so DuckDB owns the buffers'
+/// lifetime once the write completes.
+unsafe extern "C" fn ducklink_arrow_stream_get_next(
+    stream: *mut ArrowArrayStream,
+    out: *mut ffi::ArrowArray,
+) -> std::os::raw::c_int {
+    let state = match stream_state(stream) {
+        Some(s) => s,
+        None => return 1,
+    };
+    if out.is_null() {
+        arrow_stream_set_error(state, "get_next: null out ptr");
+        return 1;
+    }
+    let engine = match state.engine.upgrade() {
+        Some(e) => e,
+        None => {
+            arrow_stream_set_error(state, "get_next: engine dropped");
+            return 1;
+        }
+    };
+    let cursor = match state.cursor.get() {
+        Some(c) => c,
+        None => match engine.dispatch_arrow_open(state.callback_handle) {
+            Ok(c) => {
+                state.cursor.set(Some(c));
+                c
+            }
+            Err(e) => {
+                arrow_stream_set_error(state, &format!("dispatch_arrow_open failed: {e}"));
+                return 1;
+            }
+        },
+    };
+    let rows = match engine.dispatch_arrow_next(state.callback_handle, cursor) {
+        Ok(r) => r,
+        Err(e) => {
+            arrow_stream_set_error(state, &format!("dispatch_arrow_next failed: {e}"));
+            return 1;
+        }
+    };
+    if rows.is_empty() {
+        // EOF: release = None sentinel. Writing the zero-initialised
+        // `ArrowArray::empty()` directly (no `ptr::write` from an owned
+        // FFI value) since we don't want a Rust Drop associated with it.
+        std::ptr::write(out, ffi::ArrowArray::empty());
+        return 0;
+    }
+    let ffi_arr = match state.encoder.encode_batch(&rows) {
+        Ok(a) => a,
+        Err(e) => {
+            arrow_stream_set_error(state, &format!("encode_batch failed: {e}"));
+            return 1;
+        }
+    };
+    std::ptr::write(out as *mut FFI_ArrowArray, ffi_arr);
+    0
+}
+
+/// `get_last_error`: return the cached CString pointer or NULL. The
+/// pointer is valid until the next error write; DuckDB is expected to
+/// copy the message before the next callback call, per the C Data
+/// Interface contract.
+unsafe extern "C" fn ducklink_arrow_stream_get_last_error(
+    stream: *mut ArrowArrayStream,
+) -> *const c_char {
+    let state = match stream_state(stream) {
+        Some(s) => s,
+        None => return std::ptr::null(),
+    };
+    match state.last_error.lock() {
+        Ok(g) => match &*g {
+            Some(cstr) => cstr.as_ptr(),
+            None => std::ptr::null(),
+        },
+        Err(_) => std::ptr::null(),
+    }
+}
+
+/// `release`: close the guest cursor (if opened), drop the boxed
+/// `DucklinkArrowStream` state, and drop the enclosing
+/// `ArrowArrayStream` box itself. Per the spec, the consumer must not
+/// touch the stream memory after this returns, so freeing the outer box
+/// is the producer's responsibility.
+unsafe extern "C" fn ducklink_arrow_stream_release(stream: *mut ArrowArrayStream) {
+    if stream.is_null() {
+        return;
+    }
+    let pd = (*stream).private_data;
+    if !pd.is_null() {
+        let state_box: Box<DucklinkArrowStream> =
+            Box::from_raw(pd as *mut DucklinkArrowStream);
+        if let Some(c) = state_box.cursor.get() {
+            if let Some(engine) = state_box.engine.upgrade() {
+                if let Err(e) = engine.dispatch_arrow_close(state_box.callback_handle, c) {
+                    eprintln!("[ducklink] dispatch_arrow_close failed: {e}");
+                }
+            }
+        }
+        drop(state_box);
+    }
+    (*stream).private_data = std::ptr::null_mut();
+    (*stream).release = None;
+    // The stream struct itself was `Box::into_raw`d at install; reclaim it.
+    drop(Box::from_raw(stream));
+}
+
+/// Install every declared arrow-table producer on `raw_con` via
+/// `duckdb_arrow_scan`. See the module doc block for the one-shot
+/// caveat; the returned count is the number of successful installs.
+///
+/// # Safety
+///
+/// `raw_con` must be a valid `duckdb_connection` handle for the process
+/// lifetime the caller expects DuckDB to consume the streams over.
+pub unsafe fn register_arrow_tables(
+    raw_con: ffi::duckdb_connection,
+    engine: Arc<Engine2>,
     tables: &[ArrowTable],
 ) -> Result<usize, String> {
     if tables.is_empty() {
         return Ok(0);
     }
-    // Explicit FAIL-LOUD path. See the module-level doc block above for the
-    // scaffolding a full implementation would use (`ArrowArrayStream` ABI,
-    // `DucklinkArrowStream` state, `ARROW_TABLE_REGISTRY`). Enabling that
-    // path requires either a `call-arrow-table` WIT export (blocked: no WIT
-    // modification allowed) or a per-type row→Arrow encoder over the
-    // existing row-major `Engine2::dispatch_table` covering every
-    // `reg::LogicalType` (blob / decimal / uuid / interval / nested / etc).
-    // Silently no-opping would let the SQL side happily bind a `FROM <name>`
-    // that then returns zero rows — worse than a loud LOAD failure.
-    let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-    let msg = format!(
-        "register_arrow_tables: {} arrow table producer(s) declared ({:?}) but no \
-         callback-driven Arrow producer is wired up. `duckdb_arrow_scan` is available \
-         in the shipped bindings and would drive an ArrowArrayStream, but the \
-         `duckdb:extension/arrow-ext` WIT only exposes `register-arrow-table` — there \
-         is no `call-arrow-table` guest export to pull batches from. The row-major \
-         `callback-dispatch/call-table` export could be used with a per-type row→Arrow \
-         encoder covering every reg::LogicalType (see scaffolding above), but that is \
-         a substantial follow-up. Failing so LOAD surfaces the shortfall.",
-        tables.len(),
-        names,
-    );
-    eprintln!("[ducklink] {msg}");
-    Err(msg)
+    if raw_con.is_null() {
+        return Err("register_arrow_tables: raw_con is null".to_string());
+    }
+    let mut installed = 0usize;
+    for t in tables {
+        // Idempotency guard: a repeated (extension, table_name) pair is a
+        // no-op so re-loading the same component does not stack streams.
+        {
+            let reg = arrow_table_registry().lock().unwrap_or_else(|e| e.into_inner());
+            let already = reg
+                .iter()
+                .any(|r| r.extension == t.extension && r.table_name == t.name);
+            if already {
+                eprintln!(
+                    "[ducklink] arrow table '{}::{}' already registered; skipping",
+                    t.extension, t.name
+                );
+                continue;
+            }
+        }
+        let encoder = match crate::arrow_encoder::ArrowEncoder::new(&t.columns) {
+            Ok(e) => Arc::new(e),
+            Err(e) => {
+                eprintln!(
+                    "[ducklink] arrow table '{}::{}': ArrowEncoder build failed: {e}",
+                    t.extension, t.name
+                );
+                continue;
+            }
+        };
+        let state = Box::new(DucklinkArrowStream {
+            engine: Arc::downgrade(&engine),
+            callback_handle: t.callback_handle,
+            extension: t.extension.clone(),
+            table_name: t.name.clone(),
+            columns: t.columns.clone(),
+            cursor: std::cell::Cell::new(None),
+            encoder,
+            last_error: Mutex::new(None),
+        });
+        let state_ptr = Box::into_raw(state);
+        let stream = Box::new(ArrowArrayStream {
+            get_schema: Some(ducklink_arrow_stream_get_schema),
+            get_next: Some(ducklink_arrow_stream_get_next),
+            get_last_error: Some(ducklink_arrow_stream_get_last_error),
+            release: Some(ducklink_arrow_stream_release),
+            private_data: state_ptr as *mut c_void,
+        });
+        let stream_ptr = Box::into_raw(stream);
+        let name_c = match CString::new(t.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!(
+                    "[ducklink] arrow table '{}::{}' has NUL byte in name; skipping",
+                    t.extension, t.name
+                );
+                // Reclaim the boxes we just leaked.
+                drop(Box::from_raw(stream_ptr));
+                drop(Box::from_raw(state_ptr));
+                continue;
+            }
+        };
+        // Wrap our ArrowArrayStream pointer in the `_duckdb_arrow_stream`
+        // shell DuckDB's arrow_scan API consumes. DuckDB extracts
+        // `internal_ptr` synchronously inside the call, so a stack-alloc
+        // wrapper is safe.
+        let mut wrapper = ffi::_duckdb_arrow_stream {
+            internal_ptr: stream_ptr as *mut c_void,
+        };
+        let rc = ffi::duckdb_arrow_scan(
+            raw_con,
+            name_c.as_ptr(),
+            &mut wrapper as *mut ffi::_duckdb_arrow_stream,
+        );
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] arrow table '{}::{}': duckdb_arrow_scan failed (rc={rc})",
+                t.extension, t.name
+            );
+            // On failure DuckDB did not adopt the stream — reclaim it.
+            drop(Box::from_raw(stream_ptr));
+            drop(Box::from_raw(state_ptr));
+            continue;
+        }
+        {
+            let mut reg = arrow_table_registry().lock().unwrap_or_else(|e| e.into_inner());
+            reg.push(ArrowTableRegistration {
+                extension: t.extension.clone(),
+                table_name: t.name.clone(),
+                callback_handle: t.callback_handle,
+                columns: t.columns.clone(),
+            });
+        }
+        installed += 1;
+        eprintln!(
+            "[ducklink] arrow producer '{}::{}' installed as one-shot; second query will \
+             return empty until reload — need replacement-scan hookup for per-query fresh streams",
+            t.extension, t.name
+        );
+    }
+    Ok(installed)
 }
 
 // ---------------------------------------------------------------------------
