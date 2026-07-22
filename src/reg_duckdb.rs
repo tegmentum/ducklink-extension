@@ -40,7 +40,7 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::column_types
     Decimalvalue as ColvecDecimal, Intervalvalue as ColvecInterval, Uuidvalue as ColvecUuid,
 };
 
-use crate::engine::{AggregateFunc, Engine2, ScalarFunc, TableFunc};
+use crate::engine::{AggregateFunc, Engine2, ReplacementScan, ScalarFunc, TableFunc};
 
 /// Convert DuckDB's physical UUID hugeint storage (sign-flipped: the high bit is
 /// inverted so values sort correctly as a signed i128) into the logical 128-bit
@@ -3103,6 +3103,21 @@ pub fn register_load_function(
         engine,
         loaded: Mutex::new(Vec::new()),
     });
+
+    // Install the process-wide DuckDB replacement-scan callback. This
+    // registers the callback ONCE while `db` is still valid (we are inside
+    // the extension's init) — later `files::register_replacement_scan`
+    // calls from loaded components mutate REPLACEMENT_SCAN_REGISTRY only;
+    // the callback below reads that registry on each unbound-table-name
+    // reference to decide whether to rewrite the scan.
+    unsafe {
+        ffi::duckdb_add_replacement_scan(
+            db,
+            Some(ducklink_replacement_scan_callback),
+            std::ptr::null_mut(),
+            None,
+        );
+    }
     con.register_table_function::<WasmLoad>("ducklink_load")?;
     // User-side alias schemas. `FROM ducklink_prefix('c', 'crypto')`
     // creates a schema `c` and re-registers every function in schema
@@ -3272,6 +3287,13 @@ pub unsafe fn load_wasm_into_db(
         }
     }
 
+    // Wire any `files::register_replacement_scan(exts, function_name)` calls
+    // the component made during load() into the DuckDB catalog. Appends to
+    // the process-wide registry the C-side callback consults on every
+    // unbound table-name reference. Registration is idempotent (a repeat
+    // (ext, fn) pair is a no-op) so re-loading a component does not stack.
+    register_replacement_scans(&loaded.replacement_scans);
+
     {
         let mut loaded_list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
         let rec = LoadedRecord {
@@ -3439,6 +3461,10 @@ impl VTab for WasmLoad {
                     // sibling, reused across loads for the process lifetime.
                 }
             }
+
+            // Wire the component's `files::register_replacement_scan` calls
+            // into the process-wide registry the C callback consults.
+            register_replacement_scans(&loaded.replacement_scans);
 
             bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
             bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
@@ -7652,4 +7678,151 @@ mod tests {
             .expect("c.hash() via PREFIX");
         assert_eq!(via_alias, "sha2-256:ping");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Replacement-scan integration
+// ---------------------------------------------------------------------------
+//
+// DuckDB's replacement-scan mechanism lets an extension rewrite an unbound
+// table-name reference (e.g. `SELECT * FROM 'lambda.gb'`) to a table function
+// call (`SELECT * FROM genbank_read_path('lambda.gb')`) at parse time. The
+// stable C API surface for this is:
+//
+//   duckdb_add_replacement_scan(db, callback, extra, on_delete)
+//   duckdb_replacement_scan_set_function_name(info, "fn")
+//   duckdb_replacement_scan_add_parameter(info, value)
+//   duckdb_replacement_scan_set_error(info, "msg")
+//
+// duckdb-rs 1.10504.0 exposes these via `duckdb::ffi::*` re-exports but
+// ships no safe wrapper (same story as aggregates — see `register_aggregates`
+// above).
+//
+// We use ONE process-wide callback installed at `ducklink_init_c_api` time,
+// backed by a `Mutex<Vec<Registration>>` that loaded components append to via
+// `register_replacement_scans`. The callback matches an unbound table name
+// against each registration's extension list; on a hit it sets the target
+// function name and passes the original string through as its first
+// argument.
+
+use std::sync::OnceLock;
+
+/// One (extension-list, target-table-fn-name) mapping the C callback
+/// consults on every unbound table reference. Populated by
+/// `register_replacement_scans`; installed at extension init.
+struct ReplacementScanRegistration {
+    /// File extensions to match on (no leading dot, lower-case). A table
+    /// reference is a hit when its trailing `.<ext>` matches any entry
+    /// here (case-insensitive on the reference side).
+    extensions: Vec<String>,
+    /// The registered DuckDB table function to route the scan to.
+    function_name: String,
+    /// The extension NAME that owns this mapping (for diagnostics only —
+    /// not consumed by the callback).
+    #[allow(dead_code)]
+    owner: String,
+}
+
+/// The process-wide registry. `OnceLock<Mutex<Vec<_>>>` mirrors the shape
+/// used elsewhere in this crate (see `RUNTIME`).
+static REPLACEMENT_SCAN_REGISTRY: OnceLock<Mutex<Vec<ReplacementScanRegistration>>> =
+    OnceLock::new();
+
+fn replacement_registry() -> &'static Mutex<Vec<ReplacementScanRegistration>> {
+    REPLACEMENT_SCAN_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Append one component's replacement-scan bindings to the process-wide
+/// registry. Idempotent — a repeated (extension, function_name) pair is
+/// a no-op so re-loading the same component does not stack duplicates.
+pub fn register_replacement_scans(scans: &[ReplacementScan]) {
+    if scans.is_empty() {
+        return;
+    }
+    let mut reg = replacement_registry().lock().unwrap_or_else(|e| e.into_inner());
+    for s in scans {
+        let already = reg.iter().any(|r| {
+            r.function_name == s.function_name
+                && r.extensions.len() == s.extensions.len()
+                && r.extensions
+                    .iter()
+                    .zip(s.extensions.iter())
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        });
+        if already {
+            continue;
+        }
+        eprintln!(
+            "[ducklink] replacement scan: {:?} -> '{}' (owner '{}')",
+            s.extensions, s.function_name, s.extension
+        );
+        reg.push(ReplacementScanRegistration {
+            extensions: s.extensions.iter().map(|e| e.to_ascii_lowercase()).collect(),
+            function_name: s.function_name.clone(),
+            owner: s.extension.clone(),
+        });
+    }
+}
+
+/// The one C callback installed at init. DuckDB calls this for every
+/// unbound table-name reference in a query; we walk the registry and, on
+/// an extension match, rewrite the scan to the registered table function
+/// with the original table-name string as its first parameter.
+///
+/// # Safety
+///
+/// `info` and `table_name` are valid for the duration of the call — DuckDB
+/// owns both. `_data` is the `extra` pointer we passed at registration
+/// (currently null; the registry is looked up statically instead).
+pub unsafe extern "C" fn ducklink_replacement_scan_callback(
+    info: ffi::duckdb_replacement_scan_info,
+    table_name: *const c_char,
+    _data: *mut c_void,
+) {
+    if table_name.is_null() {
+        return;
+    }
+    let name_cstr = std::ffi::CStr::from_ptr(table_name);
+    let name = match name_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return, // non-UTF-8 table name — leave alone, DuckDB errors as unbound
+    };
+
+    // Extract the trailing extension (lower-case, no dot). A table name
+    // without a dot has no extension; a name ending in a dot has an empty
+    // one — both cases are treated as "no match".
+    let ext = match name.rsplit_once('.') {
+        Some((_, e)) if !e.is_empty() => e.to_ascii_lowercase(),
+        _ => return,
+    };
+
+    let reg = match REPLACEMENT_SCAN_REGISTRY.get() {
+        Some(r) => r,
+        None => return, // nobody has registered any scans yet
+    };
+    let guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = guard.iter().find(|r| r.extensions.iter().any(|e| e == &ext));
+    let hit = match hit {
+        Some(h) => h,
+        None => return,
+    };
+
+    // Route the scan to `hit.function_name` and pass the original table
+    // name as its first parameter. On CString / duckdb_create_varchar
+    // failure we fall through silently — DuckDB then reports the scan as
+    // unbound with its normal error, so the user isn't left thinking the
+    // replacement fired.
+    let fname_c = match CString::new(hit.function_name.as_str()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let arg_c = match CString::new(name) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    ffi::duckdb_replacement_scan_set_function_name(info, fname_c.as_ptr());
+    let mut param = ffi::duckdb_create_varchar(arg_c.as_ptr());
+    ffi::duckdb_replacement_scan_add_parameter(info, param);
+    ffi::duckdb_destroy_value(&mut param);
 }

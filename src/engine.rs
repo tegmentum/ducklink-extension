@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{anyhow, Context, Result};
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder};
 
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::{
     column_types as extension_column_types, runtime as extension_runtime, types as extension_types,
@@ -144,6 +144,20 @@ pub struct AggregateFunc {
     pub callback_handle: u32,
 }
 
+/// A DuckDB replacement scan the component asked the host to wire.
+/// `extensions` are lower-case file extensions (no dot, e.g. `"gb"`);
+/// `function_name` is the target table function's registered name.
+///
+/// Consumed by `reg_duckdb::register_replacement_scans`, which calls
+/// `duckdb_add_replacement_scan` on the connection's database and installs
+/// a callback that rewrites `FROM 'x.<ext>'` to `FROM <fn>('x.<ext>')`.
+#[derive(Clone, Debug)]
+pub struct ReplacementScan {
+    pub extension: String,
+    pub extensions: Vec<String>,
+    pub function_name: String,
+}
+
 /// What a component registered: the functions a direction-specific sink bridges
 /// into the database.
 #[derive(Clone, Debug, Default)]
@@ -151,6 +165,11 @@ pub struct LoadedComponent {
     pub scalars: Vec<ScalarFunc>,
     pub tables: Vec<TableFunc>,
     pub aggregates: Vec<AggregateFunc>,
+    /// File-extension → registered-table-function name mappings from the
+    /// component's `files::register_replacement_scan` calls. Drained from
+    /// the runtime's pending state alongside scalars/tables/aggregates;
+    /// consumed by `reg_duckdb::register_replacement_scans`.
+    pub replacement_scans: Vec<ReplacementScan>,
     /// Component-provided documentation parsed from the wasm's `duckdb.docs`
     /// custom section, if present. Overrides catalog docs field-by-field at
     /// query time; `None` for components that don't ship a section.
@@ -229,12 +248,33 @@ impl Engine2 {
         // http, httpfs, ...) work. Best-effort, not a sandbox: a component that
         // does not use sockets is unaffected. (A future opt-in gate could mirror
         // the host's DUCKLINK_NETWORK_GRANT.)
-        let wasi: WasiCtx = WasiCtxBuilder::new()
+        //
+        // Also grant filesystem access — preopen `/` at `/` with full perms.
+        // The DuckDB process the extension is loaded into already has native
+        // OS-level filesystem access; a wasm extension being MORE restricted
+        // than a native `.duckdb_extension` is a footgun (component authors
+        // reach for `read_text(...)` workarounds), not a security feature.
+        // Matches the pattern in `ducklink-host` (crates/ducklink-host/src/lib.rs:6053).
+        // A future opt-in gate could mirror the network story: read
+        // `DUCKLINK_FS_GRANT=<host>::<guest>[:...]` and preopen only those.
+        let mut builder = WasiCtxBuilder::new();
+        builder
             .inherit_env()
             .inherit_stdio()
             .inherit_network()
-            .allow_ip_name_lookup(true)
-            .build();
+            .allow_ip_name_lookup(true);
+        // The preopen call can fail (e.g. `/` doesn't exist? — never on unix,
+        // but conceivable in an unusual test env). If it does, we log and
+        // continue without fs access — matches the pattern for the network
+        // grant, which is also best-effort.
+        if let Err(err) = builder.preopened_dir("/", "/", DirPerms::all(), FilePerms::all()) {
+            eprintln!(
+                "[ducklink] warning: could not preopen '/' for component '{extension}': {err}; \
+                 std::fs::* from inside the component will fail — use DuckDB `read_text(...)` \
+                 instead"
+            );
+        }
+        let wasi: WasiCtx = builder.build();
         let mut instance = load_component(
             &self.engine,
             &component,
@@ -277,6 +317,15 @@ impl Engine2 {
                 callback_handle: a.callback_handle,
             })
             .collect();
+        let replacement_scans = pending
+            .replacement_scans
+            .into_iter()
+            .map(|r| ReplacementScan {
+                extension: r.extension,
+                extensions: r.extensions,
+                function_name: r.function_name,
+            })
+            .collect();
         let instance_arc = Arc::new(Mutex::new(instance));
         {
             let mut map = self.instances.write().expect("instances lock poisoned");
@@ -294,6 +343,7 @@ impl Engine2 {
             .expect("callback registry poisoned")
             .link_extension_instance(extension, &instance_arc);
         Ok(LoadedComponent {
+            replacement_scans,
             scalars,
             tables,
             aggregates,
