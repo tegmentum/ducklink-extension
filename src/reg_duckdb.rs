@@ -3366,21 +3366,6 @@ pub unsafe fn load_wasm_into_db(
         if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
             eprintln!("[ducklink] register_log_storages failed: {e}");
         }
-        if !raw_con.is_null() {
-            match register_arrow_tables(raw_con, rt.engine.clone(), &loaded.arrow_tables) {
-                Ok(n) if n > 0 => {
-                    eprintln!("[ducklink] register_arrow_tables: installed {n} producer(s)");
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("[ducklink] register_arrow_tables: {e}"),
-            }
-        } else if !loaded.arrow_tables.is_empty() {
-            eprintln!(
-                "[ducklink] skipping {} arrow_table(s) from '{}': no raw connection available",
-                loaded.arrow_tables.len(),
-                name
-            );
-        }
     }
     {
         let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
@@ -3389,6 +3374,16 @@ pub unsafe fn load_wasm_into_db(
         }
         if let Err(e) = register_table_macros(&con, &loaded.table_macros) {
             eprintln!("[ducklink] register_table_macros failed: {e}");
+        }
+        // Arrow producers register as duckdb-rs table function shims + a
+        // replacement-scan rewrite (see `register_arrow_tables`); they need
+        // the safe `Connection`, not the raw handle.
+        match register_arrow_tables(&con, rt.engine.clone(), &loaded.arrow_tables) {
+            Ok(n) if n > 0 => {
+                eprintln!("[ducklink] register_arrow_tables: installed {n} producer(s)");
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[ducklink] register_arrow_tables: {e}"),
         }
     }
 
@@ -3609,21 +3604,6 @@ impl VTab for WasmLoad {
                 if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
                     eprintln!("[ducklink] register_log_storages failed: {e}");
                 }
-                if !raw_con.is_null() {
-                    match register_arrow_tables(raw_con, rt.engine.clone(), &loaded.arrow_tables) {
-                        Ok(n) if n > 0 => {
-                            eprintln!("[ducklink] register_arrow_tables: installed {n} producer(s)");
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[ducklink] register_arrow_tables: {e}"),
-                    }
-                } else if !loaded.arrow_tables.is_empty() {
-                    eprintln!(
-                        "[ducklink] skipping {} arrow_table(s) from '{}': no raw connection available",
-                        loaded.arrow_tables.len(),
-                        name
-                    );
-                }
             }
             {
                 let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
@@ -3632,6 +3612,16 @@ impl VTab for WasmLoad {
                 }
                 if let Err(e) = register_table_macros(&con, &loaded.table_macros) {
                     eprintln!("[ducklink] register_table_macros failed: {e}");
+                }
+                // Arrow producers register as duckdb-rs table function shims
+                // + a replacement-scan rewrite; needs the safe `Connection`,
+                // not the raw handle.
+                match register_arrow_tables(&con, rt.engine.clone(), &loaded.arrow_tables) {
+                    Ok(n) if n > 0 => {
+                        eprintln!("[ducklink] register_arrow_tables: installed {n} producer(s)");
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[ducklink] register_arrow_tables: {e}"),
                 }
             }
 
@@ -7957,6 +7947,21 @@ pub unsafe extern "C" fn ducklink_replacement_scan_callback(
         Err(_) => return, // non-UTF-8 table name — leave alone, DuckDB errors as unbound
     };
 
+    // First: arrow-table producers, keyed on the exact bare table name.
+    // Registered by `register_arrow_tables` (task #53): rewrites
+    // `SELECT * FROM feed` -> `SELECT * FROM __ducklink_arrow_shim_<safe>()`
+    // so every query re-enters the shim's `bind`/`init`/`func` and opens a
+    // fresh guest cursor. On CString failure we fall through to the
+    // file-extension logic below so the user sees DuckDB's normal error
+    // rather than a silent miss.
+    if let Some(shim_name) = arrow_shim_for_table_name(name) {
+        if let Ok(fname_c) = CString::new(shim_name) {
+            ffi::duckdb_replacement_scan_set_function_name(info, fname_c.as_ptr());
+            // Arrow shim takes zero args — nothing to `add_parameter`.
+            return;
+        }
+    }
+
     // Extract the trailing extension (lower-case, no dot). A table name
     // without a dot has no extension; a name ending in a dot has an empty
     // one — both cases are treated as "no match".
@@ -8431,115 +8436,201 @@ unsafe fn read_arg_neutral(code: u8, vec: ffi::duckdb_vector, row: usize) -> reg
 }
 
 // ---------------------------------------------------------------------------
-// 3. register_arrow_tables — Arrow C Data Interface producer.
+// 3. register_arrow_tables — arrow-producer table function shim + replacement
+// scan (Option B per task #53).
 //
-// The producer end-to-end: for each declared arrow-table, allocate a
-// `DucklinkArrowStream` state carrier + `ArrowArrayStream` vtable, and
-// install it via `duckdb_arrow_scan(con, name, stream)`. DuckDB re-enters
-// the four vtable fns (`get_schema`, `get_next`, `get_last_error`,
-// `release`) as it materialises the scan; each `get_next` batches pulls
-// row-major DuckValues from the guest via
-// `Engine2::dispatch_arrow_{open,next,close}`, funnels them through
-// `crate::arrow_encoder::ArrowEncoder`, and hands DuckDB an Arrow C Data
-// Interface batch. Guest-side cursor state is lazily opened on the first
-// pull and closed on stream release, so a stream is one open cursor +
-// N pulls + one close.
+// The producer end-to-end: for each declared arrow-table, register a per-table
+// DuckDB table function under an internal name
+// `__ducklink_arrow_shim_<safe_name>` (safe_name = `<extension>_<table_name>`
+// sanitised to `[a-zA-Z0-9_]`). The shim's `bind` re-emits the declared column
+// schema, `init` sets up a lazy cursor slot, and `func` pulls one guest batch
+// per invocation through `Engine2::dispatch_arrow_{open,next,close}` and writes
+// rows directly to the DuckDB `DataChunkHandle` via the existing
+// `write_ret_raw` per-cell writer. Extending [`ducklink_replacement_scan_callback`]
+// with an arrow-table lookup lets a bare `SELECT * FROM feed` be rewritten to
+// `SELECT * FROM __ducklink_arrow_shim_<safe_name>()` at parse time — so every
+// query walks the same per-query shim path and re-opens a fresh cursor,
+// eliminating the "second query returns empty" one-shot bug the previous
+// `duckdb_arrow_scan` install path had.
 //
-// INSTALL PATH (one-shot fallback): the existing `REPLACEMENT_SCAN_REGISTRY`
-// is keyed by *file extension* and rewrites the unbound table name to a
-// registered *table function call* — it can't install a fresh
-// `duckdb_arrow_scan` per invocation for an exact table name. `duckdb.h`
-// also does not expose a "install arrow-scan lazily on unbound name" hook.
-// We therefore call `duckdb_arrow_scan` ONCE at register time and log a
-// warning: a second `SELECT * FROM <name>` after the first drains the
-// cursor to EOF will return an empty result until the component is
-// reloaded. A proper per-query fresh-stream path would need either a
-// dedicated table-function shim (materialising the stream inside its
-// bind) or an extended replacement scan hook — both are follow-up work.
+// Design choice (Option B over Option A): the shim is a DuckDB table function
+// whose `func` callback pulls guest rows and writes them straight to the
+// output `DataChunkHandle` — no Arrow FFI layer on the hot path, no
+// `duckdb_arrow_scan` + temp-alias plumbing per query. The Arrow encoder
+// (`crate::arrow_encoder::ArrowEncoder`) is preserved for external / future
+// use but is not on this path anymore.
+//
+// Cursor lifecycle: opened lazily on the first `func` call, closed on drop of
+// the per-query `ArrowShimInit`. LIMIT queries that terminate before EOF still
+// have the cursor released by the guest via `dispatch_arrow_close` at that
+// drop point.
 // ---------------------------------------------------------------------------
 
-use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-
-/// Arrow C Data Interface `ArrowArrayStream` ABI (spec v1.5+). Defined
-/// locally because libduckdb-sys 1.10504.0 exposes only `ArrowArray` and
-/// `ArrowSchema` (see `libduckdb-sys::arrow_c_data`), not the stream
-/// wrapper `duckdb_arrow_scan` consumes via `duckdb_arrow_stream.internal_ptr`.
-///
-/// Layout is fixed by the spec:
-/// <https://arrow.apache.org/docs/format/CDataInterface.html#stream-structure>.
-#[repr(C)]
-pub struct ArrowArrayStream {
-    /// Get the top-level schema of the stream. Called ONCE by DuckDB at
-    /// bind time. Returns 0 on success.
-    pub get_schema: Option<
-        unsafe extern "C" fn(
-            *mut ArrowArrayStream,
-            *mut ffi::ArrowSchema,
-        ) -> std::os::raw::c_int,
-    >,
-    /// Get the next record batch. Called repeatedly by DuckDB during scan.
-    /// Populate `*out` and return 0 for a batch; write a released ArrowArray
-    /// (release=None) and return 0 for end-of-stream. Nonzero = errno.
-    pub get_next: Option<
-        unsafe extern "C" fn(
-            *mut ArrowArrayStream,
-            *mut ffi::ArrowArray,
-        ) -> std::os::raw::c_int,
-    >,
-    /// Return the last error message as a NUL-terminated C string owned by
-    /// the stream, or NULL if none.
-    pub get_last_error:
-        Option<unsafe extern "C" fn(*mut ArrowArrayStream) -> *const c_char>,
-    /// Release stream resources. Called by DuckDB at end-of-scan.
-    pub release: Option<unsafe extern "C" fn(*mut ArrowArrayStream)>,
-    /// Producer-owned opaque state. Set to `Box::into_raw(DucklinkArrowStream)`
-    /// at install; `release` reconstitutes and drops.
-    pub private_data: *mut c_void,
-}
-
-/// Producer state a `DucklinkArrowStream` carries across the four ABI
-/// callbacks. `columns` drives the schema encoded by `get_schema`;
-/// `callback_handle` routes pull calls back through
-/// `Engine2::dispatch_arrow_{open,next,close}` to the guest;
-/// `cursor` holds the guest-side cursor handle, opened lazily on the first
-/// `get_next` and released by `release`.
-///
-/// `Cell<Option<u32>>` for `cursor` is sound here because DuckDB drives the
-/// four vtable fns serially on a single thread per stream — the stream
-/// pointer is never handed to a different consumer while one call is in
-/// flight. Cell is !Sync but we hold this only behind a raw pointer, so
-/// Rust does not require it.
-struct DucklinkArrowStream {
-    engine: std::sync::Weak<Engine2>,
+/// Per-arrow-table extra info handed to the shim VTab callbacks via
+/// `register_table_function_with_extra_info`. `col_codes`/`col_names` drive
+/// the bind schema; `callback_handle` + `engine` route each per-query
+/// `dispatch_arrow_{open,next,close}` back to the owning component instance.
+#[derive(Clone)]
+struct ArrowShimExtra {
     callback_handle: u32,
-    #[allow(dead_code)]
-    extension: String,
-    #[allow(dead_code)]
-    table_name: String,
-    #[allow(dead_code)]
-    columns: Vec<reg::ColumnDef>,
-    /// Guest-side cursor. `None` before the first `get_next` pulls it via
-    /// `dispatch_arrow_open`; `Some(id)` while the stream is live.
-    cursor: std::cell::Cell<Option<u32>>,
-    /// Row -> Arrow encoder built once from `columns` at install time.
-    /// Shared through `Arc` so a future per-query fresh-stream path can
-    /// reuse the schema/field list without rebuilding it.
-    encoder: Arc<crate::arrow_encoder::ArrowEncoder>,
-    /// Latest error message surfaced to `get_last_error`. Held as a
-    /// `CString` so the returned pointer stays valid until the next
-    /// error write.
-    last_error: Mutex<Option<CString>>,
+    engine: Arc<Engine2>,
+    col_codes: Vec<u8>,
+    col_names: Vec<String>,
 }
 
-/// Process-wide registry mirroring `REPLACEMENT_SCAN_REGISTRY`. Keyed by
-/// (extension, table_name); an idempotency guard so a re-load of the same
-/// component does not stack duplicate installations.
-#[allow(dead_code)]
+/// Bind state cloned from `ArrowShimExtra` at bind time. `func` reads
+/// `callback_handle` + `engine` + `col_codes` from here to dispatch the
+/// next-batch pull and write the result column-by-column.
+struct ArrowShimBind {
+    callback_handle: u32,
+    engine: Arc<Engine2>,
+    col_codes: Vec<u8>,
+}
+
+/// Per-query cursor state. `cursor` is `None` before the first `func` call
+/// (opened lazily then), `Some(id)` once opened, and back to `None` after
+/// `Drop` closes it. `eof` short-circuits further `func` calls once the
+/// guest reports an empty batch. `callback_handle` + `engine` are cloned in
+/// so `Drop` can close the cursor without touching bind data (DuckDB drops
+/// init before bind).
+struct ArrowShimInit {
+    engine: Arc<Engine2>,
+    callback_handle: u32,
+    cursor: Mutex<Option<u32>>,
+    eof: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ArrowShimInit {
+    fn drop(&mut self) {
+        if let Some(c) = self.cursor.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Err(e) = self.engine.dispatch_arrow_close(self.callback_handle, c) {
+                eprintln!("[ducklink] arrow shim: dispatch_arrow_close failed: {e}");
+            }
+        }
+    }
+}
+
+/// One `VTab` impl serving every arrow-table shim. `bind` republishes the
+/// declared column list, `init` sets up a lazy cursor slot, `func` pulls one
+/// batch per call and writes it to the output `DataChunkHandle`. Fresh
+/// `BindData`/`InitData` per query = a fresh guest cursor per query, which
+/// is exactly what the old `duckdb_arrow_scan` install path failed to
+/// provide.
+struct ArrowShim;
+
+impl VTab for ArrowShim {
+    type BindData = ArrowShimBind;
+    type InitData = ArrowShimInit;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        guard("arrow shim bind", || {
+            let extra = unsafe { &*bind.get_extra_info::<ArrowShimExtra>() };
+            for (name, &code) in extra.col_names.iter().zip(&extra.col_codes) {
+                bind.add_result_column(name, logical_type(code));
+            }
+            Ok(ArrowShimBind {
+                callback_handle: extra.callback_handle,
+                engine: extra.engine.clone(),
+                col_codes: extra.col_codes.clone(),
+            })
+        })
+    }
+
+    fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        // Snapshot callback_handle + engine into the init data so `Drop` can
+        // close the cursor without reaching for bind data (DuckDB does not
+        // guarantee bind outlives init across parallel scans, and reading
+        // from a dropped bind pointer would be UB).
+        let bind = unsafe { &*init.get_bind_data::<ArrowShimBind>() };
+        Ok(ArrowShimInit {
+            engine: bind.engine.clone(),
+            callback_handle: bind.callback_handle,
+            cursor: Mutex::new(None),
+            eof: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        guard("arrow shim scan", || {
+            let bind = func.get_bind_data();
+            let init = func.get_init_data();
+            if init.eof.load(Ordering::Relaxed) {
+                output.set_len(0);
+                return Ok(());
+            }
+            // Lazy-open the cursor on first call. `cursor` is guarded so a
+            // (hypothetical) reentrant `func` from DuckDB races safely.
+            let cursor = {
+                let mut guard = init.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(c) = *guard {
+                    c
+                } else {
+                    let c = bind
+                        .engine
+                        .dispatch_arrow_open(bind.callback_handle)
+                        .map_err(|e| -> Box<dyn std::error::Error> {
+                            e.to_string().into()
+                        })?;
+                    *guard = Some(c);
+                    c
+                }
+            };
+            let rows = bind
+                .engine
+                .dispatch_arrow_next(bind.callback_handle, cursor)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            if rows.is_empty() {
+                init.eof.store(true, Ordering::Relaxed);
+                output.set_len(0);
+                return Ok(());
+            }
+            let ncols = bind.col_codes.len();
+            let raw_chunk = output.get_ptr();
+            // Row-major write via write_ret_raw (per-cell). The guest hands
+            // us row-major DuckValues from `dispatch_arrow_next`, so a
+            // column-major pivot before write would be an extra pass; the
+            // per-cell writer is sufficient for the streaming path and
+            // reuses the already-tested logical-type-code arms.
+            for (i, row) in rows.iter().enumerate() {
+                if row.len() != ncols {
+                    return Err(format!(
+                        "arrow producer returned {} cols, expected {ncols}",
+                        row.len()
+                    )
+                    .into());
+                }
+                for (c, v) in row.iter().enumerate() {
+                    let vec = unsafe { ffi::duckdb_data_chunk_get_vector(raw_chunk, c as u64) };
+                    unsafe {
+                        write_ret_raw(bind.col_codes[c], vec, i, v)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    }
+                }
+            }
+            output.set_len(rows.len());
+            Ok(())
+        })
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // Arrow shims take no positional args; the replacement scan drives
+        // them with a bare `SELECT * FROM shim()`.
+        Some(vec![])
+    }
+}
+
+/// One entry in the process-wide arrow-table registry consulted by
+/// [`ducklink_replacement_scan_callback`]. `table_name` is the user-facing
+/// bare identifier a bare `SELECT * FROM <name>` references;
+/// `shim_function_name` is the internal DuckDB table function the scan is
+/// rewritten to. `(extension, table_name)` is the idempotency key.
 struct ArrowTableRegistration {
     extension: String,
     table_name: String,
-    callback_handle: u32,
-    columns: Vec<reg::ColumnDef>,
+    shim_function_name: String,
 }
 
 static ARROW_TABLE_REGISTRY: OnceLock<Mutex<Vec<ArrowTableRegistration>>> = OnceLock::new();
@@ -8548,189 +8639,30 @@ fn arrow_table_registry() -> &'static Mutex<Vec<ArrowTableRegistration>> {
     ARROW_TABLE_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Dereference a stream's `private_data` back to its `DucklinkArrowStream`
-/// state. Returns `None` if the pointer or its private data is null so the
-/// caller can surface a stream-level error instead of dereferencing.
-unsafe fn stream_state<'a>(stream: *mut ArrowArrayStream) -> Option<&'a DucklinkArrowStream> {
-    if stream.is_null() {
-        return None;
-    }
-    let pd = (*stream).private_data;
-    if pd.is_null() {
-        return None;
-    }
-    Some(&*(pd as *const DucklinkArrowStream))
+/// Sanitise `extension_table` into a valid SQL identifier suffix: keep
+/// `[a-zA-Z0-9_]` as-is, replace everything else with `_`. Idempotent.
+fn sanitize_shim_ident(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
 }
 
-/// Store an error message on the stream so `get_last_error` can surface it.
-/// Also logs to stderr for out-of-band diagnostics — DuckDB may or may not
-/// query `get_last_error` depending on how it interprets the non-zero
-/// return, and the log line keeps the failure debuggable regardless.
-fn arrow_stream_set_error(state: &DucklinkArrowStream, msg: &str) {
-    if let Ok(mut g) = state.last_error.lock() {
-        *g = CString::new(msg).ok();
-    }
-    eprintln!("[ducklink] arrow stream error: {msg}");
-}
-
-/// `get_schema`: copy the encoder's `FFI_ArrowSchema` into the caller-owned
-/// out slot. `FFI_ArrowSchema` is layout-compatible with
-/// `libduckdb_sys::ArrowSchema` (verified in libduckdb-sys's own layout
-/// test), so a `ptr::write` transfers ownership without a re-encode.
-unsafe extern "C" fn ducklink_arrow_stream_get_schema(
-    stream: *mut ArrowArrayStream,
-    out: *mut ffi::ArrowSchema,
-) -> std::os::raw::c_int {
-    let state = match stream_state(stream) {
-        Some(s) => s,
-        None => return 1,
-    };
-    if out.is_null() {
-        arrow_stream_set_error(state, "get_schema: null out ptr");
-        return 1;
-    }
-    let schema = state.encoder.schema_ffi();
-    std::ptr::write(out as *mut FFI_ArrowSchema, schema);
-    0
-}
-
-/// `get_next`: on first call, open a guest cursor via
-/// `dispatch_arrow_open`; on every call, pull the next batch of rows via
-/// `dispatch_arrow_next`. An empty batch signals EOF — we write a
-/// released `ArrowArray` sentinel (release = None) per the C Data Interface
-/// contract and return 0. A non-empty batch is encoded through
-/// `ArrowEncoder::encode_batch`, whose `FFI_ArrowArray` (layout-compatible
-/// with `ffi::ArrowArray`) is `ptr::write`d into the out slot — the
-/// encoder installs the release callback, so DuckDB owns the buffers'
-/// lifetime once the write completes.
-unsafe extern "C" fn ducklink_arrow_stream_get_next(
-    stream: *mut ArrowArrayStream,
-    out: *mut ffi::ArrowArray,
-) -> std::os::raw::c_int {
-    let state = match stream_state(stream) {
-        Some(s) => s,
-        None => return 1,
-    };
-    if out.is_null() {
-        arrow_stream_set_error(state, "get_next: null out ptr");
-        return 1;
-    }
-    let engine = match state.engine.upgrade() {
-        Some(e) => e,
-        None => {
-            arrow_stream_set_error(state, "get_next: engine dropped");
-            return 1;
-        }
-    };
-    let cursor = match state.cursor.get() {
-        Some(c) => c,
-        None => match engine.dispatch_arrow_open(state.callback_handle) {
-            Ok(c) => {
-                state.cursor.set(Some(c));
-                c
-            }
-            Err(e) => {
-                arrow_stream_set_error(state, &format!("dispatch_arrow_open failed: {e}"));
-                return 1;
-            }
-        },
-    };
-    let rows = match engine.dispatch_arrow_next(state.callback_handle, cursor) {
-        Ok(r) => r,
-        Err(e) => {
-            arrow_stream_set_error(state, &format!("dispatch_arrow_next failed: {e}"));
-            return 1;
-        }
-    };
-    if rows.is_empty() {
-        // EOF: release = None sentinel. Writing the zero-initialised
-        // `ArrowArray::empty()` directly (no `ptr::write` from an owned
-        // FFI value) since we don't want a Rust Drop associated with it.
-        std::ptr::write(out, ffi::ArrowArray::empty());
-        return 0;
-    }
-    let ffi_arr = match state.encoder.encode_batch(&rows) {
-        Ok(a) => a,
-        Err(e) => {
-            arrow_stream_set_error(state, &format!("encode_batch failed: {e}"));
-            return 1;
-        }
-    };
-    std::ptr::write(out as *mut FFI_ArrowArray, ffi_arr);
-    0
-}
-
-/// `get_last_error`: return the cached CString pointer or NULL. The
-/// pointer is valid until the next error write; DuckDB is expected to
-/// copy the message before the next callback call, per the C Data
-/// Interface contract.
-unsafe extern "C" fn ducklink_arrow_stream_get_last_error(
-    stream: *mut ArrowArrayStream,
-) -> *const c_char {
-    let state = match stream_state(stream) {
-        Some(s) => s,
-        None => return std::ptr::null(),
-    };
-    match state.last_error.lock() {
-        Ok(g) => match &*g {
-            Some(cstr) => cstr.as_ptr(),
-            None => std::ptr::null(),
-        },
-        Err(_) => std::ptr::null(),
-    }
-}
-
-/// `release`: close the guest cursor (if opened), drop the boxed
-/// `DucklinkArrowStream` state, and drop the enclosing
-/// `ArrowArrayStream` box itself. Per the spec, the consumer must not
-/// touch the stream memory after this returns, so freeing the outer box
-/// is the producer's responsibility.
-unsafe extern "C" fn ducklink_arrow_stream_release(stream: *mut ArrowArrayStream) {
-    if stream.is_null() {
-        return;
-    }
-    let pd = (*stream).private_data;
-    if !pd.is_null() {
-        let state_box: Box<DucklinkArrowStream> =
-            Box::from_raw(pd as *mut DucklinkArrowStream);
-        if let Some(c) = state_box.cursor.get() {
-            if let Some(engine) = state_box.engine.upgrade() {
-                if let Err(e) = engine.dispatch_arrow_close(state_box.callback_handle, c) {
-                    eprintln!("[ducklink] dispatch_arrow_close failed: {e}");
-                }
-            }
-        }
-        drop(state_box);
-    }
-    (*stream).private_data = std::ptr::null_mut();
-    (*stream).release = None;
-    // The stream struct itself was `Box::into_raw`d at install; reclaim it.
-    drop(Box::from_raw(stream));
-}
-
-/// Install every declared arrow-table producer on `raw_con` via
-/// `duckdb_arrow_scan`. See the module doc block for the one-shot
-/// caveat; the returned count is the number of successful installs.
-///
-/// # Safety
-///
-/// `raw_con` must be a valid `duckdb_connection` handle for the process
-/// lifetime the caller expects DuckDB to consume the streams over.
-pub unsafe fn register_arrow_tables(
-    raw_con: ffi::duckdb_connection,
+/// Install every declared arrow-table producer as a per-table shim
+/// (`__ducklink_arrow_shim_<safe_name>`) plus a replacement-scan mapping
+/// from the bare user-facing name to the shim. The returned count is the
+/// number of successful installs (idempotent — a re-load of the same
+/// component skips already-registered `(extension, name)` pairs).
+pub fn register_arrow_tables(
+    con: &Connection,
     engine: Arc<Engine2>,
     tables: &[ArrowTable],
 ) -> Result<usize, String> {
     if tables.is_empty() {
         return Ok(0);
     }
-    if raw_con.is_null() {
-        return Err("register_arrow_tables: raw_con is null".to_string());
-    }
     let mut installed = 0usize;
     for t in tables {
-        // Idempotency guard: a repeated (extension, table_name) pair is a
-        // no-op so re-loading the same component does not stack streams.
+        // Idempotency: skip repeats of (extension, table_name).
         {
             let reg = arrow_table_registry().lock().unwrap_or_else(|e| e.into_inner());
             let already = reg
@@ -8744,87 +8676,54 @@ pub unsafe fn register_arrow_tables(
                 continue;
             }
         }
-        let encoder = match crate::arrow_encoder::ArrowEncoder::new(&t.columns) {
-            Ok(e) => Arc::new(e),
+        let safe = sanitize_shim_ident(&format!("{}_{}", t.extension, t.name));
+        let shim_name = format!("__ducklink_arrow_shim_{safe}");
+        let col_codes: Vec<u8> = t.columns.iter().map(|c| type_code(&c.logical)).collect();
+        let col_names: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
+        let extra = ArrowShimExtra {
+            callback_handle: t.callback_handle,
+            engine: engine.clone(),
+            col_codes,
+            col_names,
+        };
+        let result = con
+            .register_table_function_with_extra_info::<ArrowShim, ArrowShimExtra>(&shim_name, &extra);
+        match result {
+            Ok(()) => {
+                let mut reg = arrow_table_registry().lock().unwrap_or_else(|e| e.into_inner());
+                reg.push(ArrowTableRegistration {
+                    extension: t.extension.clone(),
+                    table_name: t.name.clone(),
+                    shim_function_name: shim_name.clone(),
+                });
+                drop(reg);
+                installed += 1;
+                eprintln!(
+                    "[ducklink] arrow producer '{}::{}' installed -> {} (per-query cursor)",
+                    t.extension, t.name, shim_name
+                );
+            }
             Err(e) => {
                 eprintln!(
-                    "[ducklink] arrow table '{}::{}': ArrowEncoder build failed: {e}",
+                    "[ducklink] arrow table '{}::{}' shim registration failed: {e}",
                     t.extension, t.name
                 );
-                continue;
             }
-        };
-        let state = Box::new(DucklinkArrowStream {
-            engine: Arc::downgrade(&engine),
-            callback_handle: t.callback_handle,
-            extension: t.extension.clone(),
-            table_name: t.name.clone(),
-            columns: t.columns.clone(),
-            cursor: std::cell::Cell::new(None),
-            encoder,
-            last_error: Mutex::new(None),
-        });
-        let state_ptr = Box::into_raw(state);
-        let stream = Box::new(ArrowArrayStream {
-            get_schema: Some(ducklink_arrow_stream_get_schema),
-            get_next: Some(ducklink_arrow_stream_get_next),
-            get_last_error: Some(ducklink_arrow_stream_get_last_error),
-            release: Some(ducklink_arrow_stream_release),
-            private_data: state_ptr as *mut c_void,
-        });
-        let stream_ptr = Box::into_raw(stream);
-        let name_c = match CString::new(t.name.as_str()) {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!(
-                    "[ducklink] arrow table '{}::{}' has NUL byte in name; skipping",
-                    t.extension, t.name
-                );
-                // Reclaim the boxes we just leaked.
-                drop(Box::from_raw(stream_ptr));
-                drop(Box::from_raw(state_ptr));
-                continue;
-            }
-        };
-        // Wrap our ArrowArrayStream pointer in the `_duckdb_arrow_stream`
-        // shell DuckDB's arrow_scan API consumes. DuckDB extracts
-        // `internal_ptr` synchronously inside the call, so a stack-alloc
-        // wrapper is safe.
-        let mut wrapper = ffi::_duckdb_arrow_stream {
-            internal_ptr: stream_ptr as *mut c_void,
-        };
-        let rc = ffi::duckdb_arrow_scan(
-            raw_con,
-            name_c.as_ptr(),
-            &mut wrapper as *mut ffi::_duckdb_arrow_stream,
-        );
-        if rc != ffi::DuckDBSuccess {
-            eprintln!(
-                "[ducklink] arrow table '{}::{}': duckdb_arrow_scan failed (rc={rc})",
-                t.extension, t.name
-            );
-            // On failure DuckDB did not adopt the stream — reclaim it.
-            drop(Box::from_raw(stream_ptr));
-            drop(Box::from_raw(state_ptr));
-            continue;
         }
-        {
-            let mut reg = arrow_table_registry().lock().unwrap_or_else(|e| e.into_inner());
-            reg.push(ArrowTableRegistration {
-                extension: t.extension.clone(),
-                table_name: t.name.clone(),
-                callback_handle: t.callback_handle,
-                columns: t.columns.clone(),
-            });
-        }
-        installed += 1;
-        eprintln!(
-            "[ducklink] arrow producer '{}::{}' installed as one-shot; second query will \
-             return empty until reload — need replacement-scan hookup for per-query fresh streams",
-            t.extension, t.name
-        );
     }
     Ok(installed)
+}
+
+/// Return the shim function name registered for a bare table reference,
+/// or `None` if no arrow producer claims that name. Case-sensitive to
+/// match DuckDB's default identifier resolution.
+fn arrow_shim_for_table_name(name: &str) -> Option<String> {
+    let reg = ARROW_TABLE_REGISTRY.get()?;
+    let guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .iter()
+        .find(|r| r.table_name == name)
+        .map(|r| r.shim_function_name.clone())
 }
 
 // ---------------------------------------------------------------------------
