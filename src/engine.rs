@@ -144,6 +144,20 @@ pub struct AggregateFunc {
     pub callback_handle: u32,
 }
 
+/// A DuckDB replacement scan the component asked the host to wire.
+/// `extensions` are lower-case file extensions (no dot, e.g. `"gb"`);
+/// `function_name` is the target table function's registered name.
+///
+/// Consumed by `reg_duckdb::register_replacement_scans`, which calls
+/// `duckdb_add_replacement_scan` on the connection's database and installs
+/// a callback that rewrites `FROM 'x.<ext>'` to `FROM <fn>('x.<ext>')`.
+#[derive(Clone, Debug)]
+pub struct ReplacementScan {
+    pub extension: String,
+    pub extensions: Vec<String>,
+    pub function_name: String,
+}
+
 /// What a component registered: the functions a direction-specific sink bridges
 /// into the database.
 #[derive(Clone, Debug, Default)]
@@ -151,6 +165,11 @@ pub struct LoadedComponent {
     pub scalars: Vec<ScalarFunc>,
     pub tables: Vec<TableFunc>,
     pub aggregates: Vec<AggregateFunc>,
+    /// File-extension → registered-table-function name mappings from the
+    /// component's `files::register_replacement_scan` calls. Drained from
+    /// the runtime's pending state alongside scalars/tables/aggregates;
+    /// consumed by `reg_duckdb::register_replacement_scans`.
+    pub replacement_scans: Vec<ReplacementScan>,
     /// Component-provided documentation parsed from the wasm's `duckdb.docs`
     /// custom section, if present. Overrides catalog docs field-by-field at
     /// query time; `None` for components that don't ship a section.
@@ -277,6 +296,15 @@ impl Engine2 {
                 callback_handle: a.callback_handle,
             })
             .collect();
+        let replacement_scans = pending
+            .replacement_scans
+            .into_iter()
+            .map(|r| ReplacementScan {
+                extension: r.extension,
+                extensions: r.extensions,
+                function_name: r.function_name,
+            })
+            .collect();
         let instance_arc = Arc::new(Mutex::new(instance));
         {
             let mut map = self.instances.write().expect("instances lock poisoned");
@@ -294,6 +322,7 @@ impl Engine2 {
             .expect("callback registry poisoned")
             .link_extension_instance(extension, &instance_arc);
         Ok(LoadedComponent {
+            replacement_scans,
             scalars,
             tables,
             aggregates,
