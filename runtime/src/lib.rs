@@ -353,8 +353,8 @@ pub use extension::{
     add_extension_interfaces_to_linker, describe_runtime_logicaltype, load_component,
     load_component_with_dynlink, summarize_extopts, summarize_funcopts,
     summarize_registration_names, summarize_runtime_columns, summarize_runtime_funcargs,
-    ConfigError, ExtensionInstance, ExtensionServices, ExtensionStoreState, LogField, LogLevel,
-    PendingRegistrationsData,
+    ConfigError, ExtensionInstance, ExtensionServices, ExtensionStoreState, LogEntry, LogField,
+    LogLevel, PendingRegistrationsData,
 };
 
 /// The generated wasmtime bindings for the `duckdb:extension-host` world — the
@@ -566,6 +566,22 @@ pub mod duckdb_extension_optimizer_bindings {
     wasmtime::component::bindgen!({
         path: "./wit",
         world: "duckdb:extension-host/duckdb-extension-optimizer",
+        require_store_data_send: true,
+        with: {
+            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+        },
+    });
+}
+
+/// Bindings for the log-storage world (`duckdb-extension-log-storage`, 3.2.0),
+/// which additionally exports `log-storage-dispatch`. Only components that back
+/// a named log sink satisfy this; the runtime builds these bindings lazily from
+/// an already-loaded instance. Class B parity with the stable
+/// `duckdb_register_log_storage` C API.
+pub mod duckdb_extension_log_storage_bindings {
+    wasmtime::component::bindgen!({
+        path: "./wit",
+        world: "duckdb:extension-host/duckdb-extension-log-storage",
         require_store_data_send: true,
         with: {
             "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
@@ -977,6 +993,15 @@ pub mod reg {
     /// NULL-handling mode. `varargs` is the declared trailing repeatable type
     /// (None = no varargs); `special_null` is true when the function is invoked on
     /// NULL inputs. `callback_handle` routes invocations.
+    ///
+    /// `volatile` controls whether the direction-specific sink marks the C API
+    /// scalar as `duckdb_scalar_function_set_volatile` — the WIT `funcflags` does
+    /// not expose a VOLATILE bit directly (yet), so the host derives it from the
+    /// funcopts attributes: any scalar-ex whose attributes DON'T include
+    /// `deterministic` is treated as VOLATILE (re-evaluated per row), matching
+    /// DuckDB's IMMUTABLE vs VOLATILE semantics. Absent options default to
+    /// non-volatile so the audit finding "treats every ex-path fn as VOLATILE by
+    /// default" is closed.
     #[derive(Clone, Debug)]
     pub struct ScalarExReg {
         pub extension: String,
@@ -985,6 +1010,7 @@ pub mod reg {
         pub varargs: Option<LogicalType>,
         pub returns: LogicalType,
         pub special_null: bool,
+        pub volatile: bool,
         pub callback_handle: u32,
         pub options: Option<FuncOpts>,
     }

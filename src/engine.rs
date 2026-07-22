@@ -7,6 +7,7 @@
 //! routes per-row calls back to [`Engine2::dispatch_scalar`]) lives behind the
 //! crate's `loadable` feature.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -21,9 +22,52 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::{
 };
 use ducklink_runtime::reg;
 use ducklink_runtime::{
-    load_component, CallbackRegistry, ConfigError, ExtensionInstance, ExtensionServices, LogField,
-    LogLevel, PendingRegistrationsData,
+    load_component, CallbackRegistry, ConfigError, ExtensionInstance, ExtensionServices, LogEntry,
+    LogField, LogLevel, PendingRegistrationsData,
 };
+
+#[cfg(feature = "duckdb-api")]
+use duckdb::ffi;
+
+/// A live DuckDB connection handle the extension can call the C API against.
+/// The pointer is opaque here (never dereferenced except by the DuckDB C API
+/// callers below) and Copy — the connection itself is owned by whoever opened
+/// it (the `loadable` init path in `src/lib.rs`, the `register_load_function`
+/// persistent-connection path in `src/reg_duckdb.rs`), which must keep it
+/// alive for the whole process. NativeServices only borrows the pointer.
+///
+/// `Send + Sync` is asserted below: the raw pointer type is neither by default,
+/// but the DuckDB C API for `duckdb_client_context_get_config_option` and
+/// friends is safe to call from any thread as long as the connection outlives
+/// the call — which the process-wide-lifetime rule above guarantees.
+#[cfg(feature = "duckdb-api")]
+#[derive(Clone, Copy)]
+pub struct DuckConn(pub ffi::duckdb_connection);
+
+#[cfg(feature = "duckdb-api")]
+unsafe impl Send for DuckConn {}
+#[cfg(feature = "duckdb-api")]
+unsafe impl Sync for DuckConn {}
+
+thread_local! {
+    /// When set, a reg_duckdb scalar/table dispatcher is currently running on
+    /// this thread and holding the DuckDB executor lock. A re-entrant
+    /// `NativeServices::query()` call from inside the guest (routed through
+    /// this same thread) would deadlock on that lock — so we refuse instead.
+    /// `reg_duckdb` sets the guard around every dispatcher body it invokes
+    /// (that edit lives in the sibling reg_duckdb branch).
+    static QUERY_REENTRANCY_GUARD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set the re-entrancy guard for the current thread. Returns the previous
+/// value so callers can restore it (nested dispatchers stay quiet). Called
+/// by `reg_duckdb`'s scalar/table wrappers around every guest dispatch.
+///
+/// Public so the sibling `reg_duckdb` module can wrap dispatches with:
+/// `let prev = set_query_reentrancy_guard(true); ...; set_query_reentrancy_guard(prev);`
+pub fn set_query_reentrancy_guard(active: bool) -> bool {
+    QUERY_REENTRANCY_GUARD.with(|c| c.replace(active))
+}
 
 /// Build a component-model wasmtime engine for running extension components.
 /// Mirrors the host's engine config (component model + wasm exceptions, which
@@ -61,40 +105,341 @@ fn build_engine() -> Result<Engine> {
         .context("failed to create wasmtime engine")
 }
 
-/// Config/logging sink for native DuckDB. Logging goes to stderr; config reads
-/// are not yet wired to DuckDB's settings (they return `None`). Routing these to
-/// the DuckDB C API is a follow-up; components that only register functions do
-/// not depend on it.
-struct NativeServices;
+/// Config/logging/query sink for native DuckDB. Logging goes to stderr; when
+/// Engine2 has been attached to a live DuckDB connection (see
+/// [`Engine2::attach_duckdb_connection`]) the config getters read the real
+/// DuckDB settings via the C API and `query()` runs read-only SQL against the
+/// live database. Without a connection (bench harness, standalone tests) or
+/// under the non-`duckdb-api` build, every getter reports `Ok(None)` and
+/// `query()` returns an unavailable error — the shape the guest ecosystem
+/// already tolerates.
+struct NativeServices {
+    /// The DuckDB connection to route config lookups and live queries against.
+    /// `None` when Engine2 was never attached to a connection (bench / standalone
+    /// tests) — every getter then degrades to `Ok(None)` and `query()` to
+    /// `Err("live query not available in this host")`. Absent entirely on the
+    /// non-`duckdb-api` build (the ffi bindings aren't linked).
+    #[cfg(feature = "duckdb-api")]
+    conn: Option<DuckConn>,
+}
+
+impl NativeServices {
+    /// Build a services sink that will use `conn` to answer config reads and
+    /// live queries. `conn == None` degrades every getter to `Ok(None)` and
+    /// `query()` to `Err(...)` — the default host-services contract.
+    #[cfg(feature = "duckdb-api")]
+    fn new(conn: Option<DuckConn>) -> Self {
+        Self { conn }
+    }
+
+    /// Build a services sink with no DuckDB C API access (non-`duckdb-api`
+    /// build — bench harness / standalone tests). Every config getter returns
+    /// `Ok(None)` and `query()` returns the unavailable error.
+    #[cfg(not(feature = "duckdb-api"))]
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+/// Grab a scoped `duckdb_client_context` from `conn`, run `f` with it, then
+/// destroy it. `f`'s return value is passed through. Returns `None` if the
+/// client-context handle came back null (never seen in practice, but guarded
+/// against so a fresh DuckDB build that changes the semantics won't segfault).
+#[cfg(feature = "duckdb-api")]
+unsafe fn with_client_context<T, F>(conn: DuckConn, f: F) -> Option<T>
+where
+    F: FnOnce(ffi::duckdb_client_context) -> T,
+{
+    let mut ctx: ffi::duckdb_client_context = std::ptr::null_mut();
+    ffi::duckdb_connection_get_client_context(conn.0, &mut ctx);
+    if ctx.is_null() {
+        return None;
+    }
+    let out = f(ctx);
+    ffi::duckdb_destroy_client_context(&mut ctx);
+    Some(out)
+}
+
+/// Fetch the DuckDB config option `path` as a `duckdb_value` object. Returns
+/// `None` when the option is not registered; callers must destroy the returned
+/// value with `duckdb_destroy_value`. The client-context handle is scoped to
+/// this call so we do not leak it into the caller.
+///
+/// Errors only on genuine FFI failures (a `path` containing an interior NUL);
+/// absence of the option is `Ok(None)`.
+#[cfg(feature = "duckdb-api")]
+unsafe fn fetch_config_value(
+    conn: DuckConn,
+    path: &str,
+) -> Result<Option<ffi::duckdb_value>, ConfigError> {
+    let cname = std::ffi::CString::new(path)
+        .map_err(|_| ConfigError::InvalidKey(format!("path '{path}' contains NUL byte")))?;
+    let mut scope: ffi::duckdb_config_option_scope = 0;
+    let raw = with_client_context(conn, |ctx| {
+        ffi::duckdb_client_context_get_config_option(ctx, cname.as_ptr(), &mut scope)
+    });
+    match raw {
+        Some(v) if !v.is_null() => Ok(Some(v)),
+        _ => Ok(None),
+    }
+}
+
+/// Coerce a returned config `duckdb_value` into a UTF-8 string using
+/// `duckdb_get_varchar` (which stringifies any DuckDB type). The value is
+/// destroyed after reading. Returns `None` if the C-side returned null or the
+/// bytes are not valid UTF-8.
+#[cfg(feature = "duckdb-api")]
+unsafe fn value_to_string(mut value: ffi::duckdb_value) -> Option<String> {
+    let cstr = ffi::duckdb_get_varchar(value);
+    let out = if cstr.is_null() {
+        None
+    } else {
+        let s = std::ffi::CStr::from_ptr(cstr).to_str().ok().map(|s| s.to_string());
+        ffi::duckdb_free(cstr.cast());
+        s
+    };
+    ffi::duckdb_destroy_value(&mut value);
+    out
+}
 
 impl ExtensionServices for NativeServices {
     fn provider_version(&mut self) -> Result<String, ConfigError> {
         Ok(concat!("ducklink-extension/", env!("CARGO_PKG_VERSION")).to_string())
     }
-    fn list_keys(&mut self, _prefix: Option<&str>) -> Result<Vec<String>, ConfigError> {
-        Ok(Vec::new())
+
+    fn list_keys(&mut self, prefix: Option<&str>) -> Result<Vec<String>, ConfigError> {
+        #[cfg(feature = "duckdb-api")]
+        {
+            // The catalog of DuckDB config flags is process-wide (not tied to a
+            // connection), so this works even when `self.conn` is None.
+            let count = unsafe { ffi::duckdb_config_count() };
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let mut name_ptr: *const std::os::raw::c_char = std::ptr::null();
+                let mut desc_ptr: *const std::os::raw::c_char = std::ptr::null();
+                let state = unsafe {
+                    ffi::duckdb_get_config_flag(i, &mut name_ptr, &mut desc_ptr)
+                };
+                if state != ffi::DuckDBSuccess || name_ptr.is_null() {
+                    continue;
+                }
+                let name = match unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                if let Some(p) = prefix {
+                    if !name.starts_with(p) {
+                        continue;
+                    }
+                }
+                out.push(name);
+            }
+            Ok(out)
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = prefix;
+            Ok(Vec::new())
+        }
     }
-    fn get_string(&mut self, _path: &str) -> Result<Option<String>, ConfigError> {
-        Ok(None)
+
+    fn get_string(&mut self, path: &str) -> Result<Option<String>, ConfigError> {
+        #[cfg(feature = "duckdb-api")]
+        {
+            let Some(conn) = self.conn else { return Ok(None) };
+            let Some(value) = (unsafe { fetch_config_value(conn, path)? }) else {
+                return Ok(None);
+            };
+            Ok(unsafe { value_to_string(value) })
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = path;
+            Ok(None)
+        }
     }
-    fn get_bool(&mut self, _path: &str) -> Result<Option<bool>, ConfigError> {
-        Ok(None)
+
+    fn get_bool(&mut self, path: &str) -> Result<Option<bool>, ConfigError> {
+        #[cfg(feature = "duckdb-api")]
+        {
+            let Some(conn) = self.conn else { return Ok(None) };
+            let Some(mut value) = (unsafe { fetch_config_value(conn, path)? }) else {
+                return Ok(None);
+            };
+            // `duckdb_get_value_type` returns a borrowed logical type owned
+            // by the value — DuckDB explicitly documents that we must NOT
+            // destroy it. Read the type id and drop the reference.
+            let ty = unsafe { ffi::duckdb_get_value_type(value) };
+            let type_id = if ty.is_null() {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID
+            } else {
+                unsafe { ffi::duckdb_get_type_id(ty) }
+            };
+            let out = if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN {
+                Some(unsafe { ffi::duckdb_get_bool(value) })
+            } else {
+                // Fall back to a stringified reading of the value so callers
+                // don't get spurious `None` for an option that DuckDB stores
+                // as VARCHAR ("true"/"false"). Type mismatches (e.g. a
+                // numeric config option) collapse to `None`.
+                unsafe { ffi::duckdb_destroy_value(&mut value) };
+                let Some(s) = self.get_string(path)? else { return Ok(None) };
+                return Ok(match s.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "on" | "yes" => Some(true),
+                    "false" | "0" | "off" | "no" => Some(false),
+                    _ => None,
+                });
+            };
+            unsafe { ffi::duckdb_destroy_value(&mut value) };
+            Ok(out)
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = path;
+            Ok(None)
+        }
     }
-    fn get_i64(&mut self, _path: &str) -> Result<Option<i64>, ConfigError> {
-        Ok(None)
+
+    fn get_i64(&mut self, path: &str) -> Result<Option<i64>, ConfigError> {
+        #[cfg(feature = "duckdb-api")]
+        {
+            let Some(conn) = self.conn else { return Ok(None) };
+            let Some(mut value) = (unsafe { fetch_config_value(conn, path)? }) else {
+                return Ok(None);
+            };
+            // `duckdb_get_value_type` returns a borrowed logical type owned
+            // by the value — DuckDB explicitly documents that we must NOT
+            // destroy it. Read the type id and drop the reference.
+            let ty = unsafe { ffi::duckdb_get_value_type(value) };
+            let type_id = if ty.is_null() {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID
+            } else {
+                unsafe { ffi::duckdb_get_type_id(ty) }
+            };
+            let out = match type_id {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => Some(unsafe { ffi::duckdb_get_int64(value) }),
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => {
+                    Some(unsafe { ffi::duckdb_get_int32(value) } as i64)
+                }
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => {
+                    let u = unsafe { ffi::duckdb_get_uint64(value) };
+                    if u <= i64::MAX as u64 { Some(u as i64) } else { None }
+                }
+                _ => {
+                    unsafe { ffi::duckdb_destroy_value(&mut value) };
+                    let Some(s) = self.get_string(path)? else { return Ok(None) };
+                    return Ok(s.parse::<i64>().ok());
+                }
+            };
+            unsafe { ffi::duckdb_destroy_value(&mut value) };
+            Ok(out)
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = path;
+            Ok(None)
+        }
     }
-    fn get_u64(&mut self, _path: &str) -> Result<Option<u64>, ConfigError> {
-        Ok(None)
+
+    fn get_u64(&mut self, path: &str) -> Result<Option<u64>, ConfigError> {
+        #[cfg(feature = "duckdb-api")]
+        {
+            let Some(conn) = self.conn else { return Ok(None) };
+            let Some(mut value) = (unsafe { fetch_config_value(conn, path)? }) else {
+                return Ok(None);
+            };
+            // `duckdb_get_value_type` returns a borrowed logical type owned
+            // by the value — DuckDB explicitly documents that we must NOT
+            // destroy it. Read the type id and drop the reference.
+            let ty = unsafe { ffi::duckdb_get_value_type(value) };
+            let type_id = if ty.is_null() {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID
+            } else {
+                unsafe { ffi::duckdb_get_type_id(ty) }
+            };
+            let out = match type_id {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => Some(unsafe { ffi::duckdb_get_uint64(value) }),
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => {
+                    let i = unsafe { ffi::duckdb_get_int64(value) };
+                    if i >= 0 { Some(i as u64) } else { None }
+                }
+                _ => {
+                    unsafe { ffi::duckdb_destroy_value(&mut value) };
+                    let Some(s) = self.get_string(path)? else { return Ok(None) };
+                    return Ok(s.parse::<u64>().ok());
+                }
+            };
+            unsafe { ffi::duckdb_destroy_value(&mut value) };
+            Ok(out)
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = path;
+            Ok(None)
+        }
     }
-    fn get_f64(&mut self, _path: &str) -> Result<Option<f64>, ConfigError> {
-        Ok(None)
+
+    fn get_f64(&mut self, path: &str) -> Result<Option<f64>, ConfigError> {
+        #[cfg(feature = "duckdb-api")]
+        {
+            let Some(conn) = self.conn else { return Ok(None) };
+            let Some(mut value) = (unsafe { fetch_config_value(conn, path)? }) else {
+                return Ok(None);
+            };
+            // `duckdb_get_value_type` returns a borrowed logical type owned
+            // by the value — DuckDB explicitly documents that we must NOT
+            // destroy it. Read the type id and drop the reference.
+            let ty = unsafe { ffi::duckdb_get_value_type(value) };
+            let type_id = if ty.is_null() {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID
+            } else {
+                unsafe { ffi::duckdb_get_type_id(ty) }
+            };
+            let out = match type_id {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE => Some(unsafe { ffi::duckdb_get_double(value) }),
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => {
+                    Some(unsafe { ffi::duckdb_get_int64(value) } as f64)
+                }
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => {
+                    Some(unsafe { ffi::duckdb_get_uint64(value) } as f64)
+                }
+                _ => {
+                    unsafe { ffi::duckdb_destroy_value(&mut value) };
+                    let Some(s) = self.get_string(path)? else { return Ok(None) };
+                    return Ok(s.parse::<f64>().ok());
+                }
+            };
+            unsafe { ffi::duckdb_destroy_value(&mut value) };
+            Ok(out)
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = path;
+            Ok(None)
+        }
     }
+
     fn get_bytes(&mut self, _path: &str) -> Result<Option<Vec<u8>>, ConfigError> {
+        // DuckDB does not model BLOB-typed config options in the settings
+        // catalog, so a get_bytes lookup would never resolve. Stay `Ok(None)`
+        // rather than round-tripping through get_varchar, which would return
+        // the utf-8 representation of a stringy value.
         Ok(None)
     }
-    fn get_string_list(&mut self, _path: &str) -> Result<Option<Vec<String>>, ConfigError> {
-        Ok(None)
+
+    fn get_string_list(&mut self, path: &str) -> Result<Option<Vec<String>>, ConfigError> {
+        // DuckDB's settings catalog exposes list-shaped options as
+        // comma-separated VARCHAR (e.g. `allowed_paths`, `custom_extension_repository`
+        // remain scalar today; no LIST-typed setting exists). If a caller asks
+        // for a string-list-shaped option, we resolve the underlying string and
+        // split on ','; if the option is absent we return `Ok(None)`.
+        let Some(s) = self.get_string(path)? else { return Ok(None) };
+        if s.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(s.split(',').map(|piece| piece.trim().to_string()).collect()))
     }
+
     fn log(&mut self, level: LogLevel, message: &str, target: Option<&str>) {
         match target {
             Some(t) => eprintln!("[ducklink:{level:?}:{t}] {message}"),
@@ -107,6 +452,69 @@ impl ExtensionServices for NativeServices {
             .map(|f| format!("{}={}", f.key, f.value))
             .collect();
         eprintln!("[ducklink:{level:?}] {message} {{{}}}", rendered.join(", "));
+    }
+
+    fn query(&mut self, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        // Re-entrancy: a guest scalar/table dispatcher running on this thread
+        // already holds the DuckDB executor lock. Calling `duckdb_query` from
+        // inside would deadlock — reject cleanly so the guest can degrade.
+        if QUERY_REENTRANCY_GUARD.with(|c| c.get()) {
+            return Err(
+                "query() called re-entrantly from inside a dispatch — not permitted".to_string(),
+            );
+        }
+        #[cfg(feature = "duckdb-api")]
+        {
+            let Some(conn) = self.conn else {
+                return Err("live query not available in this host".to_string());
+            };
+            let csql = std::ffi::CString::new(sql)
+                .map_err(|_| "sql contains a NUL byte".to_string())?;
+            let mut result: ffi::duckdb_result = unsafe { std::mem::zeroed() };
+            let state = unsafe { ffi::duckdb_query(conn.0, csql.as_ptr(), &mut result) };
+            if state != ffi::DuckDBSuccess {
+                let err_ptr = unsafe { ffi::duckdb_result_error(&mut result) };
+                let msg = if err_ptr.is_null() {
+                    "query failed".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err_ptr) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                unsafe { ffi::duckdb_destroy_result(&mut result) };
+                return Err(msg);
+            }
+            let cols = unsafe { ffi::duckdb_column_count(&mut result) };
+            let rows = unsafe { ffi::duckdb_row_count(&mut result) };
+            let mut out: Vec<Vec<String>> = Vec::with_capacity(rows as usize);
+            for r in 0..rows {
+                let mut row: Vec<String> = Vec::with_capacity(cols as usize);
+                for c in 0..cols {
+                    if unsafe { ffi::duckdb_value_is_null(&mut result, c, r) } {
+                        row.push(String::new());
+                        continue;
+                    }
+                    let cstr = unsafe { ffi::duckdb_value_varchar(&mut result, c, r) };
+                    if cstr.is_null() {
+                        row.push(String::new());
+                    } else {
+                        let s = unsafe { std::ffi::CStr::from_ptr(cstr) }
+                            .to_string_lossy()
+                            .into_owned();
+                        unsafe { ffi::duckdb_free(cstr.cast()) };
+                        row.push(s);
+                    }
+                }
+                out.push(row);
+            }
+            unsafe { ffi::duckdb_destroy_result(&mut result) };
+            Ok(out)
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = sql;
+            Err("live query not available in this host".to_string())
+        }
     }
 }
 
@@ -158,6 +566,150 @@ pub struct ReplacementScan {
     pub function_name: String,
 }
 
+/// A configuration option a component declared via
+/// `runtime.register-setting`. The DuckDB sink is expected to install it as
+/// a DB config option so `SET <name>=<value>` reaches the core catalog.
+/// `ty` is one of "boolean"/"varchar"/"bigint"/"double"; `scope` is
+/// "local" or "global". Consumed by `reg_duckdb` in a later phase.
+#[derive(Clone, Debug)]
+pub struct Setting {
+    pub extension: String,
+    pub name: String,
+    pub description: String,
+    pub ty: String,
+    pub default_value: Option<String>,
+    pub scope: String,
+}
+
+/// A COPY handler the component registered (e.g. `COPY ... TO 'x.parquet'`).
+/// `file_extension` is the lower-case extension (no dot) that routes to the
+/// already-registered scalar `function_handle`; `function_handle` resolves
+/// through the callback registry on every `copy-dispatch` call.
+#[derive(Clone, Debug)]
+pub struct CopyHandler {
+    pub extension: String,
+    pub file_extension: String,
+    pub function_handle: u32,
+}
+
+/// An Arrow-table producer the component registered. `columns` is the result
+/// schema; `callback_handle` routes the host's pull calls through the
+/// callback registry back to the owning component.
+#[derive(Clone, Debug)]
+pub struct ArrowTable {
+    pub extension: String,
+    pub name: String,
+    pub columns: Vec<reg::ColumnDef>,
+    pub callback_handle: u32,
+}
+
+/// A richer scalar the component registered via
+/// `runtime-ext.register-scalar-ex`: carries varargs and a NULL-handling mode
+/// that plain [`ScalarFunc`] cannot express. `varargs` is the declared
+/// trailing repeatable type (`None` = fixed arity); `special_null` = true
+/// means the guest is invoked even on NULL inputs (otherwise DuckDB
+/// short-circuits to NULL).
+#[derive(Clone, Debug)]
+pub struct ScalarEx {
+    pub extension: String,
+    pub name: String,
+    pub arguments: Vec<reg::FuncArg>,
+    pub varargs: Option<reg::LogicalType>,
+    pub returns: reg::LogicalType,
+    pub special_null: bool,
+    /// Drives whether the direction-specific sink calls
+    /// `duckdb_scalar_function_set_volatile`. Populated by the runtime from the
+    /// register-scalar-ex attributes; non-volatile is the default (see
+    /// `ScalarExReg::volatile`).
+    pub volatile: bool,
+    pub callback_handle: u32,
+}
+
+/// A named cast between two DuckDB types the component registered.
+/// `callback_handle` routes every cast call back through the callback
+/// registry to the owning component's dispatcher.
+#[derive(Clone, Debug)]
+pub struct CastEntry {
+    pub extension: String,
+    pub source: String,
+    pub target: String,
+    pub callback_handle: u32,
+}
+
+/// A user-defined logical type alias the component registered.
+/// `name` is the new type; `physical` is the underlying DuckDB type
+/// expression (e.g. `"BIGINT"`).
+#[derive(Clone, Debug)]
+pub struct LogicalTypeEntry {
+    pub extension: String,
+    pub name: String,
+    pub physical: String,
+}
+
+/// A SQL macro the component registered (usable in the SELECT clause).
+/// `parameters` are positional names; `definition_sql` is the body expression.
+#[derive(Clone, Debug)]
+pub struct MacroEntry {
+    pub extension: String,
+    pub schema: String,
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub definition_sql: String,
+}
+
+/// A SQL table macro the component registered (usable in the FROM clause).
+/// `parameters` are positional names; `body_sql` is the relational body.
+#[derive(Clone, Debug)]
+pub struct TableMacroEntry {
+    pub extension: String,
+    pub schema: String,
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub body_sql: String,
+}
+
+/// An ENUM type the component registered. `members` is the ordered list of
+/// enum member names.
+#[derive(Clone, Debug)]
+pub struct EnumTypeEntry {
+    pub extension: String,
+    pub name: String,
+    pub members: Vec<String>,
+}
+
+/// A logical type registered over a full type-expression (e.g.
+/// `DECIMAL(18,3)`). Rides the existing type-expression escape hatch, so
+/// the runtime never invents a new WIT arm.
+#[derive(Clone, Debug)]
+pub struct ModifiedTypeEntry {
+    pub extension: String,
+    pub name: String,
+    pub type_expr: String,
+}
+
+/// A storage / catalog backend the component registered. Keyed by an ATTACH
+/// `type_name` (e.g. `"sqlite"`); `callback_handle` routes every
+/// `storage-dispatch` call back through the callback registry to the owning
+/// component.
+#[derive(Clone, Debug)]
+pub struct StorageEntry {
+    pub extension: String,
+    pub type_name: String,
+    pub callback_handle: u32,
+}
+
+/// A log-storage sink the component registered. `callback_handle` routes
+/// every log-storage callback back to the owning component. `extension` is
+/// materialised from the outer load-time extension name for parity with the
+/// sibling entries (the runtime's `PendingLogStorage` doesn't carry it
+/// because a log storage is scoped to the loading component by construction).
+#[derive(Clone, Debug)]
+pub struct LogStorageEntry {
+    pub extension: String,
+    pub name: String,
+    pub callback_handle: u32,
+}
+
 /// What a component registered: the functions a direction-specific sink bridges
 /// into the database.
 #[derive(Clone, Debug, Default)]
@@ -170,6 +722,43 @@ pub struct LoadedComponent {
     /// the runtime's pending state alongside scalars/tables/aggregates;
     /// consumed by `reg_duckdb::register_replacement_scans`.
     pub replacement_scans: Vec<ReplacementScan>,
+    /// Casts the component registered via `runtime.register-cast`. Drained
+    /// from the runtime's `pending.casts`; previously silently dropped.
+    pub casts: Vec<CastEntry>,
+    /// SQL macros the component registered via `runtime.register-macro`.
+    /// Drained from the runtime's `pending.macros`; previously silently
+    /// dropped.
+    pub macros: Vec<MacroEntry>,
+    /// User-defined logical type aliases from `runtime.register-logical-type`.
+    /// Drained from `pending.logical_types`; previously silently dropped.
+    pub logical_types: Vec<LogicalTypeEntry>,
+    /// Storage / catalog backends from `runtime.register-storage`. Drained
+    /// from `pending.storages`; previously silently dropped.
+    pub storages: Vec<StorageEntry>,
+    /// Configuration options the component declared via
+    /// `runtime.register-setting`. Drained from `pending.settings`.
+    pub settings: Vec<Setting>,
+    /// COPY handlers from `runtime.register-copy-handler`, keyed by file
+    /// extension. Drained from `pending.copy_handlers`.
+    pub copy_handlers: Vec<CopyHandler>,
+    /// Arrow-table producers from `runtime.register-arrow-table`. Drained
+    /// from `pending.arrow_tables`.
+    pub arrow_tables: Vec<ArrowTable>,
+    /// Rich scalars from `runtime-ext.register-scalar-ex` (varargs +
+    /// NULL-handling). Drained from `pending.scalar_ex`.
+    pub scalar_ex: Vec<ScalarEx>,
+    /// SQL table macros from `runtime.register-table-macro`. Drained from
+    /// `pending.table_macros`.
+    pub table_macros: Vec<TableMacroEntry>,
+    /// ENUM types from `runtime.register-enum-type`. Drained from
+    /// `pending.enum_types`.
+    pub enum_types: Vec<EnumTypeEntry>,
+    /// Types registered over a full type-expression (e.g. DECIMAL(18,3)).
+    /// Drained from `pending.modified_types`.
+    pub modified_types: Vec<ModifiedTypeEntry>,
+    /// Log-storage sinks the component registered. Drained from
+    /// `pending.log_storages`.
+    pub log_storages: Vec<LogStorageEntry>,
     /// Component-provided documentation parsed from the wasm's `duckdb.docs`
     /// custom section, if present. Overrides catalog docs field-by-field at
     /// query time; `None` for components that don't ship a section.
@@ -189,6 +778,14 @@ pub struct Engine2 {
     engine: Engine,
     callbacks: Arc<RwLock<CallbackRegistry>>,
     instances: RwLock<HashMap<String, Arc<Mutex<ExtensionInstance>>>>,
+    /// Live DuckDB connection handle for the `NativeServices` config/query
+    /// sink. Populated by [`Engine2::attach_duckdb_connection`] after the
+    /// extension init opens its persistent connection; used by every
+    /// subsequent [`Engine2::load`] to hand the guest a working config /
+    /// live-query surface. `None` under the non-`duckdb-api` build (the ffi
+    /// bindings aren't linked) and before the first attach.
+    #[cfg(feature = "duckdb-api")]
+    duckdb_conn: RwLock<Option<DuckConn>>,
 }
 
 impl Engine2 {
@@ -205,7 +802,29 @@ impl Engine2 {
             engine: build_engine()?,
             callbacks: Arc::new(RwLock::new(CallbackRegistry::new())),
             instances: RwLock::new(HashMap::new()),
+            #[cfg(feature = "duckdb-api")]
+            duckdb_conn: RwLock::new(None),
         })
+    }
+
+    /// Attach a live DuckDB connection to this engine so subsequently-loaded
+    /// components can read real config values and run live queries through
+    /// `NativeServices`. The connection is opaque here — the caller (the
+    /// loadable-extension init in `src/lib.rs`, the `register_load_function`
+    /// path in `src/reg_duckdb.rs`) is responsible for keeping it alive for
+    /// the process. Idempotent: the last attach wins.
+    #[cfg(feature = "duckdb-api")]
+    pub fn attach_duckdb_connection(&self, conn: ffi::duckdb_connection) {
+        let mut slot = self.duckdb_conn.write().expect("duckdb_conn lock poisoned");
+        *slot = if conn.is_null() { None } else { Some(DuckConn(conn)) };
+    }
+
+    /// Snapshot the currently-attached connection for a `NativeServices`
+    /// under construction. `None` before any attach or on non-`duckdb-api`
+    /// builds — the sink degrades to `Ok(None)` getters + `Err(...)` query.
+    #[cfg(feature = "duckdb-api")]
+    fn duckdb_conn_snapshot(&self) -> Option<DuckConn> {
+        *self.duckdb_conn.read().expect("duckdb_conn lock poisoned")
     }
 
     /// Resolve `extension` to its shared `Arc<Mutex<Instance>>`. Takes a brief
@@ -275,11 +894,20 @@ impl Engine2 {
             );
         }
         let wasi: WasiCtx = builder.build();
+        // Route the guest's config getters + `query()` at the live DuckDB
+        // connection Engine2 was attached to (`Ok(None)` / unavailable when
+        // no connection has been attached yet — the shape the guest already
+        // tolerates).
+        #[cfg(feature = "duckdb-api")]
+        let services: Box<dyn ExtensionServices> =
+            Box::new(NativeServices::new(self.duckdb_conn_snapshot()));
+        #[cfg(not(feature = "duckdb-api"))]
+        let services: Box<dyn ExtensionServices> = Box::new(NativeServices::new());
         let mut instance = load_component(
             &self.engine,
             &component,
             wasi,
-            Box::new(NativeServices),
+            services,
             self.callbacks.clone(),
             extension.to_string(),
         )?;
@@ -326,6 +954,138 @@ impl Engine2 {
                 function_name: r.function_name,
             })
             .collect();
+        // Additive drains (Phase: drain-plumbing). Every field on the
+        // runtime's `PendingRegistrationsData` that Engine2::load was
+        // previously discarding — including the four (casts, macros,
+        // logical_types, storages) that were already surfaced by the
+        // runtime but silently dropped here — is materialised now so
+        // reg_duckdb.rs can consume them in the next phase.
+        let casts = pending
+            .casts
+            .into_iter()
+            .map(|c| CastEntry {
+                extension: c.extension,
+                source: c.source,
+                target: c.target,
+                callback_handle: c.callback_handle,
+            })
+            .collect();
+        let macros = pending
+            .macros
+            .into_iter()
+            .map(|m| MacroEntry {
+                extension: m.extension,
+                schema: m.schema,
+                name: m.name,
+                parameters: m.parameters,
+                definition_sql: m.definition_sql,
+            })
+            .collect();
+        let logical_types = pending
+            .logical_types
+            .into_iter()
+            .map(|l| LogicalTypeEntry {
+                extension: l.extension,
+                name: l.name,
+                physical: l.physical,
+            })
+            .collect();
+        let storages = pending
+            .storages
+            .into_iter()
+            .map(|s| StorageEntry {
+                extension: s.extension,
+                type_name: s.type_name,
+                callback_handle: s.callback_handle,
+            })
+            .collect();
+        let settings = pending
+            .settings
+            .into_iter()
+            .map(|s| Setting {
+                extension: s.extension,
+                name: s.name,
+                description: s.description,
+                ty: s.ty,
+                default_value: s.default_value,
+                scope: s.scope,
+            })
+            .collect();
+        let copy_handlers = pending
+            .copy_handlers
+            .into_iter()
+            .map(|c| CopyHandler {
+                extension: c.extension,
+                file_extension: c.file_extension,
+                function_handle: c.function_handle,
+            })
+            .collect();
+        let arrow_tables = pending
+            .arrow_tables
+            .into_iter()
+            .map(|a| ArrowTable {
+                extension: a.extension,
+                name: a.name,
+                columns: a.columns,
+                callback_handle: a.callback_handle,
+            })
+            .collect();
+        let scalar_ex = pending
+            .scalar_ex
+            .into_iter()
+            .map(|s| ScalarEx {
+                extension: s.extension,
+                name: s.name,
+                arguments: s.arguments,
+                varargs: s.varargs,
+                returns: s.returns,
+                special_null: s.special_null,
+                volatile: s.volatile,
+                callback_handle: s.callback_handle,
+            })
+            .collect();
+        let table_macros = pending
+            .table_macros
+            .into_iter()
+            .map(|t| TableMacroEntry {
+                extension: t.extension,
+                schema: t.schema,
+                name: t.name,
+                parameters: t.parameters,
+                body_sql: t.body_sql,
+            })
+            .collect();
+        let enum_types = pending
+            .enum_types
+            .into_iter()
+            .map(|e| EnumTypeEntry {
+                extension: e.extension,
+                name: e.name,
+                members: e.members,
+            })
+            .collect();
+        let modified_types = pending
+            .modified_types
+            .into_iter()
+            .map(|m| ModifiedTypeEntry {
+                extension: m.extension,
+                name: m.name,
+                type_expr: m.type_expr,
+            })
+            .collect();
+        // `PendingLogStorage` doesn't carry an `extension` field (a log
+        // storage is scoped to the loading component by construction), so
+        // we materialise it from the outer `extension` parameter for parity
+        // with every sibling entry.
+        let log_storages = pending
+            .log_storages
+            .into_iter()
+            .map(|l| LogStorageEntry {
+                extension: extension.to_string(),
+                name: l.name,
+                callback_handle: l.callback_handle,
+            })
+            .collect();
         let instance_arc = Arc::new(Mutex::new(instance));
         {
             let mut map = self.instances.write().expect("instances lock poisoned");
@@ -347,6 +1107,18 @@ impl Engine2 {
             scalars,
             tables,
             aggregates,
+            casts,
+            macros,
+            logical_types,
+            storages,
+            settings,
+            copy_handlers,
+            arrow_tables,
+            scalar_ex,
+            table_macros,
+            enum_types,
+            modified_types,
+            log_storages,
             docs,
         })
     }
@@ -381,6 +1153,11 @@ impl Engine2 {
             args.into_iter().map(neutral_to_wit).collect();
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(row_index),
+            // TODO: invokeinfo.is_window hardcoded — no DuckDB C API accessor
+            // available in libduckdb-sys 1.10504.0 (no `duckdb_*_is_window`
+            // symbol on FunctionInfo, no `is_window` flag on the extra-info
+            // struct returned by `duckdb_scalar_function_get_extra_info`);
+            // component window specialization is a no-op (audit gap T4-22).
             iswindow: false,
         };
         let result = instance
@@ -419,6 +1196,11 @@ impl Engine2 {
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
+            // TODO: invokeinfo.is_window hardcoded — no DuckDB C API accessor
+            // available in libduckdb-sys 1.10504.0 (no `duckdb_*_is_window`
+            // symbol on FunctionInfo, no `is_window` flag on the extra-info
+            // struct returned by `duckdb_scalar_function_get_extra_info`);
+            // component window specialization is a no-op (audit gap T4-22).
             iswindow: false,
         };
         instance
@@ -456,6 +1238,11 @@ impl Engine2 {
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         let ctx = extension_runtime::Invokeinfo {
             rowindex: Some(base_row_index),
+            // TODO: invokeinfo.is_window hardcoded — no DuckDB C API accessor
+            // available in libduckdb-sys 1.10504.0 (no `duckdb_*_is_window`
+            // symbol on FunctionInfo, no `is_window` flag on the extra-info
+            // struct returned by `duckdb_scalar_function_get_extra_info`);
+            // component window specialization is a no-op (audit gap T4-22).
             iswindow: false,
         };
         instance
@@ -566,6 +1353,148 @@ impl Engine2 {
             .dispatch_aggregate_col(dispatcher_handle, args)
             .map_err(|e| anyhow!("aggregate (col) dispatch failed: {e:?}"))?;
         Ok(wit_to_neutral(result))
+    }
+
+    /// Invoke a component cast for one input value, returning the cast result.
+    /// `callback_handle` resolves through the callback registry to the owning
+    /// component instance. Wraps the runtime crate's
+    /// [`ExtensionInstance::dispatch_cast`] (which itself pivots the single
+    /// value through the columnar `call-cast-col` path). The C ABI cast
+    /// callback iterates the input DuckDB vector row-by-row and reduces to
+    /// this method for each row.
+    pub fn dispatch_cast_col(
+        &self,
+        callback_handle: u32,
+        value: reg::DuckValue,
+    ) -> Result<reg::DuckValue> {
+        let (dispatcher_handle, instance_arc) = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry.dispatcher_handle;
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        let wit_val = neutral_to_wit(value);
+        let result = instance
+            .dispatch_cast(dispatcher_handle, &wit_val)
+            .map_err(|e| anyhow!("cast dispatch failed: {e:?}"))?;
+        Ok(wit_to_neutral(result))
+    }
+
+    /// Bind a COPY writer for `path` with `columns` schema + `options`. Wraps
+    /// [`ExtensionInstance::copy_to_bind`]. The returned `writer` handle is
+    /// then passed to `dispatch_copy_to_sink` / `dispatch_copy_to_finalize`
+    /// for the same statement.
+    pub fn dispatch_copy_to_bind(
+        &self,
+        callback_handle: u32,
+        path: &str,
+        columns: &[extension_types::Columndef],
+        options: &[(String, String)],
+    ) -> Result<u32> {
+        let (dispatcher_handle, instance_arc) = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry.dispatcher_handle;
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        instance
+            .copy_to_bind(dispatcher_handle, path, columns, options)
+            .map_err(|e| anyhow!("copy_to_bind dispatch failed: {e:?}"))
+    }
+
+    /// Sink a batch of rows into a bound COPY writer. `callback_handle`
+    /// resolves through the callback registry; `writer` is the writer handle
+    /// the guest returned from its `copy-to-bind` on the current file. Delegates
+    /// to [`ExtensionInstance::copy_to_sink`].
+    pub fn dispatch_copy_to_sink(
+        &self,
+        callback_handle: u32,
+        writer: u32,
+        rows: Vec<Vec<reg::DuckValue>>,
+    ) -> Result<()> {
+        let (dispatcher_handle, instance_arc) = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry.dispatcher_handle;
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        let wit_rows: Vec<Vec<extension_types::Duckvalue>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(neutral_to_wit).collect())
+            .collect();
+        instance
+            .copy_to_sink(dispatcher_handle, writer, &wit_rows)
+            .map_err(|e| anyhow!("copy_to_sink dispatch failed: {e:?}"))
+    }
+
+    /// Finalize + close a bound COPY writer, returning the total rows written.
+    /// `callback_handle` resolves through the callback registry; `writer` is
+    /// the writer handle the guest returned from its `copy-to-bind`. Delegates
+    /// to [`ExtensionInstance::copy_to_finalize`].
+    pub fn dispatch_copy_to_finalize(
+        &self,
+        callback_handle: u32,
+        writer: u32,
+    ) -> Result<u64> {
+        let (dispatcher_handle, instance_arc) = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry.dispatcher_handle;
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        instance
+            .copy_to_finalize(dispatcher_handle, writer)
+            .map_err(|e| anyhow!("copy_to_finalize dispatch failed: {e:?}"))
+    }
+
+    /// Deliver one log entry to the component's registered log-storage sink.
+    /// `callback_handle` is the value the component passed to
+    /// `register-log-storage`; it resolves through the shared callback registry
+    /// to the owning component instance and its guest `log-storage-dispatch`
+    /// binding. Wraps [`ExtensionInstance::dispatch_write_log_entry`].
+    pub fn dispatch_write_log_entry(
+        &self,
+        callback_handle: u32,
+        entry: LogEntry,
+    ) -> Result<()> {
+        let instance_arc = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry_ref = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            match entry_ref.instance.upgrade() {
+                Some(arc) => arc,
+                None => self.instance_arc(&entry_ref.extension)?,
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        instance
+            .dispatch_write_log_entry(callback_handle, entry)
+            .map_err(|e| anyhow!("write_log_entry dispatch failed: {e:?}"))
     }
 }
 

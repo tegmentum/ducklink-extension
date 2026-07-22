@@ -23,6 +23,7 @@ use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 use duckdb::Connection;
 
 use ducklink_runtime::reg;
+use ducklink_runtime::LogEntry;
 // The WIT value type the component dispatcher consumes/produces. The scalar hot
 // path marshals DuckDB vectors straight to/from this type, so no per-chunk
 // neutral(reg::DuckValue) <-> WIT rebuild happens inside the engine (measured at
@@ -40,7 +41,11 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::column_types
     Decimalvalue as ColvecDecimal, Intervalvalue as ColvecInterval, Uuidvalue as ColvecUuid,
 };
 
-use crate::engine::{AggregateFunc, Engine2, ReplacementScan, ScalarFunc, TableFunc};
+use crate::engine::{
+    AggregateFunc, ArrowTable, CastEntry, CopyHandler, Engine2, EnumTypeEntry, LogStorageEntry,
+    LogicalTypeEntry, MacroEntry, ModifiedTypeEntry, ReplacementScan, ScalarEx, ScalarFunc,
+    Setting, TableFunc, TableMacroEntry,
+};
 
 /// Convert DuckDB's physical UUID hugeint storage (sign-flipped: the high bit is
 /// inverted so values sort correctly as a signed i128) into the logical 128-bit
@@ -3095,6 +3100,16 @@ pub fn register_load_function(
     let raw_ok = unsafe { ffi::duckdb_connect(db, &mut raw) } == ffi::DuckDBSuccess && !raw.is_null();
     let raw_con = RawConnHandle(if raw_ok { raw } else { std::ptr::null_mut() });
 
+    // Wire the persistent raw sibling connection into the engine so
+    // NativeServices' config getters + `query()` reach the live DuckDB. The
+    // raw connection is process-persistent (never disconnected here), so it
+    // outlives every guest that will call the config/query host imports. If
+    // opening it failed we skip the attach — NativeServices then reports
+    // `Ok(None)` / unavailable, which the guest surface tolerates.
+    if raw_ok {
+        engine.attach_duckdb_connection(raw);
+    }
+
     // First loader in the process captures the runtime; later ones reuse it.
     let _ = RUNTIME.set(DucklinkRuntime {
         db,
@@ -3294,6 +3309,80 @@ pub unsafe fn load_wasm_into_db(
     // (ext, fn) pair is a no-op) so re-loading a component does not stack.
     register_replacement_scans(&loaded.replacement_scans);
 
+    // Wire every additive registration surface. Each `register_<x>` mirrors
+    // the shape of `register_replacement_scans` — process-wide registry,
+    // C ABI callback, `duckdb_register_*` install call — for one field on
+    // `LoadedComponent`. See each function's doc comment for the C API path.
+    // A failed register_<x> is NOT fatal to `load_wasm_into_db`: it is logged
+    // and the load continues (parity with scalars/tables where a duplicate
+    // is skipped). The FAIL-LOUD paths (arrow_tables) return Err — mapped
+    // to an eprintln here so LOAD reports the shortfall without aborting.
+    unsafe {
+        let raw_con = rt.raw_con.0;
+        if !raw_con.is_null() {
+            if let Err(e) = register_settings(raw_con, &loaded.settings) {
+                eprintln!("[ducklink] register_settings failed: {e}");
+            }
+            if let Err(e) = register_copy_handlers(raw_con, rt.engine.clone(), &loaded.copy_handlers) {
+                eprintln!("[ducklink] register_copy_handlers failed: {e}");
+            }
+            if let Err(e) = register_scalar_ex(raw_con, rt.engine.clone(), &loaded.scalar_ex) {
+                eprintln!("[ducklink] register_scalar_ex failed: {e}");
+            }
+            if let Err(e) = register_casts(raw_con, rt.engine.clone(), &loaded.casts) {
+                eprintln!("[ducklink] register_casts failed: {e}");
+            }
+            if let Err(e) = register_logical_types(raw_con, &loaded.logical_types) {
+                eprintln!("[ducklink] register_logical_types failed: {e}");
+            }
+            if let Err(e) = register_modified_types(raw_con, &loaded.modified_types) {
+                eprintln!("[ducklink] register_modified_types failed: {e}");
+            }
+            if let Err(e) = register_enum_types(raw_con, &loaded.enum_types) {
+                eprintln!("[ducklink] register_enum_types failed: {e}");
+            }
+        } else if !loaded.settings.is_empty()
+            || !loaded.copy_handlers.is_empty()
+            || !loaded.scalar_ex.is_empty()
+            || !loaded.casts.is_empty()
+            || !loaded.logical_types.is_empty()
+            || !loaded.modified_types.is_empty()
+            || !loaded.enum_types.is_empty()
+        {
+            eprintln!(
+                "[ducklink] skipping {} settings / {} copy_handlers / {} scalar_ex / \
+                 {} casts / {} logical_types / {} modified_types / {} enum_types \
+                 registration(s) from '{}': no raw connection available",
+                loaded.settings.len(),
+                loaded.copy_handlers.len(),
+                loaded.scalar_ex.len(),
+                loaded.casts.len(),
+                loaded.logical_types.len(),
+                loaded.modified_types.len(),
+                loaded.enum_types.len(),
+                name
+            );
+        }
+        if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
+            eprintln!("[ducklink] register_log_storages failed: {e}");
+        }
+    }
+    if let Err(e) = register_arrow_tables(rt.engine.clone(), &loaded.arrow_tables) {
+        // Fail-loud stub: register_arrow_tables always errors when the
+        // component declared any arrow tables (bindings lack a callback-
+        // driven install). Surface the message here so LOAD reports it.
+        eprintln!("[ducklink] register_arrow_tables: {e}");
+    }
+    {
+        let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = register_macros(&con, &loaded.macros) {
+            eprintln!("[ducklink] register_macros failed: {e}");
+        }
+        if let Err(e) = register_table_macros(&con, &loaded.table_macros) {
+            eprintln!("[ducklink] register_table_macros failed: {e}");
+        }
+    }
+
     {
         let mut loaded_list = rt.loaded.lock().unwrap_or_else(|e| e.into_inner());
         let rec = LoadedRecord {
@@ -3465,6 +3554,65 @@ impl VTab for WasmLoad {
             // Wire the component's `files::register_replacement_scan` calls
             // into the process-wide registry the C callback consults.
             register_replacement_scans(&loaded.replacement_scans);
+
+            // Additive registration surface, one call per LoadedComponent
+            // field. Same shape as the sibling call site in `load_wasm_into_db`.
+            // Failures are logged (not fatal) — matches the existing scalar/
+            // table idempotency behaviour.
+            unsafe {
+                let raw_con = rt.raw_con.0;
+                if !raw_con.is_null() {
+                    if let Err(e) = register_settings(raw_con, &loaded.settings) {
+                        eprintln!("[ducklink] register_settings failed: {e}");
+                    }
+                    if let Err(e) = register_copy_handlers(raw_con, rt.engine.clone(), &loaded.copy_handlers) {
+                        eprintln!("[ducklink] register_copy_handlers failed: {e}");
+                    }
+                    if let Err(e) = register_scalar_ex(raw_con, rt.engine.clone(), &loaded.scalar_ex) {
+                        eprintln!("[ducklink] register_scalar_ex failed: {e}");
+                    }
+                    if let Err(e) = register_casts(raw_con, rt.engine.clone(), &loaded.casts) {
+                        eprintln!("[ducklink] register_casts failed: {e}");
+                    }
+                    if let Err(e) = register_logical_types(raw_con, &loaded.logical_types) {
+                        eprintln!("[ducklink] register_logical_types failed: {e}");
+                    }
+                    if let Err(e) = register_modified_types(raw_con, &loaded.modified_types) {
+                        eprintln!("[ducklink] register_modified_types failed: {e}");
+                    }
+                    if let Err(e) = register_enum_types(raw_con, &loaded.enum_types) {
+                        eprintln!("[ducklink] register_enum_types failed: {e}");
+                    }
+                } else if !loaded.settings.is_empty()
+                    || !loaded.copy_handlers.is_empty()
+                    || !loaded.scalar_ex.is_empty()
+                    || !loaded.casts.is_empty()
+                    || !loaded.logical_types.is_empty()
+                    || !loaded.modified_types.is_empty()
+                    || !loaded.enum_types.is_empty()
+                {
+                    eprintln!(
+                        "[ducklink] skipping settings/copy_handlers/scalar_ex/casts/logical_types/\
+                         modified_types/enum_types registration(s) from '{}': no raw connection available",
+                        name
+                    );
+                }
+                if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
+                    eprintln!("[ducklink] register_log_storages failed: {e}");
+                }
+            }
+            if let Err(e) = register_arrow_tables(rt.engine.clone(), &loaded.arrow_tables) {
+                eprintln!("[ducklink] register_arrow_tables: {e}");
+            }
+            {
+                let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = register_macros(&con, &loaded.macros) {
+                    eprintln!("[ducklink] register_macros failed: {e}");
+                }
+                if let Err(e) = register_table_macros(&con, &loaded.table_macros) {
+                    eprintln!("[ducklink] register_table_macros failed: {e}");
+                }
+            }
 
             bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
             bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
@@ -7825,4 +7973,1343 @@ pub unsafe extern "C" fn ducklink_replacement_scan_callback(
     let mut param = ffi::duckdb_create_varchar(arg_c.as_ptr());
     ffi::duckdb_replacement_scan_add_parameter(info, param);
     ffi::duckdb_destroy_value(&mut param);
+}
+
+// ============================================================================
+// Phase: register_<x> C API wiring for every additive LoadedComponent field
+// ============================================================================
+//
+// Each block below mirrors the shape of `register_replacement_scans` /
+// `REPLACEMENT_SCAN_REGISTRY` / `ducklink_replacement_scan_callback` above:
+//
+//   1. A `struct <X>Registration` capturing everything the callback needs.
+//   2. A `static <X>_REGISTRY: OnceLock<Mutex<...>>` process-wide registry.
+//   3. An `extern "C" fn ducklink_<x>_callback(...)` C ABI trampoline that
+//      looks up the guest handle in the registry and re-enters
+//      `Engine2::dispatch_*` with it.
+//   4. A `pub fn register_<x>(...)` entry point the two call sites in
+//      `ducklink_init_c_api` / `WasmLoad::bind` invoke on every load.
+//
+// Where a C API function does not exist in the shipped bindings we install
+// a fail-loud stub: an eprintln explaining the shortfall AND an `Err`
+// return so LOAD fails visibly, not a silent no-op.
+
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Columndef as WitColumndef;
+
+// ---------------------------------------------------------------------------
+// 1. register_settings — declares DB config options to DuckDB. `SET <name>=`
+// stores into the DB config catalog; `runtime.get-string` reads it back via
+// the existing NativeServices path. C API: duckdb_create_config_option +
+// duckdb_config_option_set_{name,type,default_value,default_scope,description}
+// + duckdb_register_config_option. There is no on-SET callback in the shipped
+// bindings (no `duckdb_config_option_set_change_callback` or similar), so
+// this registers the option so it is known to DuckDB but does NOT dispatch
+// into the guest on SET — the guest reads the current value via the runtime's
+// `get-string` bridge instead.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct SettingRegistration {
+    owner: String,
+    name: String,
+    ty: String,
+    scope: String,
+}
+
+static SETTING_REGISTRY: OnceLock<Mutex<Vec<SettingRegistration>>> = OnceLock::new();
+
+fn setting_registry() -> &'static Mutex<Vec<SettingRegistration>> {
+    SETTING_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn config_scope_code(scope: &str) -> ffi::duckdb_config_option_scope {
+    match scope.to_ascii_lowercase().as_str() {
+        "local" => ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_LOCAL,
+        "session" => ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_SESSION,
+        "global" => ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_GLOBAL,
+        _ => ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_GLOBAL,
+    }
+}
+
+fn setting_logical_type(ty: &str) -> ffi::duckdb_logical_type {
+    let code = match ty.to_ascii_lowercase().as_str() {
+        "boolean" | "bool" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
+        "bigint" | "int64" | "long" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+        "double" | "float64" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
+        _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+    };
+    unsafe { ffi::duckdb_create_logical_type(code) }
+}
+
+fn setting_default_value(ty: &str, raw: &str) -> ffi::duckdb_value {
+    unsafe {
+        match ty.to_ascii_lowercase().as_str() {
+            "boolean" | "bool" => {
+                let b = matches!(raw.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on");
+                ffi::duckdb_create_bool(b)
+            }
+            "bigint" | "int64" | "long" => {
+                let n = raw.parse::<i64>().unwrap_or(0);
+                ffi::duckdb_create_int64(n)
+            }
+            "double" | "float64" => {
+                let f = raw.parse::<f64>().unwrap_or(0.0);
+                ffi::duckdb_create_double(f)
+            }
+            _ => {
+                let c = match CString::new(raw) {
+                    Ok(c) => c,
+                    Err(_) => return std::ptr::null_mut(),
+                };
+                ffi::duckdb_create_varchar(c.as_ptr())
+            }
+        }
+    }
+}
+
+/// Register every declared setting on `raw_con` as a DB config option so
+/// `SET <name>=<value>` reaches the core catalog and the guest can read it
+/// via the runtime's `get-string`/`get-int64`/... bridge. Returns an error
+/// only if the C API surface is unusable (never expected in the shipped
+/// bindings) — a duplicate-name registration is skipped (already installed).
+pub unsafe fn register_settings(
+    raw_con: ffi::duckdb_connection,
+    settings: &[Setting],
+) -> Result<usize, String> {
+    if settings.is_empty() {
+        return Ok(0);
+    }
+    if raw_con.is_null() {
+        return Err(
+            "register_settings: raw_con is null — cannot register config options".to_string(),
+        );
+    }
+    let mut registered = 0usize;
+    let mut reg = setting_registry().lock().unwrap_or_else(|e| e.into_inner());
+    for s in settings {
+        let already = reg.iter().any(|r| r.name.eq_ignore_ascii_case(&s.name));
+        if already {
+            eprintln!("[ducklink] setting '{}' already registered, skipping", s.name);
+            continue;
+        }
+        let name_c = match CString::new(s.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("[ducklink] setting '{}' has a NUL byte; skipping", s.name);
+                continue;
+            }
+        };
+        let desc_c = CString::new(s.description.as_str())
+            .unwrap_or_else(|_| CString::new("").unwrap());
+        let opt = ffi::duckdb_create_config_option();
+        ffi::duckdb_config_option_set_name(opt, name_c.as_ptr());
+        let mut lt = setting_logical_type(&s.ty);
+        ffi::duckdb_config_option_set_type(opt, lt);
+        ffi::duckdb_destroy_logical_type(&mut lt);
+        if let Some(dv) = s.default_value.as_deref() {
+            let mut v = setting_default_value(&s.ty, dv);
+            if !v.is_null() {
+                ffi::duckdb_config_option_set_default_value(opt, v);
+                ffi::duckdb_destroy_value(&mut v);
+            }
+        }
+        ffi::duckdb_config_option_set_default_scope(opt, config_scope_code(&s.scope));
+        ffi::duckdb_config_option_set_description(opt, desc_c.as_ptr());
+
+        let mut opt_mut = opt;
+        let rc = ffi::duckdb_register_config_option(raw_con, opt);
+        ffi::duckdb_destroy_config_option(&mut opt_mut);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] setting '{}' not registered (already present?)",
+                s.name
+            );
+            continue;
+        }
+        reg.push(SettingRegistration {
+            owner: s.extension.clone(),
+            name: s.name.clone(),
+            ty: s.ty.clone(),
+            scope: s.scope.clone(),
+        });
+        registered += 1;
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 2. register_copy_handlers — installs each COPY handler as a DuckDB COPY
+// function keyed on its file extension. C API: duckdb_create_copy_function +
+// duckdb_copy_function_set_{name,extra_info,bind,global_init,sink,finalize}
+// + duckdb_register_copy_function.
+//
+// Extra info is a `Box<CopyExtra>` carrying the guest function handle + the
+// engine Arc; the bind/sink/finalize callbacks look this pointer up and
+// re-enter Engine2::dispatch_copy_to_{bind,sink,finalize}.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct CopyExtra {
+    function_handle: u32,
+    engine: Arc<Engine2>,
+    file_extension: String,
+}
+
+/// Per-invocation state stashed on the bind info; sink/finalize read the
+/// writer handle it carries.
+struct CopyBindState {
+    writer_handle: u32,
+}
+
+unsafe extern "C" fn copy_extra_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut CopyExtra));
+    }
+}
+
+unsafe extern "C" fn copy_bind_state_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut CopyBindState));
+    }
+}
+
+unsafe extern "C" fn ducklink_copy_bind(info: ffi::duckdb_copy_function_bind_info) {
+    let extra = ffi::duckdb_copy_function_bind_get_extra_info(info) as *const CopyExtra;
+    if extra.is_null() {
+        let msg = CString::new("copy_bind: missing extra info").unwrap();
+        ffi::duckdb_copy_function_bind_set_error(info, msg.as_ptr());
+        return;
+    }
+    // Bind time: DuckDB has not yet exposed the target path through the
+    // stable C API surface at THIS callback stage (`duckdb_copy_function_
+    // bind_get_file_path` does not exist — only the global-init variant
+    // does). We just stash a placeholder bind state so `sink` can find the
+    // writer handle that `global_init` will set.
+    let state = Box::into_raw(Box::new(CopyBindState { writer_handle: 0 })) as *mut c_void;
+    ffi::duckdb_copy_function_bind_set_bind_data(info, state, Some(copy_bind_state_destroy));
+    let _ = extra;
+}
+
+unsafe extern "C" fn ducklink_copy_global_init(info: ffi::duckdb_copy_function_global_init_info) {
+    let extra = ffi::duckdb_copy_function_global_init_get_extra_info(info) as *const CopyExtra;
+    if extra.is_null() {
+        let msg = CString::new("copy_global_init: missing extra info").unwrap();
+        ffi::duckdb_copy_function_global_init_set_error(info, msg.as_ptr());
+        return;
+    }
+    let extra_ref = &*extra;
+    let path_ptr = ffi::duckdb_copy_function_global_init_get_file_path(info);
+    let path = if path_ptr.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(path_ptr).to_string_lossy().into_owned()
+    };
+    // The runtime's copy-to-bind needs a `[Columndef]` and options map. The
+    // C API path here does not surface either, so we call with an empty
+    // schema + options. Components that require the schema at bind time need
+    // to look it up through a sibling `get_columns()` guest export.
+    let cols: Vec<WitColumndef> = Vec::new();
+    let opts: Vec<(String, String)> = Vec::new();
+    let writer = match extra_ref
+        .engine
+        .dispatch_copy_to_bind(extra_ref.function_handle, &path, &cols, &opts)
+    {
+        Ok(w) => w,
+        Err(e) => {
+            let msg = CString::new(format!("copy_to_bind failed: {e}")).unwrap();
+            ffi::duckdb_copy_function_global_init_set_error(info, msg.as_ptr());
+            return;
+        }
+    };
+    let bind_data = ffi::duckdb_copy_function_global_init_get_bind_data(info) as *mut CopyBindState;
+    if !bind_data.is_null() {
+        (*bind_data).writer_handle = writer;
+    }
+    // Attach a small global state (owned by DuckDB) mirroring the writer
+    // handle, so sink/finalize can read it without touching bind data.
+    let gstate = Box::into_raw(Box::new(writer as u64)) as *mut c_void;
+    ffi::duckdb_copy_function_global_init_set_global_state(info, gstate, Some(copy_writer_destroy));
+}
+
+unsafe extern "C" fn copy_writer_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut u64));
+    }
+}
+
+unsafe extern "C" fn ducklink_copy_sink(
+    info: ffi::duckdb_copy_function_sink_info,
+    input: ffi::duckdb_data_chunk,
+) {
+    let extra = ffi::duckdb_copy_function_sink_get_extra_info(info) as *const CopyExtra;
+    if extra.is_null() {
+        let msg = CString::new("copy_sink: missing extra info").unwrap();
+        ffi::duckdb_copy_function_sink_set_error(info, msg.as_ptr());
+        return;
+    }
+    let extra_ref = &*extra;
+    let gstate = ffi::duckdb_copy_function_sink_get_global_state(info) as *const u64;
+    let writer = if gstate.is_null() { 0u32 } else { *gstate as u32 };
+    // Marshal the input chunk to Vec<Vec<reg::DuckValue>> — the wide, slow
+    // path for now. A column-native COPY sink is a follow-up.
+    let n = ffi::duckdb_data_chunk_get_size(input) as usize;
+    let ncols = ffi::duckdb_data_chunk_get_column_count(input) as usize;
+    let mut rows: Vec<Vec<reg::DuckValue>> = (0..n).map(|_| Vec::with_capacity(ncols)).collect();
+    for c in 0..ncols {
+        let vec = ffi::duckdb_data_chunk_get_vector(input, c as u64);
+        let ty = ffi::duckdb_vector_get_column_type(vec);
+        let code = code_from_duckdb_type(ffi::duckdb_get_type_id(ty));
+        for r in 0..n {
+            let v = read_arg_neutral(code, vec, r);
+            rows[r].push(v);
+        }
+        let mut ty_mut = ty;
+        ffi::duckdb_destroy_logical_type(&mut ty_mut);
+    }
+    if let Err(e) = extra_ref
+        .engine
+        .dispatch_copy_to_sink(extra_ref.function_handle, writer, rows)
+    {
+        let msg = CString::new(format!("copy_to_sink failed: {e}")).unwrap();
+        ffi::duckdb_copy_function_sink_set_error(info, msg.as_ptr());
+    }
+}
+
+unsafe extern "C" fn ducklink_copy_finalize(info: ffi::duckdb_copy_function_finalize_info) {
+    let extra = ffi::duckdb_copy_function_finalize_get_extra_info(info) as *const CopyExtra;
+    if extra.is_null() {
+        let msg = CString::new("copy_finalize: missing extra info").unwrap();
+        ffi::duckdb_copy_function_finalize_set_error(info, msg.as_ptr());
+        return;
+    }
+    let extra_ref = &*extra;
+    let gstate = ffi::duckdb_copy_function_finalize_get_global_state(info) as *const u64;
+    let writer = if gstate.is_null() { 0u32 } else { *gstate as u32 };
+    if let Err(e) = extra_ref
+        .engine
+        .dispatch_copy_to_finalize(extra_ref.function_handle, writer)
+    {
+        let msg = CString::new(format!("copy_to_finalize failed: {e}")).unwrap();
+        ffi::duckdb_copy_function_finalize_set_error(info, msg.as_ptr());
+    }
+}
+
+/// Register every declared COPY handler on `raw_con`. Idempotency is
+/// delegated to DuckDB (a duplicate name returns failure, which we log and
+/// skip).
+pub unsafe fn register_copy_handlers(
+    raw_con: ffi::duckdb_connection,
+    engine: Arc<Engine2>,
+    handlers: &[CopyHandler],
+) -> Result<usize, String> {
+    if handlers.is_empty() {
+        return Ok(0);
+    }
+    if raw_con.is_null() {
+        return Err("register_copy_handlers: raw_con is null".to_string());
+    }
+    let mut registered = 0usize;
+    for h in handlers {
+        let name_c = match CString::new(h.file_extension.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!(
+                    "[ducklink] copy handler '{}' has a NUL byte; skipping",
+                    h.file_extension
+                );
+                continue;
+            }
+        };
+        let cf = ffi::duckdb_create_copy_function();
+        ffi::duckdb_copy_function_set_name(cf, name_c.as_ptr());
+        let extra = Box::into_raw(Box::new(CopyExtra {
+            function_handle: h.function_handle,
+            engine: engine.clone(),
+            file_extension: h.file_extension.clone(),
+        })) as *mut c_void;
+        ffi::duckdb_copy_function_set_extra_info(cf, extra, Some(copy_extra_destroy));
+        ffi::duckdb_copy_function_set_bind(cf, Some(ducklink_copy_bind));
+        ffi::duckdb_copy_function_set_global_init(cf, Some(ducklink_copy_global_init));
+        ffi::duckdb_copy_function_set_sink(cf, Some(ducklink_copy_sink));
+        ffi::duckdb_copy_function_set_finalize(cf, Some(ducklink_copy_finalize));
+        // COPY FROM: not yet wired (the guest currently has no
+        // `copy-from-*` export in this bindings shape). Leaving it unset
+        // means `COPY <tbl> FROM 'x.<ext>'` reports "unsupported" — the
+        // sink registration side is still visibly installed.
+
+        let rc = ffi::duckdb_register_copy_function(raw_con, cf);
+        let mut cf_mut = cf;
+        ffi::duckdb_destroy_copy_function(&mut cf_mut);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] copy handler '{}' not registered (already present?)",
+                h.file_extension
+            );
+            continue;
+        }
+        registered += 1;
+    }
+    Ok(registered)
+}
+
+// Small helper: turn a duckdb_type id into our internal T_* code.
+fn code_from_duckdb_type(t: ffi::duckdb_type) -> u8 {
+    match t {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => T_I64,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => T_U64,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE => T_F64,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN => T_BOOL,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => T_TEXT,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB => T_BLOB,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT => T_I8,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => T_I16,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => T_I32,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT => T_U8,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT => T_U16,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => T_U32,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT => T_F32,
+        _ => T_TEXT,
+    }
+}
+
+// Read one row of a DuckDB flat vector into a neutral `DuckValue`. Only
+// covers the fixed-width primitive + TEXT/BLOB arms — the same subset the
+// scalar hot path already handles.
+unsafe fn read_arg_neutral(code: u8, vec: ffi::duckdb_vector, row: usize) -> reg::DuckValue {
+    let data = ffi::duckdb_vector_get_data(vec);
+    let validity = ffi::duckdb_vector_get_validity(vec) as *mut u64;
+    if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, row as u64) {
+        return reg::DuckValue::Null;
+    }
+    match code {
+        T_I64 => reg::DuckValue::Int64(*(data as *const i64).add(row)),
+        T_U64 => reg::DuckValue::Uint64(*(data as *const u64).add(row)),
+        T_F64 => reg::DuckValue::Float64(*(data as *const f64).add(row)),
+        T_BOOL => reg::DuckValue::Boolean(*(data as *const bool).add(row)),
+        T_I8 => reg::DuckValue::Int8(*(data as *const i8).add(row)),
+        T_I16 => reg::DuckValue::Int16(*(data as *const i16).add(row)),
+        T_I32 => reg::DuckValue::Int32(*(data as *const i32).add(row)),
+        T_U8 => reg::DuckValue::Uint8(*(data as *const u8).add(row)),
+        T_U16 => reg::DuckValue::Uint16(*(data as *const u16).add(row)),
+        T_U32 => reg::DuckValue::Uint32(*(data as *const u32).add(row)),
+        T_F32 => reg::DuckValue::Float32(*(data as *const f32).add(row)),
+        T_TEXT => {
+            let strs = data as *const duckdb_string_t;
+            let mut s = std::ptr::read(strs.add(row));
+            let mut raw = DuckString::new(&mut s);
+            reg::DuckValue::Text(raw.as_str().to_string())
+        }
+        T_BLOB => {
+            let strs = data as *const duckdb_string_t;
+            let mut s = std::ptr::read(strs.add(row));
+            let mut raw = DuckString::new(&mut s);
+            reg::DuckValue::Blob(raw.as_str().as_bytes().to_vec())
+        }
+        _ => reg::DuckValue::Null,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. register_arrow_tables — Arrow C Data Interface producer.
+//
+// STATUS (major-4): FAIL-LOUD documented Err. The shipped bindings DO expose
+// `duckdb_arrow_scan(con, table_name, duckdb_arrow_stream)` — an install site
+// that DuckDB re-enters on every pull via the Arrow C Data Interface
+// ArrowArrayStream ABI. The producer-side blocker is upstream, in the WIT:
+//
+//   * `duckdb:extension/arrow-ext@4.0.0` exposes `register-arrow-table` only.
+//     No `call-arrow-table` guest export exists (checked
+//     wit-canonical/duckdb-extension/arrow-ext.wit + callback-dispatch.wit).
+//   * `Engine2::dispatch_table` (row-major duckvalue return) IS callable via
+//     the existing `callback-dispatch/call-table` export, so a producer could
+//     be built by row-to-arrow encoding all 22 `reg::LogicalType` variants.
+//   * WIT modification is forbidden by the enclosing task; adding a proper
+//     columnar `call-arrow-table` (returning arrow-shaped batches directly)
+//     is the correct long-term surface but requires a bindings bump.
+//
+// Rather than ship a producer that silently corrupts memory on the first
+// unsupported logical type (blob / decimal / uuid / interval / complex /
+// nested), FAIL LOUD: log + return an error so LOAD surfaces the shortfall.
+// The scaffolding below (`ArrowArrayStream`, `DucklinkArrowStream`, the four
+// extern "C" fn signatures) documents the ABI a full implementation would
+// use, so a follow-up can wire it up once one of:
+//
+//   (a) a `call-arrow-table` WIT export is added to arrow-ext.wit, letting
+//       the guest emit Arrow record batches directly (batch_index parameter,
+//       Option<Vec<Vec<NeutralValue>>>-style pull), OR
+//   (b) a per-type row→Arrow encoder covering every reg::LogicalType variant
+//       is written on top of the existing `dispatch_table`.
+// ---------------------------------------------------------------------------
+
+/// Arrow C Data Interface `ArrowArrayStream` ABI (spec v1.5+). Defined
+/// locally because libduckdb-sys 1.10504.0 exposes only `ArrowArray` and
+/// `ArrowSchema` (see `libduckdb-sys::arrow_c_data`), not the stream
+/// wrapper `duckdb_arrow_scan` consumes via `duckdb_arrow_stream.internal_ptr`.
+///
+/// Layout is fixed by the spec:
+/// <https://arrow.apache.org/docs/format/CDataInterface.html#stream-structure>.
+#[repr(C)]
+#[allow(dead_code)]
+pub struct ArrowArrayStream {
+    /// Get the top-level schema of the stream. Called ONCE by DuckDB at
+    /// bind time. Returns 0 on success.
+    pub get_schema: Option<
+        unsafe extern "C" fn(
+            *mut ArrowArrayStream,
+            *mut ffi::ArrowSchema,
+        ) -> std::os::raw::c_int,
+    >,
+    /// Get the next record batch. Called repeatedly by DuckDB during scan.
+    /// Populate `*out` and return 0 for a batch; write a released ArrowArray
+    /// (release=None) and return 0 for end-of-stream. Nonzero = errno.
+    pub get_next: Option<
+        unsafe extern "C" fn(
+            *mut ArrowArrayStream,
+            *mut ffi::ArrowArray,
+        ) -> std::os::raw::c_int,
+    >,
+    /// Return the last error message as a NUL-terminated C string owned by
+    /// the stream, or NULL if none.
+    pub get_last_error:
+        Option<unsafe extern "C" fn(*mut ArrowArrayStream) -> *const c_char>,
+    /// Release stream resources. Called by DuckDB at end-of-scan.
+    pub release: Option<unsafe extern "C" fn(*mut ArrowArrayStream)>,
+    /// Producer-owned opaque state. Set to `Box::into_raw(DucklinkArrowStream)`
+    /// at install; `release` reconstitutes and drops.
+    pub private_data: *mut c_void,
+}
+
+/// Producer state a `DucklinkArrowStream` would carry. `_columns` drives the
+/// schema encoded by `get_schema`; `_callback_handle` routes pull calls back
+/// through `Engine2::dispatch_arrow_table` (see engine.rs) to the guest.
+///
+/// Not currently instantiated: see the `register_arrow_tables` doc block
+/// above for the WIT-side blocker.
+#[allow(dead_code)]
+struct DucklinkArrowStream {
+    engine: std::sync::Weak<Engine2>,
+    callback_handle: u32,
+    extension: String,
+    table_name: String,
+    columns: Vec<reg::ColumnDef>,
+    batch_index: std::sync::atomic::AtomicU32,
+    last_error: Mutex<Option<CString>>,
+}
+
+/// Process-wide registry mirroring `REPLACEMENT_SCAN_REGISTRY`. Keyed by
+/// (extension, table_name); the boxed streams outlive the connection so
+/// DuckDB can re-consume them across queries (`duckdb_arrow_scan` installs
+/// per-connection, but each query pulls afresh via a fresh stream — that
+/// distinction only matters once the producer is wired up).
+#[allow(dead_code)]
+struct ArrowTableRegistration {
+    extension: String,
+    table_name: String,
+    callback_handle: u32,
+    columns: Vec<reg::ColumnDef>,
+}
+
+static ARROW_TABLE_REGISTRY: OnceLock<Mutex<Vec<ArrowTableRegistration>>> = OnceLock::new();
+
+#[allow(dead_code)]
+fn arrow_table_registry() -> &'static Mutex<Vec<ArrowTableRegistration>> {
+    ARROW_TABLE_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn register_arrow_tables(
+    _engine: Arc<Engine2>,
+    tables: &[ArrowTable],
+) -> Result<usize, String> {
+    if tables.is_empty() {
+        return Ok(0);
+    }
+    // Explicit FAIL-LOUD path. See the module-level doc block above for the
+    // scaffolding a full implementation would use (`ArrowArrayStream` ABI,
+    // `DucklinkArrowStream` state, `ARROW_TABLE_REGISTRY`). Enabling that
+    // path requires either a `call-arrow-table` WIT export (blocked: no WIT
+    // modification allowed) or a per-type row→Arrow encoder over the
+    // existing row-major `Engine2::dispatch_table` covering every
+    // `reg::LogicalType` (blob / decimal / uuid / interval / nested / etc).
+    // Silently no-opping would let the SQL side happily bind a `FROM <name>`
+    // that then returns zero rows — worse than a loud LOAD failure.
+    let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+    let msg = format!(
+        "register_arrow_tables: {} arrow table producer(s) declared ({:?}) but no \
+         callback-driven Arrow producer is wired up. `duckdb_arrow_scan` is available \
+         in the shipped bindings and would drive an ArrowArrayStream, but the \
+         `duckdb:extension/arrow-ext` WIT only exposes `register-arrow-table` — there \
+         is no `call-arrow-table` guest export to pull batches from. The row-major \
+         `callback-dispatch/call-table` export could be used with a per-type row→Arrow \
+         encoder covering every reg::LogicalType (see scaffolding above), but that is \
+         a substantial follow-up. Failing so LOAD surfaces the shortfall.",
+        tables.len(),
+        names,
+    );
+    eprintln!("[ducklink] {msg}");
+    Err(msg)
+}
+
+// ---------------------------------------------------------------------------
+// 4. register_scalar_ex — extends a plain scalar with the three attributes
+// the base `register_scalars` path cannot express: varargs trailing type,
+// special-NULL handling, and VOLATILE (re-evaluated per row).
+//
+// Installed as a sibling scalar via the raw C API so the ex-flags reach
+// DuckDB (duckdb-rs' `VScalar` path does not surface them).
+// ---------------------------------------------------------------------------
+
+/// State stashed on the C-side scalar function via
+/// `duckdb_scalar_function_set_extra_info`. Read from the invoke callback to
+/// dispatch back into the engine.
+#[allow(dead_code)]
+struct ScalarExExtra {
+    callback_handle: u32,
+    engine: Arc<Engine2>,
+    arg_codes: Vec<u8>,
+    ret_code: u8,
+}
+
+unsafe extern "C" fn scalar_ex_extra_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut ScalarExExtra));
+    }
+}
+
+/// One process-wide invoke callback for every scalar-ex. Marshals the input
+/// chunk row-by-row, dispatches through `Engine2::dispatch_scalar`, writes
+/// the per-row result out. The columnar fast path stays with the base
+/// scalar registration; scalar-ex is the correctness fallback for varargs
+/// / special-null / volatile.
+unsafe extern "C" fn ducklink_scalar_ex_invoke(
+    info: ffi::duckdb_function_info,
+    input: ffi::duckdb_data_chunk,
+    output: ffi::duckdb_vector,
+) {
+    let extra = ffi::duckdb_scalar_function_get_extra_info(info) as *const ScalarExExtra;
+    if extra.is_null() {
+        let msg = CString::new("scalar_ex_invoke: missing extra info").unwrap();
+        ffi::duckdb_scalar_function_set_error(info, msg.as_ptr());
+        return;
+    }
+    let extra_ref = &*extra;
+    let n = ffi::duckdb_data_chunk_get_size(input) as usize;
+    let ncols = ffi::duckdb_data_chunk_get_column_count(input) as usize;
+    let mut rows: Vec<Vec<reg::DuckValue>> = (0..n).map(|_| Vec::with_capacity(ncols)).collect();
+    for c in 0..ncols {
+        let vec = ffi::duckdb_data_chunk_get_vector(input, c as u64);
+        let code = extra_ref.arg_codes.get(c).copied().unwrap_or(T_TEXT);
+        for r in 0..n {
+            let v = read_arg_neutral(code, vec, r);
+            rows[r].push(v);
+        }
+    }
+    for r in 0..n {
+        let args = std::mem::take(&mut rows[r]);
+        let out = match extra_ref
+            .engine
+            .dispatch_scalar(extra_ref.callback_handle, r as u64, args)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = CString::new(format!("scalar_ex dispatch failed: {e}")).unwrap();
+                ffi::duckdb_scalar_function_set_error(info, msg.as_ptr());
+                return;
+            }
+        };
+        write_row_out(extra_ref.ret_code, output, r, out);
+    }
+}
+
+unsafe fn write_row_out(code: u8, out: ffi::duckdb_vector, row: usize, val: reg::DuckValue) {
+    let data = ffi::duckdb_vector_get_data(out);
+    // Ensure validity mask exists so we can flip individual NULL bits.
+    ffi::duckdb_vector_ensure_validity_writable(out);
+    let validity = ffi::duckdb_vector_get_validity(out) as *mut u64;
+    if matches!(val, reg::DuckValue::Null) {
+        if !validity.is_null() {
+            ffi::duckdb_validity_set_row_invalid(validity, row as u64);
+        }
+        return;
+    }
+    match (code, val) {
+        (T_I64, reg::DuckValue::Int64(v)) => *(data as *mut i64).add(row) = v,
+        (T_U64, reg::DuckValue::Uint64(v)) => *(data as *mut u64).add(row) = v,
+        (T_F64, reg::DuckValue::Float64(v)) => *(data as *mut f64).add(row) = v,
+        (T_BOOL, reg::DuckValue::Boolean(v)) => *(data as *mut bool).add(row) = v,
+        (T_I8, reg::DuckValue::Int8(v)) => *(data as *mut i8).add(row) = v,
+        (T_I16, reg::DuckValue::Int16(v)) => *(data as *mut i16).add(row) = v,
+        (T_I32, reg::DuckValue::Int32(v)) => *(data as *mut i32).add(row) = v,
+        (T_U8, reg::DuckValue::Uint8(v)) => *(data as *mut u8).add(row) = v,
+        (T_U16, reg::DuckValue::Uint16(v)) => *(data as *mut u16).add(row) = v,
+        (T_U32, reg::DuckValue::Uint32(v)) => *(data as *mut u32).add(row) = v,
+        (T_F32, reg::DuckValue::Float32(v)) => *(data as *mut f32).add(row) = v,
+        (T_TEXT, reg::DuckValue::Text(s)) => {
+            let c = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
+            ffi::duckdb_vector_assign_string_element(out, row as u64, c.as_ptr());
+        }
+        (T_BLOB, reg::DuckValue::Blob(b)) => {
+            ffi::duckdb_vector_assign_string_element_len(
+                out,
+                row as u64,
+                b.as_ptr() as *const c_char,
+                b.len() as u64,
+            );
+        }
+        _ => {
+            if !validity.is_null() {
+                ffi::duckdb_validity_set_row_invalid(validity, row as u64);
+            }
+        }
+    }
+}
+
+/// Register the ex-attributes for every scalar_ex on `raw_con`. Installs a
+/// C API-level scalar sibling with varargs / special-null / VOLATILE flags
+/// wired through the C API. The base scalar registration (name + core
+/// signature) is expected to have already run via `register_scalars`.
+pub unsafe fn register_scalar_ex(
+    raw_con: ffi::duckdb_connection,
+    engine: Arc<Engine2>,
+    scalar_ex: &[ScalarEx],
+) -> Result<usize, String> {
+    if scalar_ex.is_empty() {
+        return Ok(0);
+    }
+    if raw_con.is_null() {
+        return Err("register_scalar_ex: raw_con is null".to_string());
+    }
+    let mut registered = 0usize;
+    for s in scalar_ex {
+        let arg_codes: Vec<u8> = s.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        let ret_code = type_code(&s.returns);
+        let cname = match CString::new(s.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("[ducklink] scalar_ex '{}' has a NUL byte; skipping", s.name);
+                continue;
+            }
+        };
+        let func = ffi::duckdb_create_scalar_function();
+        ffi::duckdb_scalar_function_set_name(func, cname.as_ptr());
+        for &code in &arg_codes {
+            let mut lt = ffi::duckdb_create_logical_type(duckdb_type_of(code));
+            ffi::duckdb_scalar_function_add_parameter(func, lt);
+            ffi::duckdb_destroy_logical_type(&mut lt);
+        }
+        let mut rlt = ffi::duckdb_create_logical_type(duckdb_type_of(ret_code));
+        ffi::duckdb_scalar_function_set_return_type(func, rlt);
+        ffi::duckdb_destroy_logical_type(&mut rlt);
+        // ---- the three ex flags ----
+        if let Some(v) = s.varargs.as_ref() {
+            let vcode = type_code(v);
+            let mut vlt = ffi::duckdb_create_logical_type(duckdb_type_of(vcode));
+            ffi::duckdb_scalar_function_set_varargs(func, vlt);
+            ffi::duckdb_destroy_logical_type(&mut vlt);
+        }
+        if s.special_null {
+            ffi::duckdb_scalar_function_set_special_handling(func);
+        }
+        // Gate VOLATILE on the per-function flag now that `ScalarEx` carries
+        // it — the runtime derives it from the register-scalar-ex attributes.
+        // Non-volatile scalar-ex skip the call entirely (immutable by
+        // default), which closes the audit finding that treated every ex-path
+        // fn as VOLATILE unconditionally.
+        if s.volatile {
+            ffi::duckdb_scalar_function_set_volatile(func);
+        }
+        // ---- extra info + invoke callback ----
+        let extra = Box::into_raw(Box::new(ScalarExExtra {
+            callback_handle: s.callback_handle,
+            engine: engine.clone(),
+            arg_codes,
+            ret_code,
+        })) as *mut c_void;
+        ffi::duckdb_scalar_function_set_extra_info(func, extra, Some(scalar_ex_extra_destroy));
+        ffi::duckdb_scalar_function_set_function(func, Some(ducklink_scalar_ex_invoke));
+
+        let rc = ffi::duckdb_register_scalar_function(raw_con, func);
+        let mut func_mut = func;
+        ffi::duckdb_destroy_scalar_function(&mut func_mut);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] scalar_ex '{}' not registered (already present?)",
+                s.name
+            );
+            continue;
+        }
+        registered += 1;
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 5. register_casts — installs each declared cast via duckdb_create_cast_function
+// + duckdb_cast_function_set_{source_type,target_type,function,extra_info} +
+// duckdb_register_cast_function. Callback re-enters
+// `Engine2::dispatch_cast_col(handle, value)` per input-vector row.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct CastExtra {
+    callback_handle: u32,
+    engine: Arc<Engine2>,
+    source_code: u8,
+    target_code: u8,
+}
+
+unsafe extern "C" fn cast_extra_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut CastExtra));
+    }
+}
+
+unsafe extern "C" fn ducklink_cast_invoke(
+    info: ffi::duckdb_function_info,
+    count: ffi::idx_t,
+    input: ffi::duckdb_vector,
+    output: ffi::duckdb_vector,
+) -> bool {
+    let extra = ffi::duckdb_cast_function_get_extra_info(info) as *const CastExtra;
+    if extra.is_null() {
+        let msg = CString::new("cast_invoke: missing extra info").unwrap();
+        ffi::duckdb_cast_function_set_error(info, msg.as_ptr());
+        return false;
+    }
+    let extra_ref = &*extra;
+    for r in 0..(count as usize) {
+        let v = read_arg_neutral(extra_ref.source_code, input, r);
+        let out = match extra_ref.engine.dispatch_cast_col(extra_ref.callback_handle, v) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = CString::new(format!("cast dispatch failed: {e}")).unwrap();
+                ffi::duckdb_cast_function_set_row_error(info, msg.as_ptr(), r as u64, output);
+                continue;
+            }
+        };
+        write_row_out(extra_ref.target_code, output, r, out);
+    }
+    true
+}
+
+fn type_code_from_expr(expr: &str) -> u8 {
+    match expr.to_ascii_uppercase().as_str() {
+        "BOOLEAN" | "BOOL" => T_BOOL,
+        "BIGINT" | "INT8" | "INT64" => T_I64,
+        "UBIGINT" | "UINT64" => T_U64,
+        "DOUBLE" | "FLOAT8" | "FLOAT64" => T_F64,
+        "VARCHAR" | "TEXT" | "STRING" => T_TEXT,
+        "BLOB" | "BYTEA" | "BINARY" => T_BLOB,
+        "TINYINT" | "INT1" => T_I8,
+        "SMALLINT" | "INT2" | "INT16" => T_I16,
+        "INTEGER" | "INT" | "INT4" | "INT32" => T_I32,
+        "UTINYINT" | "UINT8" => T_U8,
+        "USMALLINT" | "UINT16" => T_U16,
+        "UINTEGER" | "UINT32" => T_U32,
+        "FLOAT" | "FLOAT4" | "FLOAT32" => T_F32,
+        _ => T_TEXT,
+    }
+}
+
+pub unsafe fn register_casts(
+    raw_con: ffi::duckdb_connection,
+    engine: Arc<Engine2>,
+    casts: &[CastEntry],
+) -> Result<usize, String> {
+    if casts.is_empty() {
+        return Ok(0);
+    }
+    if raw_con.is_null() {
+        return Err("register_casts: raw_con is null".to_string());
+    }
+    let mut registered = 0usize;
+    for c in casts {
+        let src_code = type_code_from_expr(&c.source);
+        let tgt_code = type_code_from_expr(&c.target);
+        let cf = ffi::duckdb_create_cast_function();
+        let mut src_lt = ffi::duckdb_create_logical_type(duckdb_type_of(src_code));
+        let mut tgt_lt = ffi::duckdb_create_logical_type(duckdb_type_of(tgt_code));
+        ffi::duckdb_cast_function_set_source_type(cf, src_lt);
+        ffi::duckdb_cast_function_set_target_type(cf, tgt_lt);
+        ffi::duckdb_destroy_logical_type(&mut src_lt);
+        ffi::duckdb_destroy_logical_type(&mut tgt_lt);
+        ffi::duckdb_cast_function_set_implicit_cast_cost(cf, 100);
+        ffi::duckdb_cast_function_set_function(cf, Some(ducklink_cast_invoke));
+        let extra = Box::into_raw(Box::new(CastExtra {
+            callback_handle: c.callback_handle,
+            engine: engine.clone(),
+            source_code: src_code,
+            target_code: tgt_code,
+        })) as *mut c_void;
+        ffi::duckdb_cast_function_set_extra_info(cf, extra, Some(cast_extra_destroy));
+
+        let rc = ffi::duckdb_register_cast_function(raw_con, cf);
+        let mut cf_mut = cf;
+        ffi::duckdb_destroy_cast_function(&mut cf_mut);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] cast '{}' -> '{}' not registered (already present?)",
+                c.source, c.target
+            );
+            continue;
+        }
+        registered += 1;
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 6. register_logical_types — user-defined logical type aliases. C API:
+// duckdb_create_logical_type on the physical type + duckdb_register_logical_type.
+// ---------------------------------------------------------------------------
+
+pub unsafe fn register_logical_types(
+    raw_con: ffi::duckdb_connection,
+    types: &[LogicalTypeEntry],
+) -> Result<usize, String> {
+    if types.is_empty() {
+        return Ok(0);
+    }
+    if raw_con.is_null() {
+        return Err("register_logical_types: raw_con is null".to_string());
+    }
+    let mut registered = 0usize;
+    for t in types {
+        let code = type_code_from_expr(&t.physical);
+        let mut lt = ffi::duckdb_create_logical_type(duckdb_type_of(code));
+        let name_c = match CString::new(t.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!(
+                    "[ducklink] logical type '{}' has a NUL byte; skipping",
+                    t.name
+                );
+                ffi::duckdb_destroy_logical_type(&mut lt);
+                continue;
+            }
+        };
+        ffi::duckdb_logical_type_set_alias(lt, name_c.as_ptr());
+        let rc = ffi::duckdb_register_logical_type(raw_con, lt, std::ptr::null_mut());
+        ffi::duckdb_destroy_logical_type(&mut lt);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] logical type '{}' not registered (already present?)",
+                t.name
+            );
+            continue;
+        }
+        registered += 1;
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 7. register_modified_types — logical types registered over a full
+// type-expression (e.g. DECIMAL(18,3)). Same shape as logical_types plus a
+// decimal-width/scale extraction.
+// ---------------------------------------------------------------------------
+
+fn parse_decimal_expr(expr: &str) -> Option<(u8, u8)> {
+    let s = expr.trim();
+    let upper = s.to_ascii_uppercase();
+    if !upper.starts_with("DECIMAL") && !upper.starts_with("NUMERIC") {
+        return None;
+    }
+    let open = s.find('(')?;
+    let close = s.find(')')?;
+    let inner = &s[open + 1..close];
+    let mut it = inner.split(',');
+    let w: u8 = it.next()?.trim().parse().ok()?;
+    let sc: u8 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+    Some((w, sc))
+}
+
+pub unsafe fn register_modified_types(
+    raw_con: ffi::duckdb_connection,
+    types: &[ModifiedTypeEntry],
+) -> Result<usize, String> {
+    if types.is_empty() {
+        return Ok(0);
+    }
+    if raw_con.is_null() {
+        return Err("register_modified_types: raw_con is null".to_string());
+    }
+    let mut registered = 0usize;
+    for t in types {
+        // Decimal path: honour the (width,scale) shape.
+        let mut lt = if let Some((w, sc)) = parse_decimal_expr(&t.type_expr) {
+            ffi::duckdb_create_decimal_type(w, sc)
+        } else {
+            let code = type_code_from_expr(&t.type_expr);
+            ffi::duckdb_create_logical_type(duckdb_type_of(code))
+        };
+        let name_c = match CString::new(t.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!(
+                    "[ducklink] modified type '{}' has a NUL byte; skipping",
+                    t.name
+                );
+                ffi::duckdb_destroy_logical_type(&mut lt);
+                continue;
+            }
+        };
+        ffi::duckdb_logical_type_set_alias(lt, name_c.as_ptr());
+        let rc = ffi::duckdb_register_logical_type(raw_con, lt, std::ptr::null_mut());
+        ffi::duckdb_destroy_logical_type(&mut lt);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] modified type '{}' not registered (already present?)",
+                t.name
+            );
+            continue;
+        }
+        registered += 1;
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 8. register_enum_types — ENUM types. C API: duckdb_create_enum_type +
+// duckdb_register_logical_type. The enum dictionary is a flat list of
+// member name c-strings.
+// ---------------------------------------------------------------------------
+
+pub unsafe fn register_enum_types(
+    raw_con: ffi::duckdb_connection,
+    enums: &[EnumTypeEntry],
+) -> Result<usize, String> {
+    if enums.is_empty() {
+        return Ok(0);
+    }
+    if raw_con.is_null() {
+        return Err("register_enum_types: raw_con is null".to_string());
+    }
+    let mut registered = 0usize;
+    for e in enums {
+        // Build a stable Vec<CString> so pointers stay live for the duration
+        // of the create call.
+        let cstrs: Vec<CString> = e
+            .members
+            .iter()
+            .filter_map(|m| CString::new(m.as_str()).ok())
+            .collect();
+        if cstrs.len() != e.members.len() {
+            eprintln!(
+                "[ducklink] enum type '{}' has a member with a NUL byte; skipping",
+                e.name
+            );
+            continue;
+        }
+        let mut ptrs: Vec<*const c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
+        let mut lt = ffi::duckdb_create_enum_type(ptrs.as_mut_ptr(), ptrs.len() as ffi::idx_t);
+        let name_c = match CString::new(e.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                ffi::duckdb_destroy_logical_type(&mut lt);
+                eprintln!("[ducklink] enum type '{}' has a NUL byte; skipping", e.name);
+                continue;
+            }
+        };
+        ffi::duckdb_logical_type_set_alias(lt, name_c.as_ptr());
+        let rc = ffi::duckdb_register_logical_type(raw_con, lt, std::ptr::null_mut());
+        ffi::duckdb_destroy_logical_type(&mut lt);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] enum type '{}' not registered (already present?)",
+                e.name
+            );
+            continue;
+        }
+        registered += 1;
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 9. register_macros — no C API; uses `CREATE OR REPLACE MACRO`.
+// Identifiers are quoted with double quotes and internal quotes doubled to
+// keep the shape safe against injection through component-supplied names.
+// ---------------------------------------------------------------------------
+
+fn quote_ident(ident: &str) -> String {
+    let mut s = String::with_capacity(ident.len() + 2);
+    s.push('"');
+    for ch in ident.chars() {
+        if ch == '"' {
+            s.push('"');
+        }
+        s.push(ch);
+    }
+    s.push('"');
+    s
+}
+
+pub fn register_macros(con: &Connection, macros: &[MacroEntry]) -> Result<usize, String> {
+    if macros.is_empty() {
+        return Ok(0);
+    }
+    let mut registered = 0usize;
+    for m in macros {
+        let schema = if m.schema.is_empty() {
+            "main".to_string()
+        } else {
+            m.schema.clone()
+        };
+        let params = m
+            .parameters
+            .iter()
+            .map(|p| quote_ident(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "CREATE OR REPLACE MACRO {}.{}({}) AS {}",
+            quote_ident(&schema),
+            quote_ident(&m.name),
+            params,
+            m.definition_sql
+        );
+        match con.execute_batch(&sql) {
+            Ok(_) => registered += 1,
+            Err(e) => eprintln!(
+                "[ducklink] macro '{}.{}' not registered: {e}",
+                schema, m.name
+            ),
+        }
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 10. register_table_macros — CREATE OR REPLACE MACRO ... AS TABLE <body>.
+// ---------------------------------------------------------------------------
+
+pub fn register_table_macros(
+    con: &Connection,
+    macros: &[TableMacroEntry],
+) -> Result<usize, String> {
+    if macros.is_empty() {
+        return Ok(0);
+    }
+    let mut registered = 0usize;
+    for m in macros {
+        let schema = if m.schema.is_empty() {
+            "main".to_string()
+        } else {
+            m.schema.clone()
+        };
+        let params = m
+            .parameters
+            .iter()
+            .map(|p| quote_ident(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "CREATE OR REPLACE MACRO {}.{}({}) AS TABLE {}",
+            quote_ident(&schema),
+            quote_ident(&m.name),
+            params,
+            m.body_sql
+        );
+        match con.execute_batch(&sql) {
+            Ok(_) => registered += 1,
+            Err(e) => eprintln!(
+                "[ducklink] table macro '{}.{}' not registered: {e}",
+                schema, m.name
+            ),
+        }
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 11. register_log_storages — log-storage sinks. C API:
+// duckdb_create_log_storage + duckdb_log_storage_set_{write_log_entry,name,
+// extra_data} + duckdb_register_log_storage. The `write_log_entry` callback
+// receives level/type/message directly from DuckDB, packages them into a
+// `LogEntry` and dispatches back into the owning component via
+// `Engine2::dispatch_write_log_entry` — the guest-side
+// `log-storage-dispatch.write-log-entry` export (added by the log-storage-wit
+// agent) receives the record. The Engine2 handle is looked up through the
+// process-wide `LOG_STORAGE_REGISTRY`, mirroring the `REPLACEMENT_SCAN_REGISTRY`
+// pattern above.
+// ---------------------------------------------------------------------------
+
+/// One (callback_handle -> Engine2, name) mapping the C callback consults on
+/// every DuckDB log entry. Populated by `register_log_storages`; installed at
+/// extension init and on subsequent LOADs.
+struct LogStorageRegistration {
+    callback_handle: u32,
+    engine: Arc<Engine2>,
+    name: String,
+}
+
+/// Process-wide registry mirroring `REPLACEMENT_SCAN_REGISTRY`. Keyed by
+/// callback_handle, which is unique per registered sink.
+static LOG_STORAGE_REGISTRY: OnceLock<Mutex<Vec<LogStorageRegistration>>> = OnceLock::new();
+
+fn log_storage_registry() -> &'static Mutex<Vec<LogStorageRegistration>> {
+    LOG_STORAGE_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Look up (Engine2, name) for a callback handle. Returns `None` if the
+/// handle is unknown (e.g. a stray DuckDB log record arriving after the
+/// component was unloaded).
+fn resolve_log_storage(callback_handle: u32) -> Option<(Arc<Engine2>, String)> {
+    let reg = LOG_STORAGE_REGISTRY.get()?;
+    let guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .iter()
+        .find(|r| r.callback_handle == callback_handle)
+        .map(|r| (r.engine.clone(), r.name.clone()))
+}
+
+#[allow(dead_code)]
+struct LogStorageExtra {
+    callback_handle: u32,
+    name: String,
+}
+
+unsafe extern "C" fn log_storage_extra_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut LogStorageExtra));
+    }
+}
+
+/// Map a DuckDB log-level string (e.g. "TRACE"/"DEBUG"/"INFO"/"WARN"/"ERROR"/
+/// "FATAL") into the u32 the WIT `log-entry.level` field expects. Unknown
+/// strings map to `u32::MAX` so components can distinguish an unrecognised
+/// level from a real level=0 record.
+fn log_level_to_u32(s: &str) -> u32 {
+    match s.to_ascii_uppercase().as_str() {
+        "TRACE" => 0,
+        "DEBUG" => 1,
+        "INFO" => 2,
+        "WARN" | "WARNING" => 3,
+        "ERROR" => 4,
+        "FATAL" => 5,
+        _ => u32::MAX,
+    }
+}
+
+unsafe extern "C" fn ducklink_log_storage_write(
+    extra_data: *mut c_void,
+    _timestamp: *mut ffi::duckdb_timestamp,
+    level: *const c_char,
+    log_type: *const c_char,
+    log_message: *const c_char,
+) {
+    if extra_data.is_null() {
+        return;
+    }
+    let extra_ref = &*(extra_data as *const LogStorageExtra);
+    let read_cstr = |p: *const c_char| -> String {
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    let lvl_str = read_cstr(level);
+    let ty = read_cstr(log_type);
+    let msg = read_cstr(log_message);
+    // Fold the DuckDB `type` label into the message so the guest sees it even
+    // though the WIT `log-entry` has no dedicated type field.
+    let message = if ty.is_empty() {
+        msg
+    } else {
+        format!("[{ty}] {msg}")
+    };
+    let ts_micros = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let entry = LogEntry {
+        level: log_level_to_u32(&lvl_str),
+        message,
+        tags: None,
+        ts_micros,
+    };
+    let (engine, sink_name) = match resolve_log_storage(extra_ref.callback_handle) {
+        Some(pair) => pair,
+        None => {
+            eprintln!(
+                "[ducklink:log-storage:{}] no engine registered for callback_handle={}",
+                extra_ref.name, extra_ref.callback_handle
+            );
+            return;
+        }
+    };
+    if let Err(err) = engine.dispatch_write_log_entry(extra_ref.callback_handle, entry) {
+        eprintln!("log-storage {sink_name}: dispatch failed: {err}");
+    }
+}
+
+pub unsafe fn register_log_storages(
+    db: ffi::duckdb_database,
+    engine: Arc<Engine2>,
+    storages: &[LogStorageEntry],
+) -> Result<usize, String> {
+    if storages.is_empty() {
+        return Ok(0);
+    }
+    if db.is_null() {
+        return Err("register_log_storages: db is null".to_string());
+    }
+    let mut registered = 0usize;
+    for s in storages {
+        let name_c = match CString::new(s.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!(
+                    "[ducklink] log storage '{}' has a NUL byte; skipping",
+                    s.name
+                );
+                continue;
+            }
+        };
+        let ls = ffi::duckdb_create_log_storage();
+        ffi::duckdb_log_storage_set_name(ls, name_c.as_ptr());
+        let extra = Box::into_raw(Box::new(LogStorageExtra {
+            callback_handle: s.callback_handle,
+            name: s.name.clone(),
+        })) as *mut c_void;
+        ffi::duckdb_log_storage_set_extra_data(ls, extra, Some(log_storage_extra_destroy));
+        ffi::duckdb_log_storage_set_write_log_entry(ls, Some(ducklink_log_storage_write));
+        // Publish (callback_handle -> engine) so the C callback can resolve
+        // its owning component. Idempotent on the callback_handle key so
+        // repeated LOADs of the same component don't stack duplicates.
+        {
+            let reg = log_storage_registry();
+            let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = guard
+                .iter_mut()
+                .find(|r| r.callback_handle == s.callback_handle)
+            {
+                existing.engine = engine.clone();
+                existing.name = s.name.clone();
+            } else {
+                guard.push(LogStorageRegistration {
+                    callback_handle: s.callback_handle,
+                    engine: engine.clone(),
+                    name: s.name.clone(),
+                });
+            }
+        }
+
+        let rc = ffi::duckdb_register_log_storage(db, ls);
+        let mut ls_mut = ls;
+        ffi::duckdb_destroy_log_storage(&mut ls_mut);
+        if rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] log storage '{}' not registered (already present?)",
+                s.name
+            );
+            continue;
+        }
+        registered += 1;
+    }
+    Ok(registered)
 }

@@ -24,7 +24,8 @@ use crate::duckdb_extension_bindings::duckdb::extension::{
     compression as extension_compression, config as extension_config,
     coordinate_system as extension_coordinate_system, encoding as extension_encoding,
     files as extension_files, collation as extension_collation, files_reg as extension_files_reg,
-    index as extension_index, lifecycle as extension_lifecycle, logging as extension_logging,
+    index as extension_index, lifecycle as extension_lifecycle, log_storage as extension_log_storage,
+    logging as extension_logging,
     macro_ext as extension_macro_ext, optimizer as extension_optimizer, parser as extension_parser,
     query as extension_query, runtime as extension_runtime,
     runtime_ext as extension_runtime_ext, secret as extension_secret,
@@ -353,6 +354,19 @@ type PendingOptimizer = reg::OptimizerReg;
 // 3.1.0 additive capture: streaming/filter-pushdown table function.
 type PendingFilterableTable = reg::FilterableTableReg;
 
+/// A log-storage sink registered by an extension. Keyed by `name` (the
+/// storage name the guest declared); `callback_handle` routes every
+/// log-storage callback back to the owning component.
+///
+/// Defined locally rather than in [`crate::reg`] because the WIT + host
+/// register_* wiring is landing in a sibling agent's phase; a later
+/// phase promotes this into `crate::reg` once the WIT surface stabilises.
+#[derive(Clone, Debug)]
+pub struct PendingLogStorage {
+    pub name: String,
+    pub callback_handle: u32,
+}
+
 #[derive(Default)]
 struct PendingScalarRegistry {
     entries: Vec<PendingScalar>,
@@ -380,6 +394,21 @@ pub struct PendingRegistrationsData {
     pub logical_types: Vec<PendingLogicalType>,
     pub casts: Vec<PendingCast>,
     pub storages: Vec<PendingStorage>,
+    // Additive fields (Phase: drain-plumbing). These mirror pending_*
+    // buffers on `ExtensionStoreState` that were already captured by the
+    // register_* host impls but not previously carried through
+    // `drain_pending` into the .duckdb_extension shim.
+    pub settings: Vec<PendingSetting>,
+    pub copy_handlers: Vec<PendingCopyHandler>,
+    pub arrow_tables: Vec<PendingArrowTable>,
+    pub scalar_ex: Vec<PendingScalarEx>,
+    pub table_macros: Vec<PendingTableMacro>,
+    pub enum_types: Vec<PendingEnumType>,
+    pub modified_types: Vec<PendingModifiedType>,
+    /// NEW additive sink (see [`PendingLogStorage`]). The register_* host
+    /// impl and take/drain wiring for pushes into this buffer land in a
+    /// sibling phase; the field is added here so the drain path is ready.
+    pub log_storages: Vec<PendingLogStorage>,
 }
 
 impl PendingRegistrationsData {
@@ -392,6 +421,15 @@ impl PendingRegistrationsData {
         self.logical_types.append(&mut other.logical_types);
         self.casts.append(&mut other.casts);
         self.storages.append(&mut other.storages);
+        // Additive fields (Phase: drain-plumbing).
+        self.settings.append(&mut other.settings);
+        self.copy_handlers.append(&mut other.copy_handlers);
+        self.arrow_tables.append(&mut other.arrow_tables);
+        self.scalar_ex.append(&mut other.scalar_ex);
+        self.table_macros.append(&mut other.table_macros);
+        self.enum_types.append(&mut other.enum_types);
+        self.modified_types.append(&mut other.modified_types);
+        self.log_storages.append(&mut other.log_storages);
     }
 }
 
@@ -461,6 +499,10 @@ pub struct ExtensionStoreState {
     pending_parsers: Vec<PendingParser>,
     pending_optimizers: Vec<PendingOptimizer>,
     pending_filterable_tables: Vec<PendingFilterableTable>,
+    // Additive capture buffer (Phase: drain-plumbing). Populated by the
+    // register_* host impl in a sibling phase; wired through
+    // `drain_pending` now so no captures are dropped once that lands.
+    pending_log_storages: Vec<PendingLogStorage>,
     /// Maps the handle returned from `table-registry.register` to the table
     /// function name, so `files.register-replacement-scan` can resolve it.
     table_handle_names: HashMap<u32, String>,
@@ -527,6 +569,7 @@ impl ExtensionStoreState {
             pending_parsers: Vec::new(),
             pending_optimizers: Vec::new(),
             pending_filterable_tables: Vec::new(),
+            pending_log_storages: Vec::new(),
             table_handle_names: HashMap::new(),
             callback_registry,
             extension_name,
@@ -590,16 +633,20 @@ impl ExtensionStoreState {
     }
 
     /// Drains ONLY the captured collation registrations (Item 2), used right
-    /// after `load()` so the host can surface them to the core (which pulls the
-    /// list via `collation-host.collation-list` and wraps each as a DuckDB
-    /// collation reusing the already-registered sort-key scalar).
+    /// after `load()` so the host can surface them to the core (the
+    /// `collation-host` pull-back interface for this capability was never
+    /// produced; enumeration goes through `PendingRegistrationsData` instead),
+    /// wrapping each as a DuckDB collation reusing the already-registered
+    /// sort-key scalar.
     fn take_pending_collations(&mut self) -> Vec<PendingCollation> {
         std::mem::take(&mut self.pending_collations)
     }
 
     /// Item 4: drains ONLY the captured pragma registrations, used right after
-    /// `load()` so the host can surface them to the core (which pulls the list
-    /// via `pragma-host.pragma-list` and intercepts `PRAGMA <name>(...)`).
+    /// `load()` so the host can surface them to the core (the `pragma-host`
+    /// pull-back interface for this capability was never produced; enumeration
+    /// goes through `PendingRegistrationsData` instead), where the core
+    /// intercepts `PRAGMA <name>(...)`.
     fn take_pending_pragmas(&mut self) -> Vec<PendingPragma> {
         std::mem::take(&mut self.pending_pragmas)
     }
@@ -656,6 +703,11 @@ impl ExtensionStoreState {
         std::mem::take(&mut self.pending_filterable_tables)
     }
 
+    // --- Phase: drain-plumbing additive drain (mirror take_pending_pragmas) ---
+    fn take_pending_log_storages(&mut self) -> Vec<PendingLogStorage> {
+        std::mem::take(&mut self.pending_log_storages)
+    }
+
     fn drain_pending(&mut self) -> PendingRegistrationsData {
         // Combine registrations retained from dropped registries with any that
         // belong to registries still held alive by the guest.
@@ -682,6 +734,18 @@ impl ExtensionStoreState {
         let logical_types = std::mem::take(&mut self.pending_logical_types);
         let casts = std::mem::take(&mut self.pending_casts);
         let storages = std::mem::take(&mut self.pending_storages);
+        // Additive drains (Phase: drain-plumbing). These were previously
+        // captured but never forwarded into `PendingRegistrationsData`;
+        // draining them here plugs the leak between the runtime and the
+        // .duckdb_extension shim without touching any register_* host impl.
+        let settings = self.take_pending_settings();
+        let copy_handlers = self.take_pending_copy_handlers();
+        let arrow_tables = self.take_pending_arrow_tables();
+        let scalar_ex = self.take_pending_scalar_ex();
+        let table_macros = self.take_pending_table_macros();
+        let enum_types = self.take_pending_enum_types();
+        let modified_types = self.take_pending_modified_types();
+        let log_storages = self.take_pending_log_storages();
         let pending = PendingRegistrationsData {
             scalars,
             tables,
@@ -691,6 +755,14 @@ impl ExtensionStoreState {
             logical_types,
             casts,
             storages,
+            settings,
+            copy_handlers,
+            arrow_tables,
+            scalar_ex,
+            table_macros,
+            enum_types,
+            modified_types,
+            log_storages,
         };
         let scalar_names =
             summarize_registration_names(&pending.scalars, |entry| entry.name.as_str());
@@ -1120,10 +1192,12 @@ impl extension_runtime::HostAggregateRegistry for ExtensionStoreState {
 
 impl extension_runtime::HostPragmaRegistry for ExtensionStoreState {
     // Item 4: a component declares a PRAGMA in `load()`. The host captures its
-    // name + the callback handle into the neutral pending buffer; the core later
-    // pulls the list (via `pragma-host.pragma-list`), intercepts
-    // `PRAGMA <name>(...)`, dispatches via callback-dispatch.call-pragma (the
-    // component RETURNS a SQL script as text), and runs that script.
+    // name + the callback handle into the neutral pending buffer; the core
+    // later pulls the list (the `pragma-host` pull-back interface for this
+    // capability was never produced; enumeration goes through
+    // PendingRegistrationsData instead), intercepts `PRAGMA <name>(...)`,
+    // dispatches via callback-dispatch.call-pragma (the component RETURNS a
+    // SQL script as text), and runs that script.
     fn register_call(
         &mut self,
         _self_: Resource<extension_runtime::PragmaRegistry>,
@@ -1406,43 +1480,26 @@ impl extension_files::Host for ExtensionStoreState {
 impl extension_secret::Host for ExtensionStoreState {
     fn register_secret_type(
         &mut self,
-        type_name: String,
-        params: BindgenVec<extension_secret::SecretParam>,
-        callback_handle: u32,
+        _type_name: String,
+        _params: BindgenVec<extension_secret::SecretParam>,
+        _callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        verbose_log!(
-            "[extension-runtime:{}] registered secret type '{type_name}' ({} params, callback={callback_handle})",
-            self.extension_name,
-            params.len()
-        );
-        self.pending_secrets.push(PendingSecret {
-            extension: self.extension_name.clone(),
-            type_name,
-            provider: None,
-            params: params.into_iter().map(|p| (p.name, p.redacted)).collect(),
-            callback_handle,
-        });
-        Ok(self.alloc_resource_id())
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_secret_type is not part of the DuckDB stable C API in this build"
+                .to_string(),
+        ))
     }
 
     fn register_secret_provider(
         &mut self,
-        type_name: String,
-        provider: String,
-        callback_handle: u32,
+        _type_name: String,
+        _provider: String,
+        _callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        verbose_log!(
-            "[extension-runtime:{}] registered secret provider '{type_name}'/'{provider}' (callback={callback_handle})",
-            self.extension_name
-        );
-        self.pending_secrets.push(PendingSecret {
-            extension: self.extension_name.clone(),
-            type_name,
-            provider: Some(provider),
-            params: Vec::new(),
-            callback_handle,
-        });
-        Ok(self.alloc_resource_id())
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_secret_type is not part of the DuckDB stable C API in this build"
+                .to_string(),
+        ))
     }
 }
 
@@ -1680,9 +1737,17 @@ impl extension_runtime_ext::Host for ExtensionStoreState {
         let varargs = varargs.map(convert_extension_logicaltype);
         let returns = convert_extension_logicaltype(returns);
         let options = options.map(convert_extension_funcopts);
+        // WIT `funcflags` has no VOLATILE bit; derive it from the incoming
+        // attributes: a scalar-ex is VOLATILE iff it did NOT declare
+        // `deterministic`. Absent options -> non-volatile default, closing the
+        // audit finding that treated every ex-path fn as VOLATILE.
+        let volatile = options
+            .as_ref()
+            .map(|o| !o.attributes.deterministic)
+            .unwrap_or(false);
         let registry_id = self.alloc_resource_id();
         verbose_log!(
-            "[extension-runtime:{}] registered scalar-ex '{name}' (registry={registry_id}, callback={callback_handle}, varargs={}, special_null={special_null})",
+            "[extension-runtime:{}] registered scalar-ex '{name}' (registry={registry_id}, callback={callback_handle}, varargs={}, special_null={special_null}, volatile={volatile})",
             self.extension_name,
             varargs.is_some()
         );
@@ -1693,6 +1758,7 @@ impl extension_runtime_ext::Host for ExtensionStoreState {
             varargs,
             returns,
             special_null,
+            volatile,
             callback_handle,
             options,
         });
@@ -1706,22 +1772,12 @@ impl extension_runtime_ext::Host for ExtensionStoreState {
 impl extension_lifecycle::Host for ExtensionStoreState {
     fn register_connection_callback(
         &mut self,
-        events: extension_lifecycle::ConnEvents,
-        callback_handle: u32,
+        _events: extension_lifecycle::ConnEvents,
+        _callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        let on_opened = events.contains(extension_lifecycle::ConnEvents::OPENED);
-        let on_closed = events.contains(extension_lifecycle::ConnEvents::CLOSED);
-        verbose_log!(
-            "[extension-runtime:{}] registered connection callback (opened={on_opened}, closed={on_closed}, callback={callback_handle})",
-            self.extension_name
-        );
-        self.pending_conn_callbacks.push(PendingConnCallback {
-            extension: self.extension_name.clone(),
-            on_opened,
-            on_closed,
-            callback_handle,
-        });
-        Ok(self.alloc_resource_id())
+        Err(extension_types::Duckerror::Unsupported(
+            "no DuckDB C API for connection open/close callbacks".to_string(),
+        ))
     }
 }
 
@@ -1781,22 +1837,13 @@ impl extension_arrow_ext::Host for ExtensionStoreState {
 impl extension_encoding::Host for ExtensionStoreState {
     fn register_encoding(
         &mut self,
-        name: String,
-        aliases: BindgenVec<String>,
-        callback_handle: u32,
+        _name: String,
+        _aliases: BindgenVec<String>,
+        _callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        verbose_log!(
-            "[extension-runtime:{}] registered text encoding '{name}' ({} aliases, callback={callback_handle})",
-            self.extension_name,
-            aliases.len()
-        );
-        self.pending_encodings.push(PendingEncoding {
-            extension: self.extension_name.clone(),
-            name,
-            aliases: aliases.into_iter().collect(),
-            callback_handle,
-        });
-        Ok(self.alloc_resource_id())
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_encoding is not part of the DuckDB stable C API".to_string(),
+        ))
     }
 }
 
@@ -1807,18 +1854,34 @@ impl extension_encoding::Host for ExtensionStoreState {
 impl extension_compression::Host for ExtensionStoreState {
     fn register_compression(
         &mut self,
+        _name: String,
+        _file_extension: String,
+        _callback_handle: u32,
+    ) -> Result<u32, extension_types::Duckerror> {
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_compression is not part of the DuckDB stable C API".to_string(),
+        ))
+    }
+}
+
+// 3.2.0: the `log-storage` interface lets a component declare a NAMED log sink
+// (Class B parity with the stable `duckdb_register_log_storage` C API). The
+// host captures the declaration into the neutral pending buffer; the C API
+// installer in `ducklink-extension/src/reg_duckdb.rs` (sibling phase) drains
+// this buffer and wires each name to a `duckdb_register_log_storage` call whose
+// write callback re-enters this component via `ExtensionInstance::dispatch_write_log_entry`.
+impl extension_log_storage::Host for ExtensionStoreState {
+    fn register_log_storage(
+        &mut self,
         name: String,
-        file_extension: String,
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
         verbose_log!(
-            "[extension-runtime:{}] registered compression codec '{name}' (.{file_extension}, callback={callback_handle})",
+            "[extension-runtime:{}] registered log storage '{name}' (callback={callback_handle})",
             self.extension_name
         );
-        self.pending_compressions.push(PendingCompression {
-            extension: self.extension_name.clone(),
+        self.pending_log_storages.push(PendingLogStorage {
             name,
-            file_extension,
             callback_handle,
         });
         Ok(self.alloc_resource_id())
@@ -1833,22 +1896,14 @@ impl extension_compression::Host for ExtensionStoreState {
 impl extension_storage::Host for ExtensionStoreState {
     fn register_storage(
         &mut self,
-        type_name: String,
-        callback_handle: u32,
-        options: Option<extension_storage::Extopts>,
+        _type_name: String,
+        _callback_handle: u32,
+        _options: Option<extension_storage::Extopts>,
     ) -> Result<u32, extension_types::Duckerror> {
-        let converted_options = options.map(convert_storage_extopts);
-        verbose_log!(
-            "[extension-runtime:{}] registered storage backend '{type_name}' (callback={callback_handle})",
-            self.extension_name
-        );
-        self.pending_storages.push(PendingStorage {
-            extension: self.extension_name.clone(),
-            type_name,
-            callback_handle,
-            options: converted_options,
-        });
-        Ok(self.alloc_resource_id())
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_storage_extension is not part of the DuckDB stable C API"
+                .to_string(),
+        ))
     }
 }
 
@@ -1860,17 +1915,11 @@ impl extension_storage::Host for ExtensionStoreState {
 impl extension_index::Host for ExtensionStoreState {
     fn register_index_type(
         &mut self,
-        type_name: String,
+        _type_name: String,
     ) -> Result<(), extension_types::Duckerror> {
-        verbose_log!(
-            "[extension-runtime:{}] registered custom index type '{type_name}'",
-            self.extension_name
-        );
-        self.pending_indexes.push(PendingIndex {
-            extension: self.extension_name.clone(),
-            type_name,
-        });
-        Ok(())
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_index_type is not part of the DuckDB stable C API".to_string(),
+        ))
     }
 }
 
@@ -1882,17 +1931,11 @@ impl extension_index::Host for ExtensionStoreState {
 impl extension_files_reg::Host for ExtensionStoreState {
     fn register_files(
         &mut self,
-        callback_handle: u32,
+        _callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
-        verbose_log!(
-            "[extension-runtime:{}] registered files backend (callback={callback_handle})",
-            self.extension_name
-        );
-        self.pending_files.push(PendingFiles {
-            extension: self.extension_name.clone(),
-            callback_handle,
-        });
-        Ok(self.alloc_resource_id())
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_file_system is not part of the DuckDB stable C API".to_string(),
+        ))
     }
 }
 
@@ -1900,26 +1943,20 @@ impl extension_files_reg::Host for ExtensionStoreState {
 // `load()` whose transform is an already-registered sort-key scalar. The host
 // satisfies the import so collation-capable components (e.g. icufns) instantiate
 // and load; the registration is captured into the neutral pending buffer. The
-// core later pulls the list (via `collation-host.collation-list`) and wraps each
-// as a DuckDB collation reusing the named scalar -- no new dispatch.
+// core later pulls the list (the `collation-host` pull-back interface for this
+// capability was never produced; enumeration goes through
+// PendingRegistrationsData instead) and wraps each as a DuckDB collation
+// reusing the named scalar -- no new dispatch.
 impl extension_collation::Host for ExtensionStoreState {
     fn register_collation(
         &mut self,
-        name: String,
-        transform_scalar: String,
-        combinable: bool,
+        _name: String,
+        _transform_scalar: String,
+        _combinable: bool,
     ) -> Result<(), extension_types::Duckerror> {
-        verbose_log!(
-            "[extension-runtime:{}] registered collation '{name}' (transform scalar='{transform_scalar}', combinable={combinable})",
-            self.extension_name
-        );
-        self.pending_collations.push(PendingCollation {
-            extension: self.extension_name.clone(),
-            name,
-            transform_scalar,
-            combinable,
-        });
-        Ok(())
+        Err(extension_types::Duckerror::Unsupported(
+            "duckdb_register_collation is not part of the DuckDB stable C API".to_string(),
+        ))
     }
 }
 
@@ -2182,6 +2219,10 @@ pub struct ExtensionInstance {
     index_write_bindings:
         Option<crate::duckdb_extension_index_write_bindings::DuckdbExtensionIndexWrite>,
     settings_bindings: Option<crate::duckdb_extension_settings_bindings::DuckdbExtensionSettings>,
+    // 3.2.0: lazily-built log-storage bindings (None until first
+    // write_log_entry, or for non-log-sink extensions).
+    log_storage_bindings:
+        Option<crate::duckdb_extension_log_storage_bindings::DuckdbExtensionLogStorage>,
 }
 
 fn map_extension_trap(err: wasmtime::Error) -> extension_types::Duckerror {
@@ -2332,6 +2373,12 @@ pub use crate::duckdb_extension_table_stream_bindings::exports::duckdb::extensio
 /// re-exported for the host.
 pub use crate::duckdb_extension_file_write_bindings::exports::duckdb::extension::file_write_dispatch::FileInfo;
 
+/// 3.2.0: one log record crossing the WIT boundary into a registered log sink,
+/// re-exported so the direction-specific sink (the C API installer in
+/// `ducklink-extension/src/reg_duckdb.rs`) can construct entries by-value.
+/// Class B parity with the stable `duckdb_register_log_storage` C API.
+pub use crate::duckdb_extension_log_storage_bindings::exports::duckdb::extension::log_storage_dispatch::LogEntry;
+
 fn index_duckerror_to_ext(err: index_types::Duckerror) -> extension_types::Duckerror {
     match err {
         index_types::Duckerror::Invalidargument(m) => extension_types::Duckerror::Invalidargument(m),
@@ -2366,6 +2413,10 @@ impl ExtensionInstance {
             file_write_bindings: None,
             index_write_bindings: None,
             settings_bindings: None,
+            // 3.2.0: log-storage-dispatch bindings are None until the first
+            // write-log-entry the direction-specific sink forwards to this
+            // component. Non-log-sink extensions never build them.
+            log_storage_bindings: None,
         }
     }
 
@@ -3369,6 +3420,49 @@ impl ExtensionInstance {
             .map_err(map_extension_trap)?
     }
 
+    // --- 3.2.0: log-storage-dispatch re-entry ---
+    // Forwards one DuckDB log record to the component whose `callback-handle`
+    // matches a storage the guest registered via `log-storage.register-log-storage`
+    // (Class B parity with the stable `duckdb_register_log_storage` C API). The
+    // bindings are built lazily from the SAME loaded component instance so a
+    // non-log-sink extension pays nothing.
+
+    fn log_storage_bindings(
+        &mut self,
+    ) -> Result<
+        &crate::duckdb_extension_log_storage_bindings::DuckdbExtensionLogStorage,
+        extension_types::Duckerror,
+    > {
+        if self.log_storage_bindings.is_none() {
+            let built =
+                crate::duckdb_extension_log_storage_bindings::DuckdbExtensionLogStorage::new(
+                    self.store.as_context_mut(),
+                    &self.instance,
+                )
+                .map_err(map_extension_trap)?;
+            self.log_storage_bindings = Some(built);
+        }
+        Ok(self.log_storage_bindings.as_ref().unwrap())
+    }
+
+    /// Deliver one log entry to the component's registered log sink. `handle` is
+    /// the `callback-handle` the component passed to `register-log-storage`; the
+    /// C API installer in `ducklink-extension/src/reg_duckdb.rs` wires each
+    /// `duckdb_register_log_storage` write callback to this method.
+    pub fn dispatch_write_log_entry(
+        &mut self,
+        handle: u32,
+        entry: LogEntry,
+    ) -> Result<(), extension_types::Duckerror> {
+        self.log_storage_bindings()?;
+        let bindings = self.log_storage_bindings.as_ref().unwrap();
+        let guest = bindings.duckdb_extension_log_storage_dispatch();
+        let store = &mut self.store;
+        guest
+            .call_write_log_entry(store.as_context_mut(), handle, &entry)
+            .map_err(map_extension_trap)?
+    }
+
     // --- M2a: storage-dispatch (foreign-catalog) re-entry ---
     // Mirrors the callback-dispatch `dispatch_*` methods but drives the
     // component's exported `storage-dispatch` interface. The native host stages
@@ -4155,59 +4249,59 @@ mod tests {
     // --- capture-into-pending logic (Host trait impls) ---
 
     #[test]
-    fn register_collation_captures_into_pending_and_is_drained() {
+    fn register_collation_returns_unsupported() {
+        // The DuckDB stable C API in this build has no
+        // duckdb_register_collation hook, so the register-* trait impl now
+        // rejects the call with Duckerror::Unsupported instead of pretending
+        // to capture into a pending buffer that would never be installed.
         let mut state = test_state();
-        // A malformed/empty name must still be captured (never panic); the core
-        // is responsible for rejecting it later.
-        extension_collation::Host::register_collation(
-            &mut state,
-            String::new(),
-            "transform".to_string(),
-            true,
-        )
-        .expect("register_collation should not error");
-        extension_collation::Host::register_collation(
+        let res = extension_collation::Host::register_collation(
             &mut state,
             "icu_en".to_string(),
             "icu_sort".to_string(),
             false,
-        )
-        .expect("register_collation should not error");
-        let drained = state.take_pending_collations();
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].name, "");
-        assert_eq!(drained[1].name, "icu_en");
-        assert_eq!(drained[1].transform_scalar, "icu_sort");
-        // Draining again yields nothing (mem::take semantics).
+        );
+        assert!(matches!(
+            res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
+        // Nothing must have been captured into the pending buffer.
         assert!(state.take_pending_collations().is_empty());
     }
 
     #[test]
-    fn register_index_type_captures_into_pending() {
+    fn register_index_type_returns_unsupported() {
         let mut state = test_state();
-        extension_index::Host::register_index_type(&mut state, "wasm_hnsw".to_string())
-            .expect("register_index_type should not error");
-        let drained = state.take_pending_indexes();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].type_name, "wasm_hnsw");
-        assert_eq!(drained[0].extension, "testext");
+        let res =
+            extension_index::Host::register_index_type(&mut state, "wasm_hnsw".to_string());
+        assert!(matches!(
+            res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
+        assert!(state.take_pending_indexes().is_empty());
     }
 
     #[test]
-    fn register_storage_and_files_capture_into_pending() {
+    fn register_storage_and_files_return_unsupported() {
         let mut state = test_state();
-        extension_storage::Host::register_storage(&mut state, "sqlitewasm".to_string(), 7, None)
-            .expect("register_storage should not error");
-        let storages = state.take_pending_storages();
-        assert_eq!(storages.len(), 1);
-        assert_eq!(storages[0].type_name, "sqlitewasm");
-        assert_eq!(storages[0].callback_handle, 7);
+        let storage_res = extension_storage::Host::register_storage(
+            &mut state,
+            "sqlitewasm".to_string(),
+            7,
+            None,
+        );
+        assert!(matches!(
+            storage_res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
+        assert!(state.take_pending_storages().is_empty());
 
-        extension_files_reg::Host::register_files(&mut state, 9)
-            .expect("register_files should not error");
-        let files = state.take_pending_files();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].callback_handle, 9);
+        let files_res = extension_files_reg::Host::register_files(&mut state, 9);
+        assert!(matches!(
+            files_res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
+        assert!(state.take_pending_files().is_empty());
     }
 
     #[test]
@@ -4261,11 +4355,13 @@ mod tests {
 
     #[test]
     fn registers_2_1_0_additive_capabilities_into_pending() {
-        // 2.1.0: secret type + provider, settings option, table macro, modified
-        // logical type, and enum all CAPTURE into their neutral pending buffers.
+        // 2.1.0: secret type + provider are now rejected as Unsupported (the
+        // stable DuckDB C API in this build has no duckdb_register_secret_type
+        // hook); settings option, table macro, modified logical type, and enum
+        // still CAPTURE into their neutral pending buffers.
         let mut state = test_state();
 
-        extension_secret::Host::register_secret_type(
+        let secret_type_res = extension_secret::Host::register_secret_type(
             &mut state,
             "s3".to_string(),
             vec![
@@ -4274,15 +4370,21 @@ mod tests {
             ]
             .into(),
             11,
-        )
-        .expect("register_secret_type");
-        extension_secret::Host::register_secret_provider(
+        );
+        assert!(matches!(
+            secret_type_res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
+        let secret_provider_res = extension_secret::Host::register_secret_provider(
             &mut state,
             "s3".to_string(),
             "credential_chain".to_string(),
             12,
-        )
-        .expect("register_secret_provider");
+        );
+        assert!(matches!(
+            secret_provider_res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
 
         extension_settings::Host::register_option(
             &mut state,
@@ -4316,13 +4418,10 @@ mod tests {
         )
         .expect("register_enum");
 
+        // Both register_secret_* calls above returned Err(Unsupported), so
+        // nothing should have landed in pending_secrets.
         let secrets = state.take_pending_secrets();
-        assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets[0].type_name, "s3");
-        assert_eq!(secrets[0].params.len(), 2);
-        assert!(secrets[0].params[1].1, "secret param must be redacted");
-        assert_eq!(secrets[0].callback_handle, 11);
-        assert_eq!(secrets[1].provider.as_deref(), Some("credential_chain"));
+        assert!(secrets.is_empty());
 
         let settings = state.take_pending_settings();
         assert_eq!(settings.len(), 1);
@@ -4366,13 +4465,17 @@ mod tests {
         )
         .expect("register_scalar_ex");
 
-        // Item 7: connection-lifecycle subscription (opened only).
-        extension_lifecycle::Host::register_connection_callback(
+        // Item 7: connection-lifecycle subscription — no DuckDB C API for
+        // connection open/close callbacks, so this now rejects as Unsupported.
+        let conn_res = extension_lifecycle::Host::register_connection_callback(
             &mut state,
             extension_lifecycle::ConnEvents::OPENED,
             22,
-        )
-        .expect("register_connection_callback");
+        );
+        assert!(matches!(
+            conn_res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
 
         // Item 7: coordinate system.
         extension_coordinate_system::Host::register_coordinate_system(
@@ -4394,23 +4497,29 @@ mod tests {
         )
         .expect("register_arrow_table");
 
-        // Item 7: text encoding.
-        extension_encoding::Host::register_encoding(
+        // Item 7: text encoding — no stable C API hook, rejected as Unsupported.
+        let enc_res = extension_encoding::Host::register_encoding(
             &mut state,
             "latin-1".to_string(),
             vec!["iso-8859-1".to_string()].into(),
             24,
-        )
-        .expect("register_encoding");
+        );
+        assert!(matches!(
+            enc_res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
 
-        // Item 7: compression codec.
-        extension_compression::Host::register_compression(
+        // Item 7: compression codec — no stable C API hook, rejected as Unsupported.
+        let comp_res = extension_compression::Host::register_compression(
             &mut state,
             "zstd".to_string(),
             "zst".to_string(),
             25,
-        )
-        .expect("register_compression");
+        );
+        assert!(matches!(
+            comp_res,
+            Err(extension_types::Duckerror::Unsupported(_))
+        ));
 
         let scalar_ex = state.take_pending_scalar_ex();
         assert_eq!(scalar_ex.len(), 1);
@@ -4420,11 +4529,8 @@ mod tests {
         assert_eq!(scalar_ex[0].varargs, Some(reg::LogicalType::Text));
         assert_eq!(scalar_ex[0].callback_handle, 21);
 
-        let conn = state.take_pending_conn_callbacks();
-        assert_eq!(conn.len(), 1);
-        assert!(conn[0].on_opened);
-        assert!(!conn[0].on_closed);
-        assert_eq!(conn[0].callback_handle, 22);
+        // register_connection_callback returned Err(Unsupported); nothing captured.
+        assert!(state.take_pending_conn_callbacks().is_empty());
 
         let crs = state.take_pending_coordinate_systems();
         assert_eq!(crs.len(), 1);
@@ -4437,16 +4543,10 @@ mod tests {
         assert_eq!(arrow[0].columns.len(), 1);
         assert_eq!(arrow[0].callback_handle, 23);
 
-        let encodings = state.take_pending_encodings();
-        assert_eq!(encodings.len(), 1);
-        assert_eq!(encodings[0].name, "latin-1");
-        assert_eq!(encodings[0].aliases, vec!["iso-8859-1".to_string()]);
-
-        let compressions = state.take_pending_compressions();
-        assert_eq!(compressions.len(), 1);
-        assert_eq!(compressions[0].name, "zstd");
-        assert_eq!(compressions[0].file_extension, "zst");
-        assert_eq!(compressions[0].callback_handle, 25);
+        // register_encoding / register_compression returned Err(Unsupported);
+        // nothing captured.
+        assert!(state.take_pending_encodings().is_empty());
+        assert!(state.take_pending_compressions().is_empty());
     }
 
     #[test]
@@ -4594,6 +4694,10 @@ pub fn add_extension_interfaces_to_linker(
     extension_optimizer::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
     // 3.1.0 additive registration import: filterable streaming table-fn marker.
     extension_table_stream::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    // 3.2.0 additive registration import: log-storage sink declaration (Class B
+    // parity with the stable `duckdb_register_log_storage` C API). The host
+    // always PROVIDES this; components import it only if they back a log sink.
+    extension_log_storage::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
     Ok(())
 }
 

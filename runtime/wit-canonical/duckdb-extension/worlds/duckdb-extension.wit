@@ -36,6 +36,9 @@ use conn-dispatch;
 use file-write-dispatch;
 use index-write-dispatch;
 use settings-dispatch;
+// 3.2.0 additive: log-storage sink (Class B parity with duckdb_register_log_storage).
+use log-storage;
+use log-storage-dispatch;
 
 world duckdb-extension {
   import runtime;
@@ -56,6 +59,9 @@ world duckdb-extension {
   import arrow-ext;
   import encoding;
   import compression;
+  // 3.2.0 additive registration import: a component declares a named log sink
+  // here in load() (Class B parity with duckdb_register_log_storage).
+  import log-storage;
   export guest;
   export callback-dispatch;
 }
@@ -251,4 +257,19 @@ world duckdb-extension-settings {
   export guest;
   export callback-dispatch;
   export settings-dispatch;
+}
+
+// Log-storage world (3.2.0): exports log-storage-dispatch. Only components that
+// back a named log sink satisfy this; the runtime instantiates its bindings
+// lazily. Class B parity with the stable `duckdb_register_log_storage` C API.
+world duckdb-extension-log-storage {
+  import runtime;
+  import config;
+  import logging;
+  import catalog;
+  import files;
+  import log-storage;
+  export guest;
+  export callback-dispatch;
+  export log-storage-dispatch;
 }

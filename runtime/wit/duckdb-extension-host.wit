@@ -42,6 +42,10 @@ use duckdb:extension/optimizer-dispatch@4.0.0;
 // 3.1.0 additive interface: streaming/filter-pushdown table-fn REGISTRATION
 // marker (the first additive MINOR off the frozen major-3 baseline).
 use duckdb:extension/table-stream@4.0.0;
+// 3.2.0 additive interfaces: log-storage sink (Class B parity with the stable
+// duckdb_register_log_storage C API).
+use duckdb:extension/log-storage@4.0.0;
+use duckdb:extension/log-storage-dispatch@4.0.0;
 use duckdb:extension/guest@4.0.0;
 
 // Base extension world: every loadable extension exports these. storage-dispatch
@@ -92,6 +96,13 @@ world duckdb-extension {
   // rides the separate `duckdb-extension-table-stream` world below). Existing
   // @3.0.0 components do NOT import it and keep loading un-rebuilt.
   import duckdb:extension/table-stream@4.0.0;
+  // 3.2.0 additive registration import: a component declares a named log sink
+  // here in load() (Class B parity with the stable `duckdb_register_log_storage`
+  // C API). The host always PROVIDES it; components import it only if they back
+  // a log sink (the dispatch side rides the separate
+  // `duckdb-extension-log-storage` world below). Existing @3.1.0 components do
+  // NOT import it and keep loading un-rebuilt.
+  import duckdb:extension/log-storage@4.0.0;
   export duckdb:extension/guest@4.0.0;
   export callback-dispatch;
 }
@@ -348,6 +359,27 @@ world duckdb-extension-optimizer {
   export duckdb:extension/guest@4.0.0;
   export callback-dispatch;
   export optimizer-dispatch;
+}
+
+// Log-storage world (3.2.0): additionally imports the log-storage registration
+// surface and exports log-storage-dispatch (the host drives the component's
+// `write-log-entry` for every DuckDB log record routed to this sink). Only
+// components that back a named log storage satisfy this; the runtime instantiates
+// its bindings lazily from an already-loaded ExtensionInstance. Class B parity
+// with the stable `duckdb_register_log_storage` C API.
+world duckdb-extension-log-storage {
+  import duckdb:extension/runtime@4.0.0;
+  import duckdb:extension/config@4.0.0;
+  import duckdb:extension/logging@4.0.0;
+  import duckdb:extension/catalog@4.0.0;
+  import duckdb:extension/files@4.0.0;
+  import duckdb:extension/storage@4.0.0;
+  import duckdb:extension/index@4.0.0;
+  import duckdb:extension/collation@4.0.0;
+  import duckdb:extension/log-storage@4.0.0;
+  export duckdb:extension/guest@4.0.0;
+  export callback-dispatch;
+  export log-storage-dispatch;
 }
 
 // OPERATOR extensions are intentionally OUT OF SCOPE for the v3 surface.

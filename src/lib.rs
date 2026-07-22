@@ -174,6 +174,12 @@ mod loadable {
             ffi::duckdb_connect(db, &mut raw_con) == ffi::DuckDBSuccess && !raw_con.is_null();
 
         let engine = Arc::new(Engine2::new().map_err(stringify)?);
+        // Note: NativeServices' DuckDB connection is attached inside
+        // `register_load_function` below, using the PROCESS-PERSISTENT raw
+        // sibling connection stored on the `DucklinkRuntime`. The `raw_con`
+        // opened here is disconnected before this function returns (its
+        // only job is the aggregate-registration path), so it must not be
+        // handed to the engine.
 
         // Register the STABILITY.md § 1.1 SQL surface — `ducklink_load`
         // (TF), `ducklink_prefix` (TF + scalar), `PREFIX` (macro),
