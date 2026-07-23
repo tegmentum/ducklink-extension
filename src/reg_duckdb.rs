@@ -1611,6 +1611,19 @@ pub fn register_scalars(
 
 /// Convert a DuckDB call-parameter value (from `BindInfo::get_parameter`) into a
 /// neutral value, extracting it as the function's declared argument type `code`.
+///
+/// Sweep-6 FIX 3: extended with I8/I16/I32/U8/U16/U32/F32 arms — every typed
+/// getter the duckdb-rs `Value` wrapper exposes (see
+/// `duckdb-1.10504/src/vtab/value.rs`). The wider set of C-API getters
+/// (`duckdb_get_hugeint`, `duckdb_get_timestamp`, `duckdb_get_date`,
+/// `duckdb_get_time`, `duckdb_get_interval`, `duckdb_get_uuid`,
+/// `duckdb_get_decimal`) exists on the raw C API but the wrapper does not
+/// re-export them and the `Value::ptr` field is `pub(crate)` — so we can't
+/// call them from here without either an unsafe transmute or a duckdb-rs
+/// patch. Path (a) was taken for what's reachable via safe wrappers; the
+/// remaining logical codes hit the fail-loud catch-all so a table function
+/// binding a HUGEINT / DECIMAL / TIMESTAMP param surfaces the gap instead of
+/// silently seeing NULL.
 fn param_to_neutral(code: u8, v: &Value) -> reg::DuckValue {
     if v.is_null() {
         return reg::DuckValue::Null;
@@ -1623,7 +1636,30 @@ fn param_to_neutral(code: u8, v: &Value) -> reg::DuckValue {
         T_TEXT => reg::DuckValue::Text(v.to_string()),
         // No raw blob getter on the param value; fall back to its text form.
         T_BLOB => reg::DuckValue::Blob(v.to_string().into_bytes()),
-        _ => reg::DuckValue::Null,
+        // Sweep-6 FIX 3: narrow-int / float32 arms — all reachable via the
+        // duckdb-rs `Value` wrapper's typed getters (`to_int8` .. `to_uint32`,
+        // `to_float`). Previously silent-NULL through the catch-all.
+        T_I8 => reg::DuckValue::Int8(v.to_int8()),
+        T_I16 => reg::DuckValue::Int16(v.to_int16()),
+        T_I32 => reg::DuckValue::Int32(v.to_int32()),
+        T_U8 => reg::DuckValue::Uint8(v.to_uint8()),
+        T_U16 => reg::DuckValue::Uint16(v.to_uint16()),
+        T_U32 => reg::DuckValue::Uint32(v.to_uint32()),
+        T_F32 => reg::DuckValue::Float32(v.to_float()),
+        // Sweep-6 FIX 3: fail-loud catch-all. The duckdb-rs wrapper does not
+        // expose typed getters for HUGEINT / UHUGEINT / DECIMAL / TIMESTAMP /
+        // DATE / TIME / INTERVAL / UUID / nested — reaching the C-API
+        // `duckdb_get_*` would need either an unsafe transmute of `Value` or
+        // a duckdb-rs patch. Log the shortfall so a real caller shows up
+        // rather than silently binding NULL.
+        _ => {
+            eprintln!(
+                "param_to_neutral: unhandled type code {code} — the duckdb-rs \
+                 Value wrapper has no safe getter for this type; \
+                 binding NULL. See sweep-6 FIX 3 note."
+            );
+            reg::DuckValue::Null
+        }
     }
 }
 
@@ -7345,6 +7381,61 @@ mod tests {
         }
     }
 
+    /// Sweep-6 FIX 5: coverage for `wit_logicaltype_from_code`'s DECIMAL
+    /// width/scale extraction. Sweep-5 FIX 3 wired the (w, s) getters onto
+    /// a real DuckDB LogicalType handle; without this test the extraction
+    /// path was only exercised end-to-end from the ArrowShim register and
+    /// the COPY-FROM writer, both of which need a full DuckDB engine plus
+    /// the sample wasm corpus. This test synthesises a bare
+    /// `duckdb_create_decimal_type(20, 5)` handle and asserts the WIT arm
+    /// echoes (20, 5) instead of the (18, 3) code-only fallback.
+    ///
+    /// Requires DuckDB to be loadable (matches the `#[cfg(all(test,
+    /// feature = "bundled"))]` gate on the module). Runs unconditionally
+    /// here — the module is already scoped to the `bundled` feature so
+    /// DuckDB is guaranteed present.
+    #[test]
+    fn wit_logicaltype_from_code_decimal_reads_width_and_scale() {
+        use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
+            Decimalshape, Logicaltype as WitLogicaltype,
+        };
+        unsafe {
+            let handle = ffi::duckdb_create_decimal_type(20, 5);
+            let wit = wit_logicaltype_from_code(T_DECIMAL, Some(handle));
+            match wit {
+                WitLogicaltype::Decimal(Decimalshape { width, scale }) => {
+                    assert_eq!(width, 20, "DECIMAL width should read as 20");
+                    assert_eq!(scale, 5, "DECIMAL scale should read as 5");
+                }
+                other => panic!("expected WitLogicaltype::Decimal(20, 5), got {other:?}"),
+            }
+            let mut h = handle;
+            ffi::duckdb_destroy_logical_type(&mut h);
+        }
+    }
+
+    /// Sweep-6 FIX 5 companion: with `lt = None` the DECIMAL arm must fall
+    /// back to the (18, 3) interim shape (the sweep-5 code-only path).
+    /// This locks in the fallback so a future refactor that flips the
+    /// default doesn't silently change guest-visible types on the code-only
+    /// callers (aggregate `write_ret_raw`, `read_arg_raw`).
+    #[test]
+    fn wit_logicaltype_from_code_decimal_defaults_to_18_3_without_handle() {
+        use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
+            Decimalshape, Logicaltype as WitLogicaltype,
+        };
+        unsafe {
+            let wit = wit_logicaltype_from_code(T_DECIMAL, None);
+            match wit {
+                WitLogicaltype::Decimal(Decimalshape { width, scale }) => {
+                    assert_eq!((width, scale), (18, 3),
+                        "handle-less DECIMAL should keep the (18, 3) interim shape");
+                }
+                other => panic!("expected WitLogicaltype::Decimal(18, 3), got {other:?}"),
+            }
+        }
+    }
+
     // --- DUCKLINK_COMPONENTS parsing edge cases ----------------------------
 
     #[test]
@@ -9031,8 +9122,12 @@ unsafe extern "C" fn ducklink_copy_sink(
         let vec = ffi::duckdb_data_chunk_get_vector(input, c as u64);
         let ty = ffi::duckdb_vector_get_column_type(vec);
         let code = code_from_duckdb_type(ffi::duckdb_get_type_id(ty));
+        // Sweep-6 FIX 4 path (a): pass the LogicalType handle so
+        // `read_arg_neutral`'s DECIMAL arm can read the real (width, scale)
+        // instead of the (18, 3) fallback. Especially load-bearing for
+        // COPY TO where the source column's DECIMAL(w, s) is authoritative.
         for r in 0..n {
-            let v = read_arg_neutral(code, vec, r);
+            let v = read_arg_neutral(code, vec, r, Some(ty));
             rows[r].push(v);
         }
         let mut ty_mut = ty;
@@ -9564,10 +9659,31 @@ fn code_from_duckdb_type(t: ffi::duckdb_type) -> u8 {
     }
 }
 
-// Read one row of a DuckDB flat vector into a neutral `DuckValue`. Only
-// covers the fixed-width primitive + TEXT/BLOB arms — the same subset the
-// scalar hot path already handles.
-unsafe fn read_arg_neutral(code: u8, vec: ffi::duckdb_vector, row: usize) -> reg::DuckValue {
+// Read one row of a DuckDB flat vector into a neutral `DuckValue`.
+//
+// Sweep-6 FIX 1 + FIX 4: full logical-type coverage. The prior shape covered
+// only fixed-width primitives + TEXT/BLOB + the sweep-5-added
+// HUGEINT/UHUGEINT/DECIMAL arms; TIMESTAMP/DATE/TIME/TIMESTAMPTZ/INTERVAL/UUID
+// /COMPLEX all fell through to the silent-NULL catch-all. Mirror the
+// `read_arg_raw` peer (~2589-2690) arm-for-arm so cast / scalar_ex / COPY-TO
+// round-trips no longer suppress non-primitive values.
+//
+// The `lt` parameter (FIX 4 path (a)) is the vector's live
+// `duckdb_logical_type` handle when the caller has it: it lets the DECIMAL
+// arm ask DuckDB for the real `(width, scale)` via
+// `duckdb_decimal_width` / `duckdb_decimal_scale` instead of hardcoding
+// (18, 3). Callers without a handle pass `None` and the (18, 3) fallback
+// stands (Gap 2 continuation for the code-only paths).
+//
+// # Safety
+// When `lt` is `Some`, the handle must be a live `duckdb_logical_type` the
+// caller has not yet destroyed. Passing a stale or freed handle is UB.
+unsafe fn read_arg_neutral(
+    code: u8,
+    vec: ffi::duckdb_vector,
+    row: usize,
+    lt: Option<ffi::duckdb_logical_type>,
+) -> reg::DuckValue {
     let data = ffi::duckdb_vector_get_data(vec);
     let validity = ffi::duckdb_vector_get_validity(vec) as *mut u64;
     if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, row as u64) {
@@ -9617,18 +9733,63 @@ unsafe fn read_arg_neutral(code: u8, vec: ffi::duckdb_vector, row: usize) -> reg
                 upper: (raw >> 64) as u64,
             }
         }
-        // TODO Gap 2 (sweep-5 continuation): width/scale are hardcoded to
-        // (18, 3) here because the code-only `read_arg_neutral` API has no
-        // handle to the vector's LogicalType. `read_arg_raw` (~2643-2651)
-        // makes the same interim choice; both round-trip against
-        // `wit_logicaltype_from_code`'s DECIMAL(18, 3) declaration.
+        // Sweep-6 FIX 4 path (a): when the caller hands us the live
+        // LogicalType handle, query DuckDB for the real `(width, scale)`
+        // instead of the DECIMAL(18, 3) interim shape. Handle-less callers
+        // keep the (18, 3) fallback — matches the peer arm in `read_arg_raw`
+        // (~2643-2651) and the `wit_logicaltype_from_code` behaviour.
         T_DECIMAL => {
             let unscaled = *(data as *const i128).add(row);
+            let (width, scale) = if let Some(handle) = lt {
+                (ffi::duckdb_decimal_width(handle), ffi::duckdb_decimal_scale(handle))
+            } else {
+                (18, 3)
+            };
             reg::DuckValue::Decimal {
                 lower: unscaled as u64,
                 upper: (unscaled >> 64) as u64,
-                width: 18,
-                scale: 3,
+                width,
+                scale,
+            }
+        }
+        // Sweep-6 FIX 1: TIMESTAMP/DATE/TIME/TIMESTAMPTZ read as raw ints —
+        // mirrors the `read_arg_raw` peer at ~2615-2618.
+        T_TIMESTAMP => reg::DuckValue::Timestamp(*(data as *const i64).add(row)),
+        T_DATE => reg::DuckValue::Date(*(data as *const i32).add(row)),
+        T_TIME => reg::DuckValue::Time(*(data as *const i64).add(row)),
+        T_TIMESTAMPTZ => reg::DuckValue::Timestamptz(*(data as *const i64).add(row)),
+        // Sweep-6 FIX 1: INTERVAL is a three-field struct in the vector.
+        T_INTERVAL => {
+            let iv = *(data as *const ffi::duckdb_interval).add(row);
+            reg::DuckValue::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            }
+        }
+        // Sweep-6 FIX 1: UUID is a 128-bit logical value; DuckDB stores the
+        // XOR-flipped physical form so unpack via `uuid_storage_to_logical`
+        // (matches `read_arg_raw`).
+        T_UUID => {
+            let logical = uuid_storage_to_logical(*(data as *const i128).add(row));
+            reg::DuckValue::Uuid {
+                hi: (logical >> 64) as u64,
+                lo: logical as u64,
+            }
+        }
+        // Sweep-6 FIX 1: COMPLEX escape-hatch is stored as VARCHAR JSON; the
+        // `type_expr` is filled in as the code-level "COMPLEX" label because
+        // the code-only path can't reconstruct the DuckDB type-expression
+        // string from the vector alone. Guests that need the full type
+        // expression should route through `read_arg_raw` (which has the
+        // Aggregate-side LogicalType shape).
+        T_COMPLEX => {
+            let strs = data as *const duckdb_string_t;
+            let mut s = std::ptr::read(strs.add(row));
+            let mut raw = DuckString::new(&mut s);
+            reg::DuckValue::Complex {
+                type_expr: "COMPLEX".to_string(),
+                json: raw.as_str().to_string(),
             }
         }
         // Sweep-5 fix: nested reads over the code-only path have no way to
@@ -9642,7 +9803,18 @@ unsafe fn read_arg_neutral(code: u8, vec: ffi::duckdb_vector, row: usize) -> reg
             );
             reg::DuckValue::Null
         }
-        _ => reg::DuckValue::Null,
+        // Sweep-6 FIX 1: fail-loud catch-all. Any type code newly added to
+        // `code_from_duckdb_type` / `type_code_from_expr` but not wired here
+        // used to silently return NULL and corrupt round-trips (the sweep-5
+        // symptom for HUGEINT/UHUGEINT/DECIMAL). Logging the code surfaces
+        // the gap the next time it happens.
+        _ => {
+            eprintln!(
+                "read_arg_neutral: unhandled type code {code} (row {row}) — \
+                 add an arm here to mirror `read_arg_raw` or extend the code table"
+            );
+            reg::DuckValue::Null
+        }
     }
 }
 
@@ -10042,10 +10214,15 @@ unsafe extern "C" fn ducklink_scalar_ex_invoke(
     for c in 0..ncols {
         let vec = ffi::duckdb_data_chunk_get_vector(input, c as u64);
         let code = extra_ref.arg_codes.get(c).copied().unwrap_or(T_TEXT);
+        // Sweep-6 FIX 4 path (a): fetch the LogicalType once per column so
+        // DECIMAL args see the real (width, scale) via read_arg_neutral.
+        let ty = ffi::duckdb_vector_get_column_type(vec);
         for r in 0..n {
-            let v = read_arg_neutral(code, vec, r);
+            let v = read_arg_neutral(code, vec, r, Some(ty));
             rows[r].push(v);
         }
+        let mut ty_mut = ty;
+        ffi::duckdb_destroy_logical_type(&mut ty_mut);
     }
     for r in 0..n {
         let args = std::mem::take(&mut rows[r]);
@@ -10121,6 +10298,38 @@ unsafe fn write_row_out(code: u8, out: ffi::duckdb_vector, row: usize, val: reg:
             *(data as *mut i128).add(row) =
                 (((upper as u128) << 64) | lower as u128) as i128;
         }
+        // Sweep-6 FIX 2: TIMESTAMP/DATE/TIME/TIMESTAMPTZ writes — mirror the
+        // `write_ret_raw` peer at ~2736-2739. Previously these silently
+        // NULL'd via the catch-all, so cast/COPY-TO paths that returned a
+        // temporal value dropped every row.
+        (T_TIMESTAMP, reg::DuckValue::Timestamp(v)) => *(data as *mut i64).add(row) = v,
+        (T_DATE, reg::DuckValue::Date(v)) => *(data as *mut i32).add(row) = v,
+        (T_TIME, reg::DuckValue::Time(v)) => *(data as *mut i64).add(row) = v,
+        (T_TIMESTAMPTZ, reg::DuckValue::Timestamptz(v)) => *(data as *mut i64).add(row) = v,
+        // Sweep-6 FIX 2: INTERVAL as a three-field struct in the vector.
+        (T_INTERVAL, reg::DuckValue::Interval { months, days, micros }) => {
+            *(data as *mut ffi::duckdb_interval).add(row) = ffi::duckdb_interval {
+                months,
+                days,
+                micros,
+            };
+        }
+        // Sweep-6 FIX 2: UUID logical (hi<<64|lo) -> physical i128 via the
+        // XOR-flip helper; matches the `write_ret_raw` peer.
+        (T_UUID, reg::DuckValue::Uuid { hi, lo }) => {
+            let logical = ((hi as u128) << 64) | lo as u128;
+            *(data as *mut i128).add(row) = uuid_storage_to_logical(logical as i128) as i128;
+        }
+        // Sweep-6 FIX 2: COMPLEX escape-hatch writes the JSON payload as
+        // VARCHAR — mirrors the `write_ret_raw` peer at ~2762-2769.
+        (T_COMPLEX, reg::DuckValue::Complex { json, .. }) => {
+            ffi::duckdb_vector_assign_string_element_len(
+                out,
+                row as u64,
+                json.as_ptr() as *const c_char,
+                json.len() as u64,
+            );
+        }
         // Sweep-5 fix: nested writes need list_vector_set_size / reserve +
         // child fill, not a scalar slot store. Explicit fail-loud so callers
         // see the shortfall instead of silently NULL'ing the row.
@@ -10136,7 +10345,15 @@ unsafe fn write_row_out(code: u8, out: ffi::duckdb_vector, row: usize, val: reg:
                 ffi::duckdb_validity_set_row_invalid(validity, row as u64);
             }
         }
-        _ => {
+        // Sweep-6 FIX 2: fail-loud catch-all. Previously any (code, value)
+        // pair not explicitly handled silently marked the row NULL — for
+        // cast_ex / scalar_ex / COPY-TO that's silent data loss. Log the
+        // shortfall so a future missed arm surfaces immediately.
+        (unhandled_code, other) => {
+            eprintln!(
+                "write_row_out: unhandled (code {unhandled_code}, value {other:?}) — \
+                 marking row {row} invalid (mirror this arm from `write_ret_raw`)"
+            );
             if !validity.is_null() {
                 ffi::duckdb_validity_set_row_invalid(validity, row as u64);
             }
@@ -10362,8 +10579,13 @@ unsafe extern "C" fn ducklink_cast_invoke(
         return false;
     }
     let extra_ref = &*extra;
+    // Sweep-6 FIX 4 path (a): fetch the source vector's LogicalType once so
+    // read_arg_neutral's DECIMAL arm can query the real (width, scale). Cast
+    // FROM DECIMAL(20, 5) was previously handed a value labelled (18, 3),
+    // silently shifting the scale by two decimal places.
+    let src_ty = ffi::duckdb_vector_get_column_type(input);
     for r in 0..(count as usize) {
-        let v = read_arg_neutral(extra_ref.source_code, input, r);
+        let v = read_arg_neutral(extra_ref.source_code, input, r, Some(src_ty));
         let out = match extra_ref.engine.dispatch_cast_col(extra_ref.callback_handle, v) {
             Ok(v) => v,
             Err(e) => {
@@ -10374,6 +10596,8 @@ unsafe extern "C" fn ducklink_cast_invoke(
         };
         write_row_out(extra_ref.target_code, output, r, out);
     }
+    let mut src_ty_mut = src_ty;
+    ffi::duckdb_destroy_logical_type(&mut src_ty_mut);
     true
 }
 
