@@ -1848,10 +1848,98 @@ fn neutral_to_wit(v: reg::DuckValue) -> extension_types::Duckvalue {
         reg::DuckValue::Uuid { hi, lo } => {
             extension_types::Duckvalue::Uuid(extension_types::Uuidvalue { hi, lo })
         }
+        // T2-1 residual (major-5): 128-bit integer scalars ride first-class
+        // WIT arms carrying two u64/s64 halves; the runtime reassembles the
+        // value via `((upper as i128) << 64 | lower as i128)`.
+        reg::DuckValue::Hugeint { lower, upper } => {
+            extension_types::Duckvalue::Hugeint(extension_types::Hugeintvalue { lower, upper })
+        }
+        reg::DuckValue::UHugeint { lower, upper } => {
+            extension_types::Duckvalue::Uhugeint(extension_types::Uhugeintvalue { lower, upper })
+        }
+        // S1 (major-5): nested SCALAR values have no first-class WIT
+        // `duckvalue` arm — the columnar `column-types.column` variant
+        // carries their bulk equivalents (list-col/struct-col/map-col/
+        // array-col) but the row-major COLD path stays on `complex(json)`
+        // per the column-types.wit header note. Degrade via
+        // `duckdb_value_json` so the value re-materializes through the
+        // duckdb C vector API when the guest lifts it.
+        nested @ (reg::DuckValue::List(_)
+        | reg::DuckValue::Struct(_)
+        | reg::DuckValue::Map(_)
+        | reg::DuckValue::Array(_)) => {
+            let (type_expr, json) = duckdb_value_json(&nested);
+            extension_types::Duckvalue::Complex(extension_types::Complexvalue { type_expr, json })
+        }
         reg::DuckValue::Complex { type_expr, json } => {
             extension_types::Duckvalue::Complex(extension_types::Complexvalue { type_expr, json })
         }
     }
+}
+
+/// Render a nested-shaped neutral `reg::DuckValue` (LIST / STRUCT / MAP /
+/// ARRAY) as a `(type-expression, json)` pair for the WIT `complex` arm.
+/// Companion to `duckdb_type_expr`. Guest-side, the runtime reconstructs the
+/// real LIST/STRUCT vector from the JSON via the duckdb C vector API (see the
+/// `complex` escape-hatch documentation in types.wit).
+///
+/// The JSON is a best-effort textual rendering — it uses `null` for the WIT
+/// `Null` arm and the debug-formatted scalar for everything else. Callers
+/// that need lossless nested-scalar transport should wait for structural
+/// nested VALUE arms in a future major bump.
+fn duckdb_value_json(v: &reg::DuckValue) -> (String, String) {
+    // The type-expression is synthesized from the shallow shape; the deep
+    // element type of a heterogeneous struct/map field is not tracked on
+    // `DuckValue`, so we render the outer shape and let the guest resolve
+    // the leaves.
+    fn scalar_json(v: &reg::DuckValue) -> String {
+        match v {
+            reg::DuckValue::Null => "null".to_string(),
+            reg::DuckValue::Boolean(b) => b.to_string(),
+            reg::DuckValue::Int64(i) => i.to_string(),
+            reg::DuckValue::Uint64(u) => u.to_string(),
+            reg::DuckValue::Float64(f) => f.to_string(),
+            reg::DuckValue::Text(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+            reg::DuckValue::Int32(i) => i.to_string(),
+            reg::DuckValue::Int8(i) => i.to_string(),
+            reg::DuckValue::Int16(i) => i.to_string(),
+            reg::DuckValue::Uint8(u) => u.to_string(),
+            reg::DuckValue::Uint16(u) => u.to_string(),
+            reg::DuckValue::Uint32(u) => u.to_string(),
+            reg::DuckValue::Float32(f) => f.to_string(),
+            reg::DuckValue::List(items) | reg::DuckValue::Array(items) => {
+                let parts: Vec<String> = items.iter().map(scalar_json).collect();
+                format!("[{}]", parts.join(","))
+            }
+            reg::DuckValue::Struct(fields) => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|(n, val)| format!("\"{n}\":{}", scalar_json(val)))
+                    .collect();
+                format!("{{{}}}", parts.join(","))
+            }
+            reg::DuckValue::Map(pairs) => {
+                let parts: Vec<String> = pairs
+                    .iter()
+                    .map(|(k, val)| format!("{}:{}", scalar_json(k), scalar_json(val)))
+                    .collect();
+                format!("{{{}}}", parts.join(","))
+            }
+            // Non-JSON-native scalars in a nested payload fall back to a
+            // stringified debug rendering. Round-trip fidelity is not
+            // guaranteed on this path (see fn doc).
+            other => format!("\"{other:?}\""),
+        }
+    }
+    let type_expr = match v {
+        reg::DuckValue::List(_) => "LIST",
+        reg::DuckValue::Struct(_) => "STRUCT",
+        reg::DuckValue::Map(_) => "MAP",
+        reg::DuckValue::Array(_) => "ARRAY",
+        _ => "COMPLEX",
+    }
+    .to_string();
+    (type_expr, scalar_json(v))
 }
 
 fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
@@ -1886,6 +1974,15 @@ fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
             micros: iv.micros,
         },
         extension_types::Duckvalue::Uuid(u) => reg::DuckValue::Uuid { hi: u.hi, lo: u.lo },
+        // T2-1 residual (major-5): 128-bit integer scalars.
+        extension_types::Duckvalue::Hugeint(h) => reg::DuckValue::Hugeint {
+            lower: h.lower,
+            upper: h.upper,
+        },
+        extension_types::Duckvalue::Uhugeint(h) => reg::DuckValue::UHugeint {
+            lower: h.lower,
+            upper: h.upper,
+        },
         extension_types::Duckvalue::Complex(c) => reg::DuckValue::Complex {
             type_expr: c.type_expr,
             json: c.json,
@@ -1918,9 +2015,16 @@ pub fn wit_logicaltype_to_neutral(lt: &extension_types::Logicaltype) -> reg::Log
         extension_types::Logicaltype::Date => reg::LogicalType::Date,
         extension_types::Logicaltype::Time => reg::LogicalType::Time,
         extension_types::Logicaltype::Timestamptz => reg::LogicalType::Timestamptz,
-        extension_types::Logicaltype::Decimal => reg::LogicalType::Decimal,
+        // S2 (major-5): DECIMAL now carries width/scale as a `decimalshape`.
+        extension_types::Logicaltype::Decimal(shape) => reg::LogicalType::Decimal {
+            width: shape.width,
+            scale: shape.scale,
+        },
         extension_types::Logicaltype::Interval => reg::LogicalType::Interval,
         extension_types::Logicaltype::Uuid => reg::LogicalType::Uuid,
+        // T2-1 residual (major-5): fieldless 128-bit integer logical types.
+        extension_types::Logicaltype::Hugeint => reg::LogicalType::Hugeint,
+        extension_types::Logicaltype::Uhugeint => reg::LogicalType::UHugeint,
         extension_types::Logicaltype::Complex(expr) => reg::LogicalType::Complex(expr.clone()),
     }
 }
@@ -1928,9 +2032,17 @@ pub fn wit_logicaltype_to_neutral(lt: &extension_types::Logicaltype) -> reg::Log
 /// Reverse of `convert_extension_logicaltype` in the runtime crate: lower a
 /// neutral `reg::LogicalType` into the WIT `extension_types::Logicaltype` shape
 /// the guest expects. Used by `dispatch_copy_from_bind` to forward the
-/// destination table's target-column schema (T1-6) — the incoming WIT enum
-/// arms mirror the neutral enum one-for-one so this is a total mapping with
-/// no fallible arms.
+/// destination table's target-column schema (T1-6).
+///
+/// major-5 (2026-07-23): `Decimal`, `Hugeint`, `UHugeint` are first-class WIT
+/// arms and lower structurally. The nested `List` / `Struct` / `Map` / `Array`
+/// neutral arms have NO structural WIT counterpart (wit-parser 0.251 forbids
+/// recursive VALUE types — see column-types.wit header note), so they degrade
+/// to `complex(<duckdb-type-expression>)` via `duckdb_type_expr` — the same
+/// escape hatch the WIT `complex` arm documents. Callers that need
+/// fully-structural nested logical types must wait for a @6 bump once
+/// wit-parser gains recursive-value-type support (or the runtime opts into
+/// resource handles).
 fn neutral_to_wit_logicaltype(lt: reg::LogicalType) -> extension_types::Logicaltype {
     match lt {
         reg::LogicalType::Boolean => extension_types::Logicaltype::Boolean,
@@ -1950,10 +2062,71 @@ fn neutral_to_wit_logicaltype(lt: reg::LogicalType) -> extension_types::Logicalt
         reg::LogicalType::Date => extension_types::Logicaltype::Date,
         reg::LogicalType::Time => extension_types::Logicaltype::Time,
         reg::LogicalType::Timestamptz => extension_types::Logicaltype::Timestamptz,
-        reg::LogicalType::Decimal => extension_types::Logicaltype::Decimal,
+        // S2 (major-5): DECIMAL width/scale ride the variant arm.
+        reg::LogicalType::Decimal { width, scale } => {
+            extension_types::Logicaltype::Decimal(extension_types::Decimalshape { width, scale })
+        }
         reg::LogicalType::Interval => extension_types::Logicaltype::Interval,
         reg::LogicalType::Uuid => extension_types::Logicaltype::Uuid,
+        // T2-1 residual (major-5): first-class 128-bit integer logical types.
+        reg::LogicalType::Hugeint => extension_types::Logicaltype::Hugeint,
+        reg::LogicalType::UHugeint => extension_types::Logicaltype::Uhugeint,
+        // S1 (major-5): nested LOGICAL types are not first-class on the WIT
+        // side; degrade to `complex(<duckdb-type-expression>)`.
+        nested @ (reg::LogicalType::List(_)
+        | reg::LogicalType::Struct(_)
+        | reg::LogicalType::Map(_, _)
+        | reg::LogicalType::Array(_, _)) => {
+            extension_types::Logicaltype::Complex(duckdb_type_expr(&nested))
+        }
         reg::LogicalType::Complex(expr) => extension_types::Logicaltype::Complex(expr),
+    }
+}
+
+/// Render a neutral `reg::LogicalType` as a DuckDB SQL type-expression string,
+/// suitable for stuffing into the WIT `complex` escape-hatch arm when the WIT
+/// `logicaltype` variant has no structural counterpart (major-5: LIST / STRUCT
+/// / MAP / ARRAY). Non-nested types produce the same identifier DuckDB would
+/// accept in a CREATE TABLE column type.
+fn duckdb_type_expr(lt: &reg::LogicalType) -> String {
+    match lt {
+        reg::LogicalType::Boolean => "BOOLEAN".to_string(),
+        reg::LogicalType::Int64 => "BIGINT".to_string(),
+        reg::LogicalType::Uint64 => "UBIGINT".to_string(),
+        reg::LogicalType::Float64 => "DOUBLE".to_string(),
+        reg::LogicalType::Text => "VARCHAR".to_string(),
+        reg::LogicalType::Blob => "BLOB".to_string(),
+        reg::LogicalType::Int32 => "INTEGER".to_string(),
+        reg::LogicalType::Timestamp => "TIMESTAMP".to_string(),
+        reg::LogicalType::Int8 => "TINYINT".to_string(),
+        reg::LogicalType::Int16 => "SMALLINT".to_string(),
+        reg::LogicalType::Uint8 => "UTINYINT".to_string(),
+        reg::LogicalType::Uint16 => "USMALLINT".to_string(),
+        reg::LogicalType::Uint32 => "UINTEGER".to_string(),
+        reg::LogicalType::Float32 => "REAL".to_string(),
+        reg::LogicalType::Date => "DATE".to_string(),
+        reg::LogicalType::Time => "TIME".to_string(),
+        reg::LogicalType::Timestamptz => "TIMESTAMPTZ".to_string(),
+        reg::LogicalType::Decimal { width, scale } => format!("DECIMAL({width},{scale})"),
+        reg::LogicalType::Interval => "INTERVAL".to_string(),
+        reg::LogicalType::Uuid => "UUID".to_string(),
+        reg::LogicalType::Hugeint => "HUGEINT".to_string(),
+        reg::LogicalType::UHugeint => "UHUGEINT".to_string(),
+        reg::LogicalType::List(inner) => format!("{}[]", duckdb_type_expr(inner)),
+        reg::LogicalType::Struct(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{n} {}", duckdb_type_expr(t)))
+                .collect();
+            format!("STRUCT({})", parts.join(", "))
+        }
+        reg::LogicalType::Map(k, v) => {
+            format!("MAP({}, {})", duckdb_type_expr(k), duckdb_type_expr(v))
+        }
+        reg::LogicalType::Array(size, inner) => {
+            format!("{}[{size}]", duckdb_type_expr(inner))
+        }
+        reg::LogicalType::Complex(expr) => expr.clone(),
     }
 }
 
@@ -2008,6 +2181,23 @@ mod tests {
                 hi: 0xABCD_0000_1111_2222,
                 lo: 0x3333_4444_5555_6666,
             },
+            // T2-1 residual (major-5): 128-bit integer scalars ride first-class
+            // WIT arms, so they round-trip cleanly through the neutral <-> WIT
+            // converters just like DECIMAL/INTERVAL/UUID.
+            reg::DuckValue::Hugeint {
+                lower: 0xDEAD_BEEF_CAFE_BABE,
+                upper: -0x1234_5678_9ABC_DEF0,
+            },
+            reg::DuckValue::UHugeint {
+                lower: 0xBABE_CAFE_DEAD_BEEF,
+                upper: 0x1122_3344_5566_7788,
+            },
+            // S1 (major-5): nested VALUE arms have no first-class WIT
+            // `duckvalue` counterpart -- they degrade to `Complex` via
+            // `duckdb_value_json` at the boundary and CANNOT round-trip as
+            // their original arm. They are therefore excluded from this test's
+            // round-trip cohort (a future @6 with structural nested-value
+            // arms lifts this restriction).
             reg::DuckValue::Complex {
                 type_expr: "STRUCT(a INT)".to_string(),
                 json: "{\"a\":1}".to_string(),
@@ -2027,8 +2217,11 @@ mod tests {
         }
     }
 
-    /// The 22 variants must all be distinct after a round-trip (no two collapse
-    /// onto the same WIT arm), so the count of unique debug renderings is stable.
+    /// The 24 round-trippable variants must all be distinct after a round-trip
+    /// (no two collapse onto the same WIT arm), so the count of unique debug
+    /// renderings is stable. Bumped from 22 to 24 in major-5 by the two
+    /// first-class HUGEINT / UHUGEINT arms (T2-1 residual); the S1 nested-value
+    /// arms are excluded per the note in `all_variants`.
     #[test]
     fn roundtrip_preserves_distinctness() {
         let mut seen = std::collections::HashSet::new();
@@ -2036,7 +2229,7 @@ mod tests {
             let s = format!("{:?}", wit_to_neutral(neutral_to_wit(v)));
             assert!(seen.insert(s.clone()), "two variants collapsed to {s}");
         }
-        assert_eq!(seen.len(), 22, "expected 22 distinct DuckValue variants");
+        assert_eq!(seen.len(), 24, "expected 24 distinct DuckValue variants");
     }
 
     /// Dispatching against a callback handle that was never registered must be a

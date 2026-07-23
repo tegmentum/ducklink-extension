@@ -140,6 +140,28 @@ fn column_from_values(vals: &[&extension_types::Duckvalue]) -> extension_column_
             }
             Column::Uuid(out)
         }
+        // T2-1 residual (major-5): pivot HUGEINT / UHUGEINT scalars into the
+        // fixed-width column arms carrying two u64/s64 halves.
+        Some(D::Hugeint(_)) => {
+            let mut out = Vec::with_capacity(n);
+            for (r, v) in vals.iter().enumerate() {
+                match v {
+                    D::Hugeint(h) => out.push(extension_column_types::DuckInt128 { lower: h.lower, upper: h.upper }),
+                    _ => { mark_null(r, &mut validity); out.push(extension_column_types::DuckInt128 { lower: 0, upper: 0 }); }
+                }
+            }
+            Column::Hugeint(out)
+        }
+        Some(D::Uhugeint(_)) => {
+            let mut out = Vec::with_capacity(n);
+            for (r, v) in vals.iter().enumerate() {
+                match v {
+                    D::Uhugeint(h) => out.push(extension_column_types::DuckUint128 { lower: h.lower, upper: h.upper }),
+                    _ => { mark_null(r, &mut validity); out.push(extension_column_types::DuckUint128 { lower: 0, upper: 0 }); }
+                }
+            }
+            Column::Uhugeint(out)
+        }
         Some(D::Complex(_)) => {
             let mut out = Vec::with_capacity(n);
             for (r, v) in vals.iter().enumerate() {
@@ -226,6 +248,84 @@ fn colvec_to_values(c: extension_column_types::Colvec) -> Vec<extension_types::D
                 } else { D::Null });
             }
         }
+        // T2-1 residual (major-5): 128-bit integer columns lift back to the
+        // row-major HUGEINT / UHUGEINT arms carrying two u64/s64 halves.
+        Column::Hugeint(v) => {
+            for (i, h) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    D::Hugeint(extension_types::Hugeintvalue { lower: h.lower, upper: h.upper })
+                } else { D::Null });
+            }
+        }
+        Column::Uhugeint(v) => {
+            for (i, h) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    D::Uhugeint(extension_types::Uhugeintvalue { lower: h.lower, upper: h.upper })
+                } else { D::Null });
+            }
+        }
+        // S1 (major-5): nested-column arms carry an opaque byte payload
+        // (`nested-column { encoded: list<u8> }` / `map-column` /
+        // `array-column`). The row-major `Duckvalue` has no first-class
+        // LIST/STRUCT/MAP/ARRAY arm (see types.wit), so we degrade to
+        // `Duckvalue::Complex` -- one row per column slot, all sharing the
+        // same encoded blob (the runtime-defined per-vector encoding is
+        // outside this scope; a future @6 will replace this with a
+        // structural nested-VALUE crossing once wit-parser gains recursive-
+        // value-type support). The type-expression tag records the KIND so
+        // downstream can dispatch.
+        Column::ListCol(nc) => {
+            let json = nested_column_json(&nc.encoded);
+            for i in 0..n {
+                out.push(if is_valid(i) {
+                    D::Complex(extension_types::Complexvalue {
+                        type_expr: "LIST".into(),
+                        json: json.clone(),
+                    })
+                } else { D::Null });
+            }
+        }
+        Column::StructCol(nc) => {
+            let json = nested_column_json(&nc.encoded);
+            for i in 0..n {
+                out.push(if is_valid(i) {
+                    D::Complex(extension_types::Complexvalue {
+                        type_expr: "STRUCT".into(),
+                        json: json.clone(),
+                    })
+                } else { D::Null });
+            }
+        }
+        Column::MapCol(mc) => {
+            let json = format!(
+                "{{\"keys\":{},\"vals\":{}}}",
+                nested_column_json(&mc.keys_encoded),
+                nested_column_json(&mc.vals_encoded),
+            );
+            for i in 0..n {
+                out.push(if is_valid(i) {
+                    D::Complex(extension_types::Complexvalue {
+                        type_expr: "MAP".into(),
+                        json: json.clone(),
+                    })
+                } else { D::Null });
+            }
+        }
+        Column::ArrayCol(ac) => {
+            let json = format!(
+                "{{\"size\":{},\"encoded\":{}}}",
+                ac.size,
+                nested_column_json(&ac.encoded),
+            );
+            for i in 0..n {
+                out.push(if is_valid(i) {
+                    D::Complex(extension_types::Complexvalue {
+                        type_expr: "ARRAY".into(),
+                        json: json.clone(),
+                    })
+                } else { D::Null });
+            }
+        }
         Column::Complex(v) => {
             for (i, c) in v.into_iter().enumerate() {
                 out.push(if is_valid(i) {
@@ -235,6 +335,20 @@ fn colvec_to_values(c: extension_column_types::Colvec) -> Vec<extension_types::D
         }
     }
     out
+}
+
+/// Render a nested-column opaque byte payload as an escaped JSON string --
+/// stub for the S1 nested-column arms in the row-major `colvec_to_values`
+/// fallback path. Callers that need to actually decode the payload go through
+/// the runtime-defined encoding (out of scope for this phase).
+fn nested_column_json(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2 + 2);
+    s.push('"');
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s.push('"');
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,9 +2175,18 @@ fn convert_extension_logicaltype(ty: extension_runtime::Logicaltype) -> reg::Log
         extension_runtime::Logicaltype::Date => reg::LogicalType::Date,
         extension_runtime::Logicaltype::Time => reg::LogicalType::Time,
         extension_runtime::Logicaltype::Timestamptz => reg::LogicalType::Timestamptz,
-        extension_runtime::Logicaltype::Decimal => reg::LogicalType::Decimal,
+        // S2 (major-5): DECIMAL width/scale now ride the variant arm as a
+        // `decimalshape` payload -- lift into the neutral struct arm.
+        extension_runtime::Logicaltype::Decimal(shape) => reg::LogicalType::Decimal {
+            width: shape.width,
+            scale: shape.scale,
+        },
         extension_runtime::Logicaltype::Interval => reg::LogicalType::Interval,
         extension_runtime::Logicaltype::Uuid => reg::LogicalType::Uuid,
+        // T2-1 residual (major-5): 128-bit integer logical types are
+        // fieldless -- values ride on `duckvalue.hugeint` / `.uhugeint`.
+        extension_runtime::Logicaltype::Hugeint => reg::LogicalType::Hugeint,
+        extension_runtime::Logicaltype::Uhugeint => reg::LogicalType::UHugeint,
         extension_runtime::Logicaltype::Complex(expr) => reg::LogicalType::Complex(expr),
     }
 }
@@ -2340,6 +2463,20 @@ fn storage_duckvalue_to_ext(value: storage_types::Duckvalue) -> extension_types:
         storage_types::Duckvalue::Uuid(u) => {
             extension_types::Duckvalue::Uuid(extension_types::Uuidvalue { hi: u.hi, lo: u.lo })
         }
+        // T2-1 residual (major-5): 128-bit integer scalars ride first-class WIT
+        // arms with two u64/s64 halves.
+        storage_types::Duckvalue::Hugeint(h) => {
+            extension_types::Duckvalue::Hugeint(extension_types::Hugeintvalue {
+                lower: h.lower,
+                upper: h.upper,
+            })
+        }
+        storage_types::Duckvalue::Uhugeint(h) => {
+            extension_types::Duckvalue::Uhugeint(extension_types::Uhugeintvalue {
+                lower: h.lower,
+                upper: h.upper,
+            })
+        }
         storage_types::Duckvalue::Complex(c) => {
             extension_types::Duckvalue::Complex(extension_types::Complexvalue {
                 type_expr: c.type_expr,
@@ -2378,9 +2515,20 @@ fn storage_logicaltype_to_ext(ty: storage_types::Logicaltype) -> extension_types
         storage_types::Logicaltype::Date => extension_types::Logicaltype::Date,
         storage_types::Logicaltype::Time => extension_types::Logicaltype::Time,
         storage_types::Logicaltype::Timestamptz => extension_types::Logicaltype::Timestamptz,
-        storage_types::Logicaltype::Decimal => extension_types::Logicaltype::Decimal,
+        // S2 (major-5): DECIMAL width/scale ride the variant arm. Storage-world
+        // `Decimalshape` and base-world `Decimalshape` are structurally
+        // identical -- rebuild the base record from the storage-world fields.
+        storage_types::Logicaltype::Decimal(shape) => extension_types::Logicaltype::Decimal(
+            extension_types::Decimalshape {
+                width: shape.width,
+                scale: shape.scale,
+            },
+        ),
         storage_types::Logicaltype::Interval => extension_types::Logicaltype::Interval,
         storage_types::Logicaltype::Uuid => extension_types::Logicaltype::Uuid,
+        // T2-1 residual (major-5): first-class 128-bit integer logical types.
+        storage_types::Logicaltype::Hugeint => extension_types::Logicaltype::Hugeint,
+        storage_types::Logicaltype::Uhugeint => extension_types::Logicaltype::Uhugeint,
         storage_types::Logicaltype::Complex(expr) => extension_types::Logicaltype::Complex(expr),
     }
 }
@@ -4156,7 +4304,9 @@ mod tests {
             L::Date,
             L::Time,
             L::Timestamptz,
-            L::Decimal,
+            L::Decimal(extension_types::Decimalshape { width: 18, scale: 3 }),
+            L::Hugeint,
+            L::Uhugeint,
             L::Interval,
             L::Uuid,
             L::Complex("STRUCT(a INTEGER, b VARCHAR)".to_string()),
@@ -4400,7 +4550,9 @@ mod tests {
             S::Date,
             S::Time,
             S::Timestamptz,
-            S::Decimal,
+            S::Decimal(storage_types::Decimalshape { width: 18, scale: 3 }),
+            S::Hugeint,
+            S::Uhugeint,
             S::Interval,
             S::Uuid,
         ] {

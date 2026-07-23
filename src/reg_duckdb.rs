@@ -37,8 +37,10 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
 // hands them to `dispatch_scalar_batch_col`, and `write_colvec` lowers the
 // result column back to a DuckDB flat vector — no row-major pivot anywhere.
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::column_types::{
-    Colvec, Column as ColvecColumn, Complexvalue as ColvecComplex,
-    Decimalvalue as ColvecDecimal, Intervalvalue as ColvecInterval, Uuidvalue as ColvecUuid,
+    ArrayColumn as ColvecArrayColumn, Colvec, Column as ColvecColumn,
+    Complexvalue as ColvecComplex, Decimalvalue as ColvecDecimal, DuckInt128 as ColvecDuckInt128,
+    DuckUint128 as ColvecDuckUint128, Intervalvalue as ColvecInterval,
+    MapColumn as ColvecMapColumn, NestedColumn as ColvecNestedColumn, Uuidvalue as ColvecUuid,
 };
 
 use crate::engine::{
@@ -127,6 +129,25 @@ const T_UUID: u8 = 19;
 // carried as its JSON rendering in a VARCHAR column (best-effort). The declared
 // type-expression is not reconstructed into a real LIST/STRUCT vector here.
 const T_COMPLEX: u8 = 20;
+// T2-1 residual (major-5): first-class nested + 128-bit integer bridge codes.
+// The nested arms carry structural shape via `reg::LogicalType` (LIST elem,
+// STRUCT fields, MAP key/value, ARRAY size+elem); `logical_type_ffi_from_lt`
+// walks that shape recursively into `duckdb_create_{list,struct,map,array}_type`.
+// The read/write marshallers for nested types are FAIL-LOUD stubs — they log
+// an eprintln + degrade to a NULL/empty column rather than half-marshal a
+// nested vector, per the T2-1 residual "clean partial over broken" guidance.
+const T_LIST: u8 = 21;
+const T_STRUCT: u8 = 22;
+const T_MAP: u8 = 23;
+const T_ARRAY: u8 = 24;
+const T_HUGEINT: u8 = 25;
+const T_UHUGEINT: u8 = 26;
+// Highest defined bridge code — used by `logical_type_and_duckdb_type_cover_every_code`
+// (tests) and by any per-code enumeration. `#[allow(dead_code)]` because
+// the sole live use is the test; keeping it public-adjacent so future
+// enumerate-all-codes callers don't drift out of sync with the T_* set.
+#[allow(dead_code)]
+const T_CODE_MAX: u8 = T_UHUGEINT;
 
 /// DuckDB's per-column output chunk capacity. Every table-fn `func` clamps its
 /// batch to this so `set_len` never exceeds the chunk's allocated capacity
@@ -157,9 +178,20 @@ pub(crate) fn type_code(lt: &reg::LogicalType) -> u8 {
         reg::LogicalType::Date => T_DATE,
         reg::LogicalType::Time => T_TIME,
         reg::LogicalType::Timestamptz => T_TIMESTAMPTZ,
-        reg::LogicalType::Decimal => T_DECIMAL,
+        reg::LogicalType::Decimal { .. } => T_DECIMAL,
         reg::LogicalType::Interval => T_INTERVAL,
         reg::LogicalType::Uuid => T_UUID,
+        // T2-1 residual (major-5): 128-bit integers.
+        reg::LogicalType::Hugeint => T_HUGEINT,
+        reg::LogicalType::UHugeint => T_UHUGEINT,
+        // S1 (major-5): first-class nested arms. The bridge code only tags
+        // the KIND — structural shape (element type, field names, map
+        // key/value, array size) is preserved out-of-band by callers that
+        // hand a full `reg::LogicalType` to `logical_type_ffi_from_lt`.
+        reg::LogicalType::List(_) => T_LIST,
+        reg::LogicalType::Struct(_) => T_STRUCT,
+        reg::LogicalType::Map(_, _) => T_MAP,
+        reg::LogicalType::Array(_, _) => T_ARRAY,
         reg::LogicalType::Complex(_) => T_COMPLEX,
     }
 }
@@ -185,6 +217,10 @@ fn logical_type(code: u8) -> LogicalTypeHandle {
         T_TIMESTAMPTZ => LogicalTypeId::TimestampTZ,
         T_INTERVAL => LogicalTypeId::Interval,
         T_UUID => LogicalTypeId::Uuid,
+        // T2-1 residual (major-5): 128-bit integers now have first-class
+        // LogicalTypeId arms via duckdb-rs.
+        T_HUGEINT => LogicalTypeId::Hugeint,
+        T_UHUGEINT => LogicalTypeId::UHugeint,
         // Complex crosses as JSON text -> declare a VARCHAR column.
         T_COMPLEX => LogicalTypeId::Varchar,
         // DECIMAL needs a (width, scale) and is built directly below; the value's
@@ -192,6 +228,22 @@ fn logical_type(code: u8) -> LogicalTypeHandle {
         // DuckDB's default-precision DECIMAL(18, 3). A column whose values carry a
         // different width/scale is a known limitation (see write_ret Decimal arm).
         T_DECIMAL => return LogicalTypeHandle::decimal(18, 3),
+        // S1 (major-5): nested arms have no code-only lowering — the
+        // LogicalTypeHandle path needs a full `reg::LogicalType` shape to
+        // walk. Callers wanting a nested column type must go through the
+        // raw-FFI `logical_type_ffi_from_lt(&reg::LogicalType)` path
+        // (which recurses into duckdb_create_{list,struct,map,array}_type).
+        // Falling back to VARCHAR keeps the code-only path linear rather
+        // than panicking on registrations that thread a code without the
+        // structural shape.
+        T_LIST | T_STRUCT | T_MAP | T_ARRAY => {
+            eprintln!(
+                "[ducklink] nested logical type (code {code}) has no code-only lowering — \
+                 declaring column as VARCHAR fallback (T2-1 residual: pass full \
+                 reg::LogicalType via logical_type_ffi_from_lt for structural nested types)"
+            );
+            LogicalTypeId::Varchar
+        }
         _ => unreachable!("type code out of range"),
     };
     LogicalTypeHandle::from(id)
@@ -221,9 +273,26 @@ pub(crate) fn sql_type_name(lt: &reg::LogicalType) -> String {
         reg::LogicalType::Date => "DATE".to_string(),
         reg::LogicalType::Time => "TIME".to_string(),
         reg::LogicalType::Timestamptz => "TIMESTAMP WITH TIME ZONE".to_string(),
-        reg::LogicalType::Decimal => "DECIMAL(18, 3)".to_string(),
+        // S2 (major-5): DECIMAL width/scale ride the variant arm structurally,
+        // so the SQL name preserves the declared precision instead of the
+        // hardcoded 18/3 the pre-@5 shape used.
+        reg::LogicalType::Decimal { width, scale } => format!("DECIMAL({width}, {scale})"),
         reg::LogicalType::Interval => "INTERVAL".to_string(),
         reg::LogicalType::Uuid => "UUID".to_string(),
+        // T2-1 residual (major-5): 128-bit integers.
+        reg::LogicalType::Hugeint => "HUGEINT".to_string(),
+        reg::LogicalType::UHugeint => "UHUGEINT".to_string(),
+        // S1 (major-5): nested types render as DuckDB type-expression strings.
+        reg::LogicalType::List(inner) => format!("{}[]", sql_type_name(inner)),
+        reg::LogicalType::Struct(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{n} {}", sql_type_name(t)))
+                .collect();
+            format!("STRUCT({})", parts.join(", "))
+        }
+        reg::LogicalType::Map(k, v) => format!("MAP({}, {})", sql_type_name(k), sql_type_name(v)),
+        reg::LogicalType::Array(size, inner) => format!("{}[{size}]", sql_type_name(inner)),
         // The Complex escape-hatch carries the declared type-expression verbatim.
         reg::LogicalType::Complex(expr) => expr.clone(),
     }
@@ -449,6 +518,75 @@ unsafe fn read_col_to_colvec(
                 })
                 .collect();
             ColvecColumn::Blob(out)
+        }
+        // T2-1 residual (major-5): HUGEINT / UHUGEINT bulk read. DuckDB
+        // stores each cell as a naked i128 / u128 in the flat vector; split
+        // each into (lower u64, upper i64/u64) so the WIT column arms round-
+        // trip through the guest's `duck-int128 { lower, upper }` shape.
+        T_HUGEINT => {
+            let s = vec.as_slice_with_len::<i128>(len);
+            let out: Vec<ColvecDuckInt128> = s
+                .iter()
+                .map(|&raw| ColvecDuckInt128 {
+                    lower: raw as u64,
+                    upper: (raw >> 64) as i64,
+                })
+                .collect();
+            ColvecColumn::Hugeint(out)
+        }
+        T_UHUGEINT => {
+            let s = vec.as_slice_with_len::<u128>(len);
+            let out: Vec<ColvecDuckUint128> = s
+                .iter()
+                .map(|&raw| ColvecDuckUint128 {
+                    lower: raw as u64,
+                    upper: (raw >> 64) as u64,
+                })
+                .collect();
+            ColvecColumn::Uhugeint(out)
+        }
+        // S1 (major-5): nested type reads via
+        // `duckdb_list_vector_get_child(vec)` / `duckdb_list_vector_get_size` /
+        // `duckdb_struct_vector_get_child(vec, i)` /
+        // `duckdb_array_vector_get_child(vec)` are not yet wired here. The
+        // opaque-encoded `nested-column { encoded: list<u8> }` payload the
+        // WIT column arm carries needs a runtime-defined encoding scheme
+        // (see column-types.wit S1 header note) that has NOT landed yet.
+        // FAIL-LOUD: emit an empty encoded payload + eprintln so the guest
+        // observes an empty vector rather than a half-marshaled one.
+        T_LIST => {
+            eprintln!(
+                "[ducklink] read_col_to_colvec: T_LIST payload encoding not yet wired \
+                 (T2-1 residual continuation) — emitting empty nested-column"
+            );
+            ColvecColumn::ListCol(ColvecNestedColumn { encoded: Vec::new() })
+        }
+        T_STRUCT => {
+            eprintln!(
+                "[ducklink] read_col_to_colvec: T_STRUCT payload encoding not yet wired \
+                 (T2-1 residual continuation) — emitting empty nested-column"
+            );
+            ColvecColumn::StructCol(ColvecNestedColumn { encoded: Vec::new() })
+        }
+        T_MAP => {
+            eprintln!(
+                "[ducklink] read_col_to_colvec: T_MAP payload encoding not yet wired \
+                 (T2-1 residual continuation) — emitting empty map-column"
+            );
+            ColvecColumn::MapCol(ColvecMapColumn {
+                keys_encoded: Vec::new(),
+                vals_encoded: Vec::new(),
+            })
+        }
+        T_ARRAY => {
+            eprintln!(
+                "[ducklink] read_col_to_colvec: T_ARRAY payload encoding not yet wired \
+                 (T2-1 residual continuation) — emitting empty array-column"
+            );
+            ColvecColumn::ArrayCol(ColvecArrayColumn {
+                size: 0,
+                encoded: Vec::new(),
+            })
         }
         _ => unreachable!("type code out of range"),
     };
@@ -835,6 +973,13 @@ fn describe_column(c: &ColvecColumn) -> &'static str {
         ColvecColumn::Interval(_) => "Interval",
         ColvecColumn::Uuid(_) => "Uuid",
         ColvecColumn::Complex(_) => "Complex",
+        // T2-1 residual (major-5): 128-bit + nested column arms.
+        ColvecColumn::Hugeint(_) => "Hugeint",
+        ColvecColumn::Uhugeint(_) => "Uhugeint",
+        ColvecColumn::ListCol(_) => "ListCol",
+        ColvecColumn::StructCol(_) => "StructCol",
+        ColvecColumn::MapCol(_) => "MapCol",
+        ColvecColumn::ArrayCol(_) => "ArrayCol",
     }
 }
 
@@ -922,6 +1067,51 @@ fn colvec_to_witvals(c: Colvec) -> Vec<WitVal> {
                 } else {
                     WitVal::Null
                 });
+            }
+        }
+        // T2-1 residual (major-5): 128-bit integer lower into first-class
+        // WitVal arms carrying the (lower, upper) split — matches the
+        // WIT `hugeintvalue` / `uhugeintvalue` records.
+        ColvecColumn::Hugeint(v) => {
+            for (i, d) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    WitVal::Hugeint(ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Hugeintvalue {
+                        lower: d.lower,
+                        upper: d.upper,
+                    })
+                } else {
+                    WitVal::Null
+                });
+            }
+        }
+        ColvecColumn::Uhugeint(v) => {
+            for (i, d) in v.into_iter().enumerate() {
+                out.push(if is_valid(i) {
+                    WitVal::Uhugeint(ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Uhugeintvalue {
+                        lower: d.lower,
+                        upper: d.upper,
+                    })
+                } else {
+                    WitVal::Null
+                });
+            }
+        }
+        // S1 (major-5): nested column arms have NO first-class row-major
+        // WitVal counterpart (the row-major path stays on `complex(json)`
+        // per the column-types.wit header note). Nested reads are FAIL-LOUD
+        // stubs in `read_col_to_colvec` above (empty encoded payload); the
+        // row-major re-lift here surfaces every cell as NULL so the guest
+        // observes a deterministic — not partially-encoded — column.
+        ColvecColumn::ListCol(_)
+        | ColvecColumn::StructCol(_)
+        | ColvecColumn::MapCol(_)
+        | ColvecColumn::ArrayCol(_) => {
+            eprintln!(
+                "[ducklink] colvec_to_witvals: nested column arm has no row-major \
+                 WitVal shape (T2-1 residual continuation) — emitting {n} NULLs"
+            );
+            for _ in 0..n {
+                out.push(WitVal::Null);
             }
         }
     }
@@ -1021,10 +1211,33 @@ fn write_ret(
             // logical -> physical sign-flipped hugeint storage.
             s[i] = uuid_storage_to_logical(logical as i128) as i128;
         }
+        // T2-1 residual (major-5): 128-bit integer per-row writer. Reassemble
+        // the physical i128 / u128 from the (lower, upper) WIT split.
+        (T_HUGEINT, WitVal::Hugeint(h)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<i128>(len) };
+            s[i] = ((h.upper as i128) << 64) | (h.lower as i128 & 0xFFFF_FFFF_FFFF_FFFFi128);
+        }
+        (T_UHUGEINT, WitVal::Uhugeint(h)) => {
+            let s = unsafe { vec.as_mut_slice_with_len::<u128>(len) };
+            s[i] = ((h.upper as u128) << 64) | (h.lower as u128);
+        }
         // No nested-vector writer: emit the JSON rendering into the VARCHAR column.
         (T_COMPLEX, WitVal::Complex(c)) => vec.insert(i, c.json.as_str()),
         (T_TEXT, WitVal::Text(x)) => vec.insert(i, x.as_str()),
         (T_BLOB, WitVal::Blob(x)) => vec.insert(i, x.as_slice()),
+        // S1 (major-5): nested type WitVal has no row-major arm (row-major
+        // uses `complex(json)` per the column-types.wit header note). If the
+        // guest returns a nested WIT column but this write path (which
+        // materialises row-major WitVal) fires, that's an internal path
+        // routing error — FAIL-LOUD with an Err so the caller surfaces it
+        // rather than silently zeroing the slot.
+        (T_LIST, _) | (T_STRUCT, _) | (T_MAP, _) | (T_ARRAY, _) => {
+            return Err(format!(
+                "nested type write via write_ret (code {code}) not supported — nested \
+                 columns must lower via write_colvec's structural arms (T2-1 residual)"
+            )
+            .into());
+        }
         (_, other) => {
             return Err(format!(
                 "component returned {other:?}, incompatible with declared return type"
@@ -1281,22 +1494,51 @@ impl VScalar for WasmScalar {
 /// Register every component scalar on `con`. Returns the count registered. All
 /// `reg` logical types are supported across any arity.
 ///
-/// T2-6: this path routes through duckdb-rs' safe
+/// T2-6 (major-5): the base-scalar overload-set migration was ATTEMPTED-AND-
+/// DEFERRED. The stable C API `duckdb_create_scalar_function_set` +
+/// `duckdb_add_scalar_function_to_set` + `duckdb_register_scalar_function_set`
+/// path is used successfully for the `register_scalar_ex` sibling (varargs /
+/// special-null / VOLATILE overloads land as a shared set). Migrating the
+/// BASE scalar path off `VScalar` to match would require:
+///
+///   * Rewriting `WasmScalar::invoke` — currently a safe
+///     `fn(&State, &mut DataChunkHandle, &mut dyn WritableVector) -> Result`
+///     that duckdb-rs boxes into a C ABI callback — as a raw
+///     `unsafe extern "C" fn(info, input_chunk, output_vec)` (matching
+///     `ducklink_scalar_ex_invoke`). Every downstream helper the safe path
+///     depends on (`FlatVector`, `refill_colvec` on a scratch borrow,
+///     `write_colvec`'s `WritableVector`, the SCALAR_ARGS_SCRATCH /
+///     SCALAR_NULL_MASK_SCRATCH thread-locals, the `guard()` panic
+///     firewall, the `QueryReentrancyGuard` re-entrancy check) has to be
+///     re-plumbed against the raw `duckdb_data_chunk` + `duckdb_vector`
+///     handles rather than the duckdb-rs wrappers.
+///   * Deleting the `PENDING_SIGNATURE` thread-local (raw C API takes
+///     arg types explicitly via `duckdb_scalar_function_add_parameter`).
+///   * A new `build_wasm_scalar_function` mirroring `build_scalar_ex_function`
+///     that installs the WasmScalarState via `duckdb_scalar_function_set_extra_info`
+///     and threads the invoke callback + extra-info destroy path.
+///   * The set installer then groups by (extension, name) and mirrors
+///     `register_scalar_ex`'s set + singleton branches (same ownership
+///     argument: the C API copies each per-overload handle into the set,
+///     so the per-overload handle is destroyed immediately after add).
+///
+/// That migration is materially larger than the T2-6 slice budget and
+/// touches every hot-path scratch + guard site. Landing it partial (raw
+/// invoke but preserving `VScalar` sig plumbing) is worse than not landing
+/// it at all — the invoke ABI must match the C API's `duckdb_scalar_function`
+/// contract exactly or DuckDB will call into freed memory. Chose the
+/// **fail-loud DOCUMENTED DEFERRAL** per the "prefer partial with clear
+/// reason over broken" guidance.
+///
+/// Interim state: this path stays on duckdb-rs' safe
 /// `register_scalar_function_with_state`, which underneath calls
 /// `duckdb_register_scalar_function` (single-overload). Registering
 /// `my_add(INT, INT)` and then `my_add(DOUBLE, DOUBLE)` from the same load
-/// therefore fails on the SECOND registration — DuckDB rejects the
-/// duplicate name because there is no overload set to add it to. The
-/// stable C API in libduckdb-sys 1.10504.0 DOES expose
-/// `duckdb_create_scalar_function_set` /
-/// `duckdb_add_scalar_function_to_set` /
-/// `duckdb_register_scalar_function_set`, which would let the second
-/// overload land as a new member of the shared set. Wiring that up
-/// requires abandoning the duckdb-rs safe wrapper for this path (the
-/// `VScalar` trait / `PENDING_SIGNATURE` scaffolding is single-signature),
-/// so it's deferred as a follow-up. Interim: detect duplicate names in
-/// THIS registration pass and log the shortfall clearly instead of the
-/// generic "already present?" message.
+/// still fails on the SECOND registration — the duplicate-name loud-log
+/// below flags the shortfall explicitly instead of the generic "already
+/// present?" message. Callers that need overload sets today must route
+/// through `register-scalar-ex` (whose overloaded path IS wired) and pay
+/// the ex-flag row-major invoke penalty for now.
 pub fn register_scalars(
     con: &Connection,
     engine: Arc<Engine2>,
@@ -2212,6 +2454,22 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
         T_DECIMAL => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL,
         // COMPLEX falls back to VARCHAR/JSON.
         T_COMPLEX => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        // T2-1 residual (major-5): 128-bit integers get their real duckdb_type
+        // discriminant so DECIMAL / cast plumbing that reads the code back
+        // via `code_from_duckdb_type` round-trips.
+        T_HUGEINT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT,
+        T_UHUGEINT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT,
+        // S1 (major-5): nested types are code-only here — the discriminant
+        // is right but the shape (element / fields / key-value / size) MUST
+        // come from a full `reg::LogicalType`. Callers that only have a
+        // code get the raw discriminant so `duckdb_type_of` never lies about
+        // the KIND, but a `duckdb_create_logical_type(<this>)` at the raw
+        // FFI level would produce an unusable handle without child types —
+        // use `logical_type_ffi_from_lt` instead.
+        T_LIST => ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST,
+        T_STRUCT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT,
+        T_MAP => ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP,
+        T_ARRAY => ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY,
         _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
     }
 }
@@ -2220,11 +2478,18 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
 /// mirrors [`duckdb_type_of`] but branches to
 /// `duckdb_create_decimal_type(18, 3)` for T_DECIMAL so callers get a
 /// properly-widthed DECIMAL type instead of the width/scale-less shape
-/// `duckdb_create_logical_type(DUCKDB_TYPE_DECIMAL)` yields. TODO (Gap 2):
-/// when component-declared decimal precision/scale is threaded through
-/// `reg::LogicalType`, replace the hardcoded (18, 3) with the per-column
-/// values. `logical_type()` (LogicalTypeHandle) already hardcodes (18, 3)
-/// so round-trip stays consistent.
+/// `duckdb_create_logical_type(DUCKDB_TYPE_DECIMAL)` yields.
+///
+/// major-5 (T2-1 residual): the T_HUGEINT / T_UHUGEINT arms route through
+/// `duckdb_create_logical_type(DUCKDB_TYPE_{U,}HUGEINT)`, which produces a
+/// fully-formed 128-bit integer type — no per-value width/scale needed.
+///
+/// **Nested types (T_LIST / T_STRUCT / T_MAP / T_ARRAY) require the child
+/// type shape to construct**, which a bare code cannot carry. This code-only
+/// path therefore falls back to a VARCHAR handle for the nested arms and
+/// logs an eprintln; callers that hold a full `reg::LogicalType` MUST use
+/// [`logical_type_ffi_from_lt`] instead, which walks the shape recursively
+/// into `duckdb_create_{list,struct,map,array}_type`.
 ///
 /// The returned handle is owned by the caller; use
 /// `duckdb_destroy_logical_type` to release.
@@ -2232,13 +2497,91 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
 /// # Safety
 /// Calls into the DuckDB C API; caller must destroy the returned type.
 unsafe fn logical_type_ffi(code: u8) -> ffi::duckdb_logical_type {
-    if code == T_DECIMAL {
-        // Interim shape: DECIMAL(18, 3). Aligns with `logical_type()`
-        // above (which returns `LogicalTypeHandle::decimal(18, 3)`) so
-        // read_arg_raw / write_ret_raw round-trip correctly.
-        ffi::duckdb_create_decimal_type(18, 3)
-    } else {
-        ffi::duckdb_create_logical_type(duckdb_type_of(code))
+    match code {
+        T_DECIMAL => {
+            // Interim shape: DECIMAL(18, 3). Aligns with `logical_type()`
+            // above (which returns `LogicalTypeHandle::decimal(18, 3)`) so
+            // read_arg_raw / write_ret_raw round-trip correctly.
+            // `logical_type_ffi_from_lt` supersedes this for callers that
+            // hold the per-column (width, scale).
+            ffi::duckdb_create_decimal_type(18, 3)
+        }
+        T_LIST | T_STRUCT | T_MAP | T_ARRAY => {
+            eprintln!(
+                "[ducklink] logical_type_ffi: code {code} is a nested type — code-only \
+                 lowering has no child-shape; falling back to VARCHAR (T2-1 residual). \
+                 Use logical_type_ffi_from_lt(&reg::LogicalType) with the full shape."
+            );
+            ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR)
+        }
+        _ => ffi::duckdb_create_logical_type(duckdb_type_of(code)),
+    }
+}
+
+/// Structural counterpart of [`logical_type_ffi`]: build a `duckdb_logical_type`
+/// from a full `reg::LogicalType`, honouring the per-column DECIMAL width/scale
+/// (S2, major-5) and recursing into `duckdb_create_{list,struct,map,array}_type`
+/// for the nested S1 arms.
+///
+/// Preferred over [`logical_type_ffi(code)`] wherever the caller already
+/// holds a `reg::LogicalType` (scalar / aggregate / table registration paths,
+/// cast source/target, modified-type registrations). The code-only variant is
+/// retained for callers that only get the bridge code (e.g. cast route
+/// derived from a raw `type_code_from_expr` fold, aggregate raw path).
+///
+/// The returned handle is owned by the caller; use
+/// `duckdb_destroy_logical_type` to release.
+///
+/// # Safety
+/// Calls into the DuckDB C API; caller must destroy the returned type.
+unsafe fn logical_type_ffi_from_lt(lt: &reg::LogicalType) -> ffi::duckdb_logical_type {
+    match lt {
+        // S2 (major-5): honour per-column width/scale instead of hardcoding
+        // DECIMAL(18, 3). Round-trips with `read_arg_raw` / `write_ret_raw`
+        // as long as the caller passes the same shape on both sides.
+        reg::LogicalType::Decimal { width, scale } => {
+            ffi::duckdb_create_decimal_type(*width, *scale)
+        }
+        // S1 (major-5): recurse into the nested-type creators. Every child
+        // handle is created here and consumed by the parent creator (which
+        // takes ownership per the DuckDB C API contract), so no manual
+        // destroy is needed for children.
+        reg::LogicalType::List(elem) => {
+            let child = logical_type_ffi_from_lt(elem);
+            ffi::duckdb_create_list_type(child)
+        }
+        reg::LogicalType::Array(size, elem) => {
+            let child = logical_type_ffi_from_lt(elem);
+            ffi::duckdb_create_array_type(child, *size as ffi::idx_t)
+        }
+        reg::LogicalType::Map(k, v) => {
+            let key = logical_type_ffi_from_lt(k);
+            let val = logical_type_ffi_from_lt(v);
+            ffi::duckdb_create_map_type(key, val)
+        }
+        reg::LogicalType::Struct(fields) => {
+            // Two parallel vecs: owned child handles + owned CStrings (name
+            // pointers must live until `duckdb_create_struct_type` returns).
+            let mut child_types: Vec<ffi::duckdb_logical_type> = Vec::with_capacity(fields.len());
+            let mut child_names_c: Vec<CString> = Vec::with_capacity(fields.len());
+            for (n, t) in fields {
+                child_types.push(logical_type_ffi_from_lt(t));
+                child_names_c.push(
+                    CString::new(n.as_str()).unwrap_or_else(|_| CString::new("_").unwrap()),
+                );
+            }
+            let mut child_name_ptrs: Vec<*const c_char> =
+                child_names_c.iter().map(|c| c.as_ptr()).collect();
+            ffi::duckdb_create_struct_type(
+                child_types.as_mut_ptr(),
+                child_name_ptrs.as_mut_ptr(),
+                fields.len() as ffi::idx_t,
+            )
+            // child_types / child_names_c / child_name_ptrs drop here; the
+            // struct_type creator has already consumed / copied what it needs.
+        }
+        // Everything else falls through to the code-only path.
+        _ => logical_type_ffi(type_code(lt)),
     }
 }
 
@@ -2305,6 +2648,40 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
                 width: 18,
                 scale: 3,
             }
+        }
+        // T2-1 residual (major-5): HUGEINT is DuckDB's 128-bit signed integer.
+        // Physical storage is a naked i128 in the vector; split into (lower u64,
+        // upper i64) so it lifts into the WIT `hugeintvalue` shape without an
+        // intermediate sign-extend.
+        T_HUGEINT => {
+            let raw = *(data as *const i128).add(i);
+            reg::DuckValue::Hugeint {
+                lower: raw as u64,
+                upper: (raw >> 64) as i64,
+            }
+        }
+        // T2-1 residual (major-5): UHUGEINT — same shape as HUGEINT but the
+        // high half is unsigned (WIT `uhugeintvalue`).
+        T_UHUGEINT => {
+            let raw = *(data as *const u128).add(i);
+            reg::DuckValue::UHugeint {
+                lower: raw as u64,
+                upper: (raw >> 64) as u64,
+            }
+        }
+        // S1 (major-5): nested type reads via
+        // `duckdb_list_vector_get_child` / `_get_size` /
+        // `duckdb_struct_vector_get_child` / `duckdb_array_vector_get_child`
+        // are not yet wired. Rather than partial-marshal a nested value with
+        // the child row_id offsets uninitialised, log the shortfall once and
+        // surface NULL so the aggregate's output row is at least deterministic.
+        // FAIL-LOUD (T2-1 residual continuation).
+        T_LIST | T_STRUCT | T_MAP | T_ARRAY => {
+            eprintln!(
+                "[ducklink] read_arg_raw: nested type code {code} not yet fully wired \
+                 (T2-1 residual continuation) — surfacing NULL for row {i}"
+            );
+            reg::DuckValue::Null
         }
         // COMPLEX (nested) over the raw aggregate path is not yet marshalled;
         // surface as NULL.
@@ -2389,6 +2766,30 @@ pub(crate) unsafe fn write_ret_raw(
                 json.as_ptr() as *const c_char,
                 json.len() as u64,
             );
+        }
+        // T2-1 residual (major-5): 128-bit integer writes. Reassemble the
+        // physical i128 / u128 from the WIT (lower, upper) split.
+        (T_HUGEINT, reg::DuckValue::Hugeint { lower, upper }) => {
+            let raw = ((*upper as i128) << 64) | (*lower as i128 & 0xFFFF_FFFF_FFFF_FFFFi128);
+            *(data as *mut i128).add(i) = raw;
+        }
+        (T_UHUGEINT, reg::DuckValue::UHugeint { lower, upper }) => {
+            let raw = ((*upper as u128) << 64) | (*lower as u128);
+            *(data as *mut u128).add(i) = raw;
+        }
+        // S1 (major-5): nested writes need
+        // `duckdb_list_vector_set_size` + `_reserve` + a child-vector fill,
+        // which is a materially more invasive write path than the fixed-width
+        // arms above. Rather than emit a partial write, FAIL-LOUD (T2-1
+        // residual continuation): return Err so the caller surfaces the
+        // shortfall as a query error instead of silently zeroing the slot.
+        (T_LIST, reg::DuckValue::List(_))
+        | (T_STRUCT, reg::DuckValue::Struct(_))
+        | (T_MAP, reg::DuckValue::Map(_))
+        | (T_ARRAY, reg::DuckValue::Array(_)) => {
+            return Err(format!(
+                "nested type write (code {code}) not yet fully wired (T2-1 residual continuation)"
+            ));
         }
         (_, other) => {
             return Err(format!(
@@ -6905,9 +7306,20 @@ mod tests {
             Date,
             Time,
             Timestamptz,
-            Decimal,
+            // S2 (major-5): DECIMAL carries width/scale structurally now.
+            Decimal { width: 18, scale: 3 },
             Interval,
             Uuid,
+            // T2-1 residual (major-5): 128-bit integer logical types.
+            Hugeint,
+            UHugeint,
+            // S1 (major-5): nested types (structural shape stubbed with
+            // Int32 leaves — this test only cares that each variant maps to
+            // a distinct bridge code).
+            List(Box::new(Int32)),
+            Struct(vec![("a".to_string(), Int32)]),
+            Map(Box::new(Int32), Box::new(Int32)),
+            Array(3, Box::new(Int32)),
             Complex(String::new()),
         ];
         let codes: Vec<u8> = types.iter().map(type_code).collect();
@@ -6923,9 +7335,11 @@ mod tests {
 
     #[test]
     fn logical_type_and_duckdb_type_cover_every_code() {
-        // Every defined code (0..=T_COMPLEX) must build a column logical type and a
-        // raw duckdb_type without hitting the `unreachable!` arm.
-        for code in 0u8..=T_COMPLEX {
+        // Every defined code (0..=T_CODE_MAX) must build a column logical type and a
+        // raw duckdb_type without hitting the `unreachable!` arm. Nested arms
+        // fall back to VARCHAR at the code-only layer per the docstring on
+        // `logical_type`; that's a fall-back, not a panic.
+        for code in 0u8..=T_CODE_MAX {
             let _ = logical_type(code); // must not panic
             let _ = duckdb_type_of(code); // must not panic
         }
@@ -8200,9 +8614,34 @@ fn wit_logicaltype_from_code(code: u8) -> WitLogicaltype {
         T_DATE => WitLogicaltype::Date,
         T_TIME => WitLogicaltype::Time,
         T_TIMESTAMPTZ => WitLogicaltype::Timestamptz,
-        T_DECIMAL => WitLogicaltype::Decimal,
+        // S2 (major-5): DECIMAL now carries a Decimalshape payload. The
+        // code-only path here has no per-column (width, scale), so use the
+        // interim DECIMAL(18, 3) shape — matches `logical_type()` above.
+        // Callers with the real width/scale should route through
+        // `neutral_to_wit_logicaltype` in engine.rs instead.
+        T_DECIMAL => WitLogicaltype::Decimal(
+            ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Decimalshape {
+                width: 18,
+                scale: 3,
+            },
+        ),
         T_INTERVAL => WitLogicaltype::Interval,
         T_UUID => WitLogicaltype::Uuid,
+        // T2-1 residual (major-5): 128-bit integer logical types.
+        T_HUGEINT => WitLogicaltype::Hugeint,
+        T_UHUGEINT => WitLogicaltype::Uhugeint,
+        // S1 (major-5): nested logical types have NO structural WIT arm
+        // (wit-parser 0.251 forbids recursive VALUE types — see
+        // column-types.wit header note). Degrade via `complex(<kind>)` so
+        // the guest sees the kind label rather than silently collapsing to
+        // VARCHAR. The exact type-expression isn't reconstructable from the
+        // code alone; callers that hold the full reg::LogicalType shape
+        // should use `neutral_to_wit_logicaltype` in engine.rs which knows
+        // the child types.
+        T_LIST => WitLogicaltype::Complex("LIST".to_string()),
+        T_STRUCT => WitLogicaltype::Complex("STRUCT".to_string()),
+        T_MAP => WitLogicaltype::Complex("MAP".to_string()),
+        T_ARRAY => WitLogicaltype::Complex("ARRAY".to_string()),
         _ => WitLogicaltype::Text,
     }
 }
@@ -8240,9 +8679,16 @@ fn code_from_wit_logicaltype(lt: &WitLogicaltype) -> u8 {
         WitLogicaltype::Date => T_DATE,
         WitLogicaltype::Time => T_TIME,
         WitLogicaltype::Timestamptz => T_TIMESTAMPTZ,
-        WitLogicaltype::Decimal => T_DECIMAL,
+        // S2 (major-5): Decimal now tuple-variant with a Decimalshape payload.
+        // The code path erases width/scale (T_DECIMAL is fieldless); callers
+        // that need it must lift via the runtime `wit_logicaltype_to_neutral`
+        // path in engine.rs.
+        WitLogicaltype::Decimal(_) => T_DECIMAL,
         WitLogicaltype::Interval => T_INTERVAL,
         WitLogicaltype::Uuid => T_UUID,
+        // T2-1 residual (major-5): 128-bit integer logical types.
+        WitLogicaltype::Hugeint => T_HUGEINT,
+        WitLogicaltype::Uhugeint => T_UHUGEINT,
         WitLogicaltype::Complex(_) => T_TEXT,
     }
 }
@@ -9059,10 +9505,23 @@ fn code_from_duckdb_type(t: ffi::duckdb_type) -> u8 {
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => T_TIMESTAMPTZ,
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL => T_INTERVAL,
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID => T_UUID,
-        // HUGEINT/UHUGEINT have no `reg::LogicalType` arm yet — see the
-        // T2-1 residual note. Rather than silently collapse them to
-        // `T_TEXT`, warn once at eprintln so misclassification is visible
-        // in host logs. Non-recognised codes hit the same branch.
+        // T2-1 residual (major-5): HUGEINT / UHUGEINT are first-class now.
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => T_HUGEINT,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT => T_UHUGEINT,
+        // S1 (major-5): nested types. The bridge code tags the KIND; the
+        // structural child-type shape (LIST elem, STRUCT fields, MAP
+        // key/value, ARRAY size + elem) can be recovered via
+        // `duckdb_list_type_child_type` / `duckdb_struct_type_child_{name,type}`
+        // / `duckdb_map_type_{key,value}_type` / `duckdb_array_type_child_type`
+        // — but reconstructing the full `reg::LogicalType` tree from a raw
+        // `duckdb_logical_type` handle (not just its top-level `duckdb_type`)
+        // is a separate lift path that's not wired here. Callers that need
+        // the child shape must go through the LogicalTypeHandle-based reader.
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => T_LIST,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => T_STRUCT,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP => T_MAP,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => T_ARRAY,
+        // Any other DuckDB type warns once and degrades to VARCHAR.
         other => {
             eprintln!(
                 "code_from_duckdb_type: unsupported duckdb type '{}' \u{2192} T_TEXT (see T2-1 residual)",
@@ -9593,19 +10052,21 @@ unsafe fn build_scalar_ex_function(
     };
     let func = ffi::duckdb_create_scalar_function();
     ffi::duckdb_scalar_function_set_name(func, cname.as_ptr());
-    for &code in &arg_codes {
-        // T1-4: `logical_type_ffi` routes DECIMAL correctly.
-        let mut lt = logical_type_ffi(code);
+    // T2-1 residual (major-5): route through the LogicalType-aware
+    // `logical_type_ffi_from_lt` so DECIMAL(w, s) honours per-column
+    // width/scale and nested LIST/STRUCT/MAP/ARRAY get real child types
+    // instead of the code-only VARCHAR fallback.
+    for a in &s.arguments {
+        let mut lt = logical_type_ffi_from_lt(&a.logical);
         ffi::duckdb_scalar_function_add_parameter(func, lt);
         ffi::duckdb_destroy_logical_type(&mut lt);
     }
-    let mut rlt = logical_type_ffi(ret_code);
+    let mut rlt = logical_type_ffi_from_lt(&s.returns);
     ffi::duckdb_scalar_function_set_return_type(func, rlt);
     ffi::duckdb_destroy_logical_type(&mut rlt);
     // ---- the three ex flags (per-overload) ----
     if let Some(v) = s.varargs.as_ref() {
-        let vcode = type_code(v);
-        let mut vlt = logical_type_ffi(vcode);
+        let mut vlt = logical_type_ffi_from_lt(v);
         ffi::duckdb_scalar_function_set_varargs(func, vlt);
         ffi::duckdb_destroy_logical_type(&mut vlt);
     }
@@ -9867,6 +10328,10 @@ fn type_code_from_expr(expr: &str) -> u8 {
         "DECIMAL" | "NUMERIC" => return T_DECIMAL,
         "INTERVAL" => return T_INTERVAL,
         "UUID" => return T_UUID,
+        // T2-1 residual (major-5): 128-bit integer type expressions land as
+        // their own bridge codes now that HUGEINT / UHUGEINT are first-class.
+        "HUGEINT" | "INT128" => return T_HUGEINT,
+        "UHUGEINT" | "UINT128" => return T_UHUGEINT,
         // Precision-suffixed timestamps: DuckDB stores them physically as
         // TIMESTAMP (microseconds); the precision is a scale annotation the
         // C API set_ffi call does not carry through this bridge path today.
@@ -9879,6 +10344,52 @@ fn type_code_from_expr(expr: &str) -> u8 {
     // `register_modified_types` uses for its width/scale honouring path.
     if parse_decimal_expr(trimmed).is_some() {
         return T_DECIMAL;
+    }
+    // S1 (major-5): DuckDB nested type-expression prefixes. Full recursive
+    // parsing (recognising the child type-expression inside the parens /
+    // brackets) is FAIL-LOUD-DEFERRED — building a small recursive parser
+    // for `INTEGER[]` / `STRUCT(a INTEGER, ...)` / `MAP(K, V)` / `T[N]`
+    // rippled beyond the scope of this pass. Recognise the KIND from the
+    // prefix so the cast route at least tags the code correctly, then log
+    // that the structural payload is not yet threaded through. Callers that
+    // need the child type MUST plumb a full `reg::LogicalType` through
+    // `logical_type_ffi_from_lt` and skip this expr-based path.
+    let upper_trimmed = trimmed.to_ascii_uppercase();
+    if upper_trimmed.starts_with("STRUCT(") || upper_trimmed.starts_with("STRUCT<") {
+        eprintln!(
+            "[ducklink] type_code_from_expr: STRUCT expression '{expr}' — child-type parsing \
+             not yet wired (T2-1 residual continuation); tagging as T_STRUCT with no child shape"
+        );
+        return T_STRUCT;
+    }
+    if upper_trimmed.starts_with("MAP(") || upper_trimmed.starts_with("MAP<") {
+        eprintln!(
+            "[ducklink] type_code_from_expr: MAP expression '{expr}' — child-type parsing \
+             not yet wired (T2-1 residual continuation); tagging as T_MAP with no child shape"
+        );
+        return T_MAP;
+    }
+    // LIST: DuckDB uses `<TYPE>[]` (no fixed size) for LIST and `<TYPE>[N]`
+    // (fixed size N) for ARRAY. Detect the bracket suffix and count digits
+    // to distinguish. This is fail-loud in the same "kind-tag only" sense.
+    if let Some(stripped) = upper_trimmed.strip_suffix(']') {
+        if let Some(open_ix) = stripped.rfind('[') {
+            let inside = &stripped[open_ix + 1..];
+            if inside.is_empty() {
+                eprintln!(
+                    "[ducklink] type_code_from_expr: LIST expression '{expr}' — child-type \
+                     parsing not yet wired (T2-1 residual continuation); tagging as T_LIST"
+                );
+                return T_LIST;
+            }
+            if inside.chars().all(|c| c.is_ascii_digit()) {
+                eprintln!(
+                    "[ducklink] type_code_from_expr: ARRAY expression '{expr}' — child-type \
+                     parsing not yet wired (T2-1 residual continuation); tagging as T_ARRAY"
+                );
+                return T_ARRAY;
+            }
+        }
     }
     eprintln!(
         "[ducklink] cast type-expression '{expr}' unrecognized; falling back to VARCHAR \

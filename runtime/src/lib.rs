@@ -107,7 +107,7 @@ pub fn contract_digest() -> &'static str {
 /// every @3.x component by design -- taken now, in the no-users churn window
 /// (measured 82-110x on the dispatch boundary). The cold singleton paths
 /// (call-scalar/table/pragma/cast) stay row-major. See docs/v4-columnar-abi.md.
-pub const CONTRACT_MAJOR: u64 = 4;
+pub const CONTRACT_MAJOR: u64 = 5;
 
 /// The MINOR version of the `duckdb:extension` WIT contract this host speaks.
 ///
@@ -124,7 +124,7 @@ pub const CONTRACT_MINOR: u64 = 0;
 /// Full contract version string the host advertises (observability only; the
 /// guard compares MAJOR.minor via [`CONTRACT_MAJOR`]/[`CONTRACT_MINOR`], and the
 /// authoritative identity is the content-addressed [`CONTRACT_DIGEST`]).
-pub const CONTRACT_VERSION: &str = "4.0.0";
+pub const CONTRACT_VERSION: &str = "5.0.0";
 
 /// The host's `duckdb:extension` contract version, for logging / a built-in.
 /// This is the human-readable version; the authoritative content-addressed
@@ -423,7 +423,7 @@ pub mod duckdb_extension_copy_bindings {
         // per-world type conversion. NOTE: bump the @version here in lockstep
         // with the contract.
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -438,7 +438,7 @@ pub mod duckdb_extension_secret_bindings {
         world: "duckdb:extension-host/duckdb-extension-secret",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -453,7 +453,7 @@ pub mod duckdb_extension_storage_write_bindings {
         world: "duckdb:extension-host/duckdb-extension-storage-write",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -468,7 +468,7 @@ pub mod duckdb_extension_table_stream_bindings {
         world: "duckdb:extension-host/duckdb-extension-table-stream",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -482,7 +482,7 @@ pub mod duckdb_extension_aggregate_incr_bindings {
         world: "duckdb:extension-host/duckdb-extension-aggregate-incr",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -496,7 +496,7 @@ pub mod duckdb_extension_conn_bindings {
         world: "duckdb:extension-host/duckdb-extension-conn",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -510,7 +510,7 @@ pub mod duckdb_extension_file_write_bindings {
         world: "duckdb:extension-host/duckdb-extension-file-write",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -524,7 +524,7 @@ pub mod duckdb_extension_index_write_bindings {
         world: "duckdb:extension-host/duckdb-extension-index-write",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -538,7 +538,7 @@ pub mod duckdb_extension_settings_bindings {
         world: "duckdb:extension-host/duckdb-extension-settings",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -553,7 +553,7 @@ pub mod duckdb_extension_parser_bindings {
         world: "duckdb:extension-host/duckdb-extension-parser",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -568,7 +568,7 @@ pub mod duckdb_extension_optimizer_bindings {
         world: "duckdb:extension-host/duckdb-extension-optimizer",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -584,7 +584,7 @@ pub mod duckdb_extension_log_storage_bindings {
         world: "duckdb:extension-host/duckdb-extension-log-storage",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -603,7 +603,7 @@ pub mod duckdb_extension_arrow_ext_bindings {
         world: "duckdb:extension-host/duckdb-extension-arrow-ext",
         require_store_data_send: true,
         with: {
-            "duckdb:extension/types@4.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
+            "duckdb:extension/types@5.0.0": crate::duckdb_extension_bindings::duckdb::extension::types,
         },
     });
 }
@@ -645,7 +645,9 @@ impl CallbackKind {
 pub mod reg {
     /// A DuckDB logical type, restricted to the value kinds the extension ABI
     /// currently exchanges. NOTE: no longer `Copy` -- the `Complex` escape-hatch
-    /// arm carries an owned type-expression `String`.
+    /// arm carries an owned type-expression `String`, and the nested `List` /
+    /// `Struct` / `Map` / `Array` arms (added @5.0.0) box or vec-own their
+    /// element types.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum LogicalType {
         Boolean,
@@ -665,12 +667,37 @@ pub mod reg {
         Date,
         Time,
         Timestamptz,
-        Decimal,
+        /// S2 (major-5): DECIMAL now carries `width` (total digits) and
+        /// `scale` (fractional digits) structurally, matching the WIT
+        /// `decimal(decimalshape)` arm. Was fieldless on @4.
+        Decimal { width: u8, scale: u8 },
         Interval,
         Uuid,
+        /// T2-1 residual (major-5): 128-bit signed integer logical type.
+        /// Fieldless -- the shape is fixed; values ride on
+        /// `DuckValue::Hugeint`.
+        Hugeint,
+        /// T2-1 residual (major-5): 128-bit unsigned integer logical type.
+        /// Fieldless -- companion to `Hugeint`.
+        UHugeint,
+        /// S1 (major-5): LIST logical type -- element type carried as a boxed
+        /// nested `LogicalType` so the neutral shape can round-trip nested
+        /// DuckDB type-expressions the WIT boundary still lowers through the
+        /// `complex` escape hatch (wit-parser 0.251 forbids recursive VALUE
+        /// types on the WIT side).
+        List(Box<LogicalType>),
+        /// S1 (major-5): STRUCT logical type -- ordered `(field-name, type)`
+        /// entries. Field names preserve declaration order.
+        Struct(Vec<(String, LogicalType)>),
+        /// S1 (major-5): MAP logical type -- `(key-type, value-type)`.
+        Map(Box<LogicalType>, Box<LogicalType>),
+        /// S1 (major-5): fixed-size ARRAY logical type -- (size, element-type).
+        Array(u32, Box<LogicalType>),
         /// ESCAPE-HATCH: a DuckDB type-expression string (e.g. "INTEGER[]",
         /// "STRUCT(a INTEGER, b VARCHAR)"). Carries an arbitrary declared return
-        /// type the core resolves at registration time.
+        /// type the core resolves at registration time. Still used as the
+        /// WIT-side representation for nested logical types, which the WIT
+        /// `logicaltype` variant does not carry structurally in @5.
         Complex(String),
     }
 
@@ -694,9 +721,27 @@ pub mod reg {
                 LogicalType::Date => "DATE".to_string(),
                 LogicalType::Time => "TIME".to_string(),
                 LogicalType::Timestamptz => "TIMESTAMPTZ".to_string(),
-                LogicalType::Decimal => "DECIMAL".to_string(),
+                LogicalType::Decimal { width, scale } => {
+                    format!("DECIMAL({width}, {scale})")
+                }
                 LogicalType::Interval => "INTERVAL".to_string(),
                 LogicalType::Uuid => "UUID".to_string(),
+                LogicalType::Hugeint => "HUGEINT".to_string(),
+                LogicalType::UHugeint => "UHUGEINT".to_string(),
+                LogicalType::List(inner) => format!("LIST({})", inner.describe()),
+                LogicalType::Struct(fields) => {
+                    let parts: Vec<String> = fields
+                        .iter()
+                        .map(|(n, t)| format!("{n} {}", t.describe()))
+                        .collect();
+                    format!("STRUCT{{{}}}", parts.join(", "))
+                }
+                LogicalType::Map(k, v) => {
+                    format!("MAP<{}, {}>", k.describe(), v.describe())
+                }
+                LogicalType::Array(size, inner) => {
+                    format!("ARRAY({}, {size})", inner.describe())
+                }
                 LogicalType::Complex(expr) => expr.clone(),
             }
         }
@@ -812,6 +857,29 @@ pub mod reg {
             hi: u64,
             lo: u64,
         },
+        /// T2-1 residual (major-5): 128-bit signed integer scalar. Two
+        /// halves matching the WIT `hugeintvalue` split -- the runtime
+        /// reassembles the value via `((upper as i128) << 64 | lower as i128)`.
+        Hugeint {
+            lower: u64,
+            upper: i64,
+        },
+        /// T2-1 residual (major-5): 128-bit unsigned integer scalar. Two
+        /// halves matching the WIT `uhugeintvalue` split.
+        UHugeint {
+            lower: u64,
+            upper: u64,
+        },
+        /// S1 (major-5): LIST scalar value -- ordered element values.
+        List(Vec<DuckValue>),
+        /// S1 (major-5): STRUCT scalar value -- ordered `(field-name, value)`
+        /// entries.
+        Struct(Vec<(String, DuckValue)>),
+        /// S1 (major-5): MAP scalar value -- key/value pairs, in the order
+        /// the guest emitted them.
+        Map(Vec<(DuckValue, DuckValue)>),
+        /// S1 (major-5): fixed-size ARRAY scalar value -- element values.
+        Array(Vec<DuckValue>),
         /// ESCAPE-HATCH composite value: a DuckDB type-expression string plus the
         /// value rendered as JSON. The core reconstructs the real LIST/STRUCT vector
         /// from the JSON via the duckdb C vector API.

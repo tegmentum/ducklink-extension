@@ -15,36 +15,48 @@
 //! buffers when DuckDB (the consumer) calls them, so the host stays
 //! memory-safe without a hand-rolled release path.
 //!
-//! Nested/complex types (`reg::LogicalType::Complex(_)`) are pre-existing
-//! Gap 1 from the audit and are rejected here with a clean `Err`; adding
-//! nested-type support belongs to a later phase that also plumbs
-//! precision/scale into `ColumnDef` (see the Decimal note below).
+//! Nested/complex types (`reg::LogicalType::Complex(_)`) remain the last
+//! escape hatch and are rejected here with a clean `Err`. The structural
+//! nested arms added in @5 (`List`, `Struct`, `Map`, `Array`) are handled
+//! natively via arrow-rs's `ListArray`/`StructArray`/`MapArray`/
+//! `FixedSizeListArray` constructors, with recursive per-child encoding.
 
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
-    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-    Int64Builder, Int8Builder, IntervalMonthDayNanoBuilder, StringBuilder, StructArray,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, UInt16Builder, UInt32Builder,
-    UInt64Builder, UInt8Builder,
+    FixedSizeBinaryBuilder, FixedSizeListArray, Float32Builder, Float64Builder, Int16Builder,
+    Int32Builder, Int64Builder, Int8Builder, IntervalMonthDayNanoBuilder, ListArray, MapArray,
+    NullBufferBuilder, StringBuilder, StructArray, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
 };
-use arrow::datatypes::{DataType, Field, IntervalMonthDayNano, IntervalUnit, Schema, TimeUnit};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{
+    DataType, Field, FieldRef, Fields, IntervalMonthDayNano, IntervalUnit, Schema, TimeUnit,
+};
 use arrow::ffi::{to_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 
 use ducklink_runtime::reg::{ColumnDef, DuckValue, LogicalType};
 
-/// Precision/scale defaulted for a `LogicalType::Decimal` column.
+/// HUGEINT is mapped to Arrow `Decimal128(38, 0)`.
 ///
-/// `reg::LogicalType::Decimal` currently carries no width/scale (the audit's
-/// "Gap 2" — per-column decimal precision needs to flow through the neutral
-/// registration model). Until that lands, the encoder declares the column as
-/// `DECIMAL(38, 0)` — the widest supported precision and DuckDB's neutral
-/// default when a scale isn't specified — and rejects rows whose value scale
-/// disagrees. Downstream code (guests emitting DECIMAL) must currently emit
-/// scale-0 values or accept an `Err`.
-const DECIMAL_DEFAULT_PRECISION: u8 = 38;
-const DECIMAL_DEFAULT_SCALE: i8 = 0;
+/// Rationale: DuckDB's own Arrow bridge lowers HUGEINT the same way, so
+/// pyarrow/pandas consumers get a first-class 128-bit integer that round-trips
+/// through IPC/Parquet unchanged. The alternative (`FixedSizeBinary(16)`)
+/// would need custom parsing on the consumer side. The trade-off is that
+/// `Decimal128(38, 0)` can hold values up to `10^38 - 1` (≈ 9.9×10^37), which
+/// is just below `i128::MAX` (≈ 1.7×10^38) — a tiny sliver near
+/// `±i128::MAX/MIN` is unrepresentable. Values in that sliver are exotic
+/// (>9.9×10^37) and DuckDB's own HUGEINT->Arrow path has the same limit.
+const HUGEINT_PRECISION: u8 = 38;
+
+/// UHUGEINT has no native Arrow type — Arrow's Decimal128 is signed, so a
+/// full u128 in the top-bit-set range wouldn't fit there either. We
+/// therefore lower to a `FixedSizeBinary(16)` payload with the two u64
+/// halves laid out big-endian (`upper` then `lower`), matching the
+/// convention we already use for `UUID`. Consumers that need arithmetic
+/// have to reassemble the u128 from those 16 bytes themselves.
+const UHUGEINT_BYTES: i32 = 16;
 
 /// Encodes a batch of `Vec<Vec<DuckValue>>` rows into an Arrow C Data
 /// Interface `(FFI_ArrowArray, FFI_ArrowSchema)` pair matching the target
@@ -169,16 +181,57 @@ fn logical_to_arrow(t: &LogicalType) -> Result<DataType, String> {
         LogicalType::Date => DataType::Date32,
         // DuckDB's TIME is microseconds since midnight; Arrow Time64(Micro) matches.
         LogicalType::Time => DataType::Time64(TimeUnit::Microsecond),
-        // See DECIMAL_DEFAULT_* — `ColumnDef` doesn't yet carry precision/scale.
-        LogicalType::Decimal => {
-            DataType::Decimal128(DECIMAL_DEFAULT_PRECISION, DECIMAL_DEFAULT_SCALE)
-        }
+        // @5: (width, scale) now flow through structurally, so we honour the
+        // real precision/scale instead of the old "default to (38, 0)" hack.
+        LogicalType::Decimal { width, scale } => DataType::Decimal128(*width, *scale as i8),
         // DuckDB INTERVAL is months + days + micros; the closest Arrow type
         // is IntervalMonthDayNano — we widen micros to nanos on encode.
         LogicalType::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
         // Arrow has no first-class UUID; the pyarrow/duckdb convention is a
         // 16-byte fixed-size binary.
         LogicalType::Uuid => DataType::FixedSizeBinary(16),
+        // See HUGEINT_PRECISION for the choice rationale (Decimal128 vs
+        // FixedSizeBinary).
+        LogicalType::Hugeint => DataType::Decimal128(HUGEINT_PRECISION, 0),
+        // See UHUGEINT_BYTES — Arrow has no unsigned 128, so we ship the
+        // 16 raw bytes big-endian and let the consumer reassemble.
+        LogicalType::UHugeint => DataType::FixedSizeBinary(UHUGEINT_BYTES),
+        // Nested arms recurse into `logical_to_arrow` for the child type.
+        // The child field is named "item" — this is arrow-rs's default and
+        // matches what pyarrow/pandas expect on the other side of the FFI.
+        LogicalType::List(elem) => {
+            let elem_dt = logical_to_arrow(elem)?;
+            DataType::List(Arc::new(Field::new("item", elem_dt, true)))
+        }
+        LogicalType::Struct(fields) => {
+            let arrow_fields: Vec<Field> = fields
+                .iter()
+                .map(|(name, ft)| logical_to_arrow(ft).map(|dt| Field::new(name, dt, true)))
+                .collect::<Result<Vec<_>, String>>()?;
+            DataType::Struct(Fields::from(arrow_fields))
+        }
+        LogicalType::Map(kt, vt) => {
+            let kt_dt = logical_to_arrow(kt)?;
+            let vt_dt = logical_to_arrow(vt)?;
+            // Arrow Map convention: an "entries" struct child whose two
+            // fields are the non-nullable key + nullable value. We use the
+            // arrow-rs default names ("entries" / "keys" / "values") so
+            // pyarrow-style consumers recognize the shape.
+            let entry_fields = Fields::from(vec![
+                Field::new("keys", kt_dt, false),
+                Field::new("values", vt_dt, true),
+            ]);
+            let entries_field = Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields),
+                false,
+            ));
+            DataType::Map(entries_field, /*keys_sorted=*/ false)
+        }
+        LogicalType::Array(size, elem) => {
+            let elem_dt = logical_to_arrow(elem)?;
+            DataType::FixedSizeList(Arc::new(Field::new("item", elem_dt, true)), *size as i32)
+        }
         LogicalType::Complex(expr) => {
             return Err(format!(
                 "nested/complex Arrow types not yet supported (LogicalType::Complex({expr:?}))"
@@ -187,17 +240,35 @@ fn logical_to_arrow(t: &LogicalType) -> Result<DataType, String> {
     })
 }
 
-/// Build the Arrow array for one column by walking `rows` and appending the
-/// matching `DuckValue` arm (or a null) through the type-appropriate builder.
-///
-/// A per-row type mismatch (e.g. `DuckValue::Int32` in a `LogicalType::Int64`
-/// column) is a hard `Err` — silent coercion would hide guest bugs.
+/// Build the Arrow array for one column by extracting the per-row values and
+/// delegating to `encode_flat`.
 fn encode_column(
     col_idx: usize,
     col: &ColumnDef,
     rows: &[Vec<DuckValue>],
 ) -> Result<ArrayRef, String> {
-    let n = rows.len();
+    // Clone-per-row keeps the per-value handling in `encode_flat` uniform
+    // (values-owned) regardless of whether we entered from the top-level
+    // row-major batch or a nested-type recursion that already produced an
+    // owned flat vec. For typical extension batch sizes (thousands of rows)
+    // the clone cost is negligible next to the Arrow buffer build.
+    let values: Vec<DuckValue> = rows.iter().map(|r| r[col_idx].clone()).collect();
+    encode_flat(&col.logical, &values, col_idx)
+}
+
+/// Encode a flat vec of `DuckValue`s into an Arrow array of the given logical
+/// type. Used both by `encode_column` (via cloning the column out of the
+/// row-major batch) and by the nested-type arms (List/Struct/Map/Array) which
+/// flatten their child values and recurse.
+///
+/// A per-row type mismatch (e.g. `DuckValue::Int32` in a `LogicalType::Int64`
+/// column) is a hard `Err` — silent coercion would hide guest bugs.
+fn encode_flat(
+    lt: &LogicalType,
+    values: &[DuckValue],
+    col_idx: usize,
+) -> Result<ArrayRef, String> {
+    let n = values.len();
 
     // The primitive columns all follow the same pattern:
     //   builder = Type::with_capacity(n)
@@ -207,10 +278,10 @@ fn encode_column(
     macro_rules! prim_col {
         ($builder:ident, $variant:ident, $tyname:literal) => {{
             let mut b = $builder::with_capacity(n);
-            for (i, r) in rows.iter().enumerate() {
-                match &r[col_idx] {
+            for (i, v) in values.iter().enumerate() {
+                match v {
                     DuckValue::Null => b.append_null(),
-                    DuckValue::$variant(v) => b.append_value(*v),
+                    DuckValue::$variant(x) => b.append_value(*x),
                     other => return Err(mismatch_error(col_idx, i, $tyname, other)),
                 }
             }
@@ -218,7 +289,7 @@ fn encode_column(
         }};
     }
 
-    let arr = match &col.logical {
+    let arr = match lt {
         LogicalType::Boolean => prim_col!(BooleanBuilder, Boolean, "Boolean"),
         LogicalType::Int8 => prim_col!(Int8Builder, Int8, "Int8"),
         LogicalType::Int16 => prim_col!(Int16Builder, Int16, "Int16"),
@@ -240,10 +311,10 @@ fn encode_column(
             // declared `DataType` with the UTC timezone so the FFI schema
             // stays consistent with what `schema_ffi()` published.
             let mut b = TimestampMicrosecondBuilder::with_capacity(n).with_timezone("UTC");
-            for (i, r) in rows.iter().enumerate() {
-                match &r[col_idx] {
+            for (i, v) in values.iter().enumerate() {
+                match v {
                     DuckValue::Null => b.append_null(),
-                    DuckValue::Timestamptz(v) => b.append_value(*v),
+                    DuckValue::Timestamptz(x) => b.append_value(*x),
                     other => return Err(mismatch_error(col_idx, i, "Timestamptz", other)),
                 }
             }
@@ -253,8 +324,8 @@ fn encode_column(
             // Rough capacity heuristic: assume ~8-byte average string. Not
             // load-bearing (StringBuilder grows), just a mild alloc hint.
             let mut b = StringBuilder::with_capacity(n, n * 8);
-            for (i, r) in rows.iter().enumerate() {
-                match &r[col_idx] {
+            for (i, v) in values.iter().enumerate() {
+                match v {
                     DuckValue::Null => b.append_null(),
                     DuckValue::Text(s) => b.append_value(s),
                     other => return Err(mismatch_error(col_idx, i, "Text", other)),
@@ -264,38 +335,40 @@ fn encode_column(
         }
         LogicalType::Blob => {
             let mut b = BinaryBuilder::with_capacity(n, n * 8);
-            for (i, r) in rows.iter().enumerate() {
-                match &r[col_idx] {
+            for (i, v) in values.iter().enumerate() {
+                match v {
                     DuckValue::Null => b.append_null(),
-                    DuckValue::Blob(v) => b.append_value(v),
+                    DuckValue::Blob(x) => b.append_value(x),
                     other => return Err(mismatch_error(col_idx, i, "Blob", other)),
                 }
             }
             Arc::new(b.finish()) as ArrayRef
         }
-        LogicalType::Decimal => {
+        LogicalType::Decimal { width, scale } => {
+            let precision = *width;
+            let column_scale = *scale;
             let mut b = Decimal128Builder::with_capacity(n)
-                .with_precision_and_scale(DECIMAL_DEFAULT_PRECISION, DECIMAL_DEFAULT_SCALE)
-                .map_err(|e| format!("invalid decimal precision/scale: {e}"))?;
-            for (i, r) in rows.iter().enumerate() {
-                match &r[col_idx] {
+                .with_precision_and_scale(precision, column_scale as i8)
+                .map_err(|e| {
+                    format!("invalid decimal precision/scale ({precision}, {column_scale}): {e}")
+                })?;
+            for (i, v) in values.iter().enumerate() {
+                match v {
                     DuckValue::Null => b.append_null(),
                     DuckValue::Decimal {
                         lower,
                         upper,
-                        width: _,
-                        scale,
+                        width: vw,
+                        scale: vs,
                     } => {
-                        if *scale as i8 != DECIMAL_DEFAULT_SCALE {
+                        // @5: LogicalType::Decimal now carries (width, scale)
+                        // structurally, so we can validate the incoming
+                        // value's (width, scale) matches the column and stop
+                        // silently accepting mismatched values.
+                        if *vw != precision || *vs != column_scale {
                             return Err(format!(
-                                "row {i} col {col_idx}: Decimal value scale {} != schema \
-                                 default {}. Per-column (precision, scale) plumbing on \
-                                 reg::LogicalType::Decimal is not yet implemented; the encoder \
-                                 currently declares DECIMAL({}, {}).",
-                                scale,
-                                DECIMAL_DEFAULT_SCALE,
-                                DECIMAL_DEFAULT_PRECISION,
-                                DECIMAL_DEFAULT_SCALE
+                                "row {i} col {col_idx}: Decimal value ({vw}, {vs}) doesn't match \
+                                 schema DECIMAL({precision}, {column_scale})"
                             ));
                         }
                         // Reassemble the 128-bit two's-complement value. The
@@ -314,8 +387,8 @@ fn encode_column(
         }
         LogicalType::Interval => {
             let mut b = IntervalMonthDayNanoBuilder::with_capacity(n);
-            for (i, r) in rows.iter().enumerate() {
-                match &r[col_idx] {
+            for (i, v) in values.iter().enumerate() {
+                match v {
                     DuckValue::Null => b.append_null(),
                     DuckValue::Interval {
                         months,
@@ -337,8 +410,8 @@ fn encode_column(
         }
         LogicalType::Uuid => {
             let mut b = FixedSizeBinaryBuilder::with_capacity(n, 16);
-            for (i, r) in rows.iter().enumerate() {
-                match &r[col_idx] {
+            for (i, v) in values.iter().enumerate() {
+                match v {
                     DuckValue::Null => b.append_null(),
                     DuckValue::Uuid { hi, lo } => {
                         // Big-endian layout matches the pyarrow / duckdb
@@ -355,6 +428,233 @@ fn encode_column(
                 }
             }
             Arc::new(b.finish()) as ArrayRef
+        }
+        LogicalType::Hugeint => {
+            let mut b = Decimal128Builder::with_capacity(n)
+                .with_precision_and_scale(HUGEINT_PRECISION, 0)
+                .map_err(|e| {
+                    format!("invalid Hugeint→Decimal128({HUGEINT_PRECISION},0): {e}")
+                })?;
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    DuckValue::Null => b.append_null(),
+                    DuckValue::Hugeint { lower, upper } => {
+                        // upper is i64 (sign-extends to i128), lower is u64
+                        // (zero-extends via u128). Same OR-then-cast trick as
+                        // the Decimal arm so a "negative" lower half doesn't
+                        // sign-extend en route through i128.
+                        let raw = (((*upper as i128) << 64) as u128
+                            | (*lower as u128)) as i128;
+                        b.append_value(raw);
+                    }
+                    other => return Err(mismatch_error(col_idx, i, "Hugeint", other)),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
+        LogicalType::UHugeint => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(n, UHUGEINT_BYTES);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    DuckValue::Null => b.append_null(),
+                    DuckValue::UHugeint { lower, upper } => {
+                        // Big-endian: upper at bytes 0..8, lower at 8..16 —
+                        // same convention as UUID above so downstream tools
+                        // that already know the UUID layout parse UHUGEINT
+                        // consistently.
+                        let mut buf = [0u8; 16];
+                        buf[..8].copy_from_slice(&upper.to_be_bytes());
+                        buf[8..].copy_from_slice(&lower.to_be_bytes());
+                        b.append_value(buf).map_err(|e| e.to_string())?;
+                    }
+                    other => return Err(mismatch_error(col_idx, i, "UHugeint", other)),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
+        LogicalType::List(elem_ty) => {
+            // Accumulate a flat child vector + per-row offsets. The child
+            // vector is later handed to `encode_flat(elem_ty, …)` — this is
+            // where the recursion happens, so `List<Struct<…>>` etc. all
+            // work as a natural consequence.
+            let mut lengths: Vec<usize> = Vec::with_capacity(n);
+            let mut flat: Vec<DuckValue> = Vec::new();
+            let mut nulls = NullBufferBuilder::new(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    DuckValue::Null => {
+                        nulls.append_null();
+                        lengths.push(0);
+                    }
+                    DuckValue::List(elems) => {
+                        nulls.append_non_null();
+                        lengths.push(elems.len());
+                        flat.extend(elems.iter().cloned());
+                    }
+                    other => return Err(mismatch_error(col_idx, i, "List", other)),
+                }
+            }
+            let child = encode_flat(elem_ty, &flat, col_idx)?;
+            let elem_dt = logical_to_arrow(elem_ty)?;
+            let field: FieldRef = Arc::new(Field::new("item", elem_dt, true));
+            let offsets = OffsetBuffer::<i32>::from_lengths(lengths);
+            let arr = ListArray::try_new(field, offsets, child, nulls.finish())
+                .map_err(|e| format!("ListArray build failed: {e}"))?;
+            Arc::new(arr) as ArrayRef
+        }
+        LogicalType::Struct(schema_fields) => {
+            // For each row we either:
+            //   - see a Null   -> emit Null in the struct's null buffer AND
+            //                     push DuckValue::Null into every per-field
+            //                     slot (Arrow requires the child arrays to
+            //                     still have `n` entries), OR
+            //   - see a Struct -> emit non-null, and route each field's value
+            //                     into its per-field vec after checking the
+            //                     field name matches the schema.
+            let mut nulls = NullBufferBuilder::new(n);
+            let mut per_field: Vec<Vec<DuckValue>> = schema_fields
+                .iter()
+                .map(|_| Vec::with_capacity(n))
+                .collect();
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    DuckValue::Null => {
+                        nulls.append_null();
+                        for pf in per_field.iter_mut() {
+                            pf.push(DuckValue::Null);
+                        }
+                    }
+                    DuckValue::Struct(field_vals) => {
+                        nulls.append_non_null();
+                        if field_vals.len() != schema_fields.len() {
+                            return Err(format!(
+                                "row {i} col {col_idx}: Struct value has {} fields, expected {}",
+                                field_vals.len(),
+                                schema_fields.len()
+                            ));
+                        }
+                        for (j, (schema_name, _)) in schema_fields.iter().enumerate() {
+                            let (val_name, val) = &field_vals[j];
+                            if val_name != schema_name {
+                                return Err(format!(
+                                    "row {i} col {col_idx}: Struct field {j} name '{val_name}' \
+                                     doesn't match schema '{schema_name}'"
+                                ));
+                            }
+                            per_field[j].push(val.clone());
+                        }
+                    }
+                    other => return Err(mismatch_error(col_idx, i, "Struct", other)),
+                }
+            }
+            let mut child_fields: Vec<Field> = Vec::with_capacity(schema_fields.len());
+            let mut child_arrays: Vec<ArrayRef> = Vec::with_capacity(schema_fields.len());
+            for (j, (name, ft)) in schema_fields.iter().enumerate() {
+                let child = encode_flat(ft, &per_field[j], col_idx)?;
+                let dt = logical_to_arrow(ft)?;
+                child_fields.push(Field::new(name, dt, true));
+                child_arrays.push(child);
+            }
+            let arr = StructArray::try_new(
+                Fields::from(child_fields),
+                child_arrays,
+                nulls.finish(),
+            )
+            .map_err(|e| format!("StructArray build failed: {e}"))?;
+            Arc::new(arr) as ArrayRef
+        }
+        LogicalType::Array(size, elem_ty) => {
+            let sz = *size as usize;
+            let mut nulls = NullBufferBuilder::new(n);
+            // For a fixed-size list, Arrow requires the child array to have
+            // exactly `n * size` entries: nulls at the parent level still
+            // need `size` placeholder entries in the child. We push
+            // `DuckValue::Null` placeholders on a parent-Null so the child
+            // encoder produces those as Arrow-level nulls.
+            let mut flat: Vec<DuckValue> = Vec::with_capacity(n * sz);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    DuckValue::Null => {
+                        nulls.append_null();
+                        for _ in 0..sz {
+                            flat.push(DuckValue::Null);
+                        }
+                    }
+                    DuckValue::Array(elems) => {
+                        nulls.append_non_null();
+                        if elems.len() != sz {
+                            return Err(format!(
+                                "row {i} col {col_idx}: Array value has {} elements, expected {sz}",
+                                elems.len()
+                            ));
+                        }
+                        flat.extend(elems.iter().cloned());
+                    }
+                    other => return Err(mismatch_error(col_idx, i, "Array", other)),
+                }
+            }
+            let child = encode_flat(elem_ty, &flat, col_idx)?;
+            let elem_dt = logical_to_arrow(elem_ty)?;
+            let field: FieldRef = Arc::new(Field::new("item", elem_dt, true));
+            let arr =
+                FixedSizeListArray::try_new(field, *size as i32, child, nulls.finish())
+                    .map_err(|e| format!("FixedSizeListArray build failed: {e}"))?;
+            Arc::new(arr) as ArrayRef
+        }
+        LogicalType::Map(kt, vt) => {
+            // Map = List<Struct<key, value>>. We flatten to two parallel
+            // child vecs (keys + values), recurse on each, then wrap them in
+            // a Struct entries array and hand that to MapArray.
+            let mut lengths: Vec<usize> = Vec::with_capacity(n);
+            let mut keys: Vec<DuckValue> = Vec::new();
+            let mut vals: Vec<DuckValue> = Vec::new();
+            let mut nulls = NullBufferBuilder::new(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    DuckValue::Null => {
+                        nulls.append_null();
+                        lengths.push(0);
+                    }
+                    DuckValue::Map(pairs) => {
+                        nulls.append_non_null();
+                        lengths.push(pairs.len());
+                        for (k, val) in pairs {
+                            keys.push(k.clone());
+                            vals.push(val.clone());
+                        }
+                    }
+                    other => return Err(mismatch_error(col_idx, i, "Map", other)),
+                }
+            }
+            let key_arr = encode_flat(kt, &keys, col_idx)?;
+            let val_arr = encode_flat(vt, &vals, col_idx)?;
+            let kt_dt = logical_to_arrow(kt)?;
+            let vt_dt = logical_to_arrow(vt)?;
+            let entry_fields = Fields::from(vec![
+                Field::new("keys", kt_dt, false),
+                Field::new("values", vt_dt, true),
+            ]);
+            // The entries StructArray must have no top-level nulls (Arrow
+            // Map spec requires every entry present). Nulls at the *map*
+            // level go on the MapArray itself, not the entries struct.
+            let entries =
+                StructArray::try_new(entry_fields.clone(), vec![key_arr, val_arr], None)
+                    .map_err(|e| format!("Map entries StructArray build failed: {e}"))?;
+            let entries_field: FieldRef = Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields),
+                false,
+            ));
+            let offsets = OffsetBuffer::<i32>::from_lengths(lengths);
+            let arr = MapArray::try_new(
+                entries_field,
+                offsets,
+                entries,
+                nulls.finish(),
+                /*ordered=*/ false,
+            )
+            .map_err(|e| format!("MapArray build failed: {e}"))?;
+            Arc::new(arr) as ArrayRef
         }
         LogicalType::Complex(expr) => {
             return Err(format!(
@@ -399,6 +699,12 @@ fn duckvalue_kind(v: &DuckValue) -> &'static str {
         DuckValue::Decimal { .. } => "Decimal",
         DuckValue::Interval { .. } => "Interval",
         DuckValue::Uuid { .. } => "Uuid",
+        DuckValue::Hugeint { .. } => "Hugeint",
+        DuckValue::UHugeint { .. } => "UHugeint",
+        DuckValue::List(_) => "List",
+        DuckValue::Struct(_) => "Struct",
+        DuckValue::Map(_) => "Map",
+        DuckValue::Array(_) => "Array",
         DuckValue::Complex { .. } => "Complex",
     }
 }
@@ -410,7 +716,8 @@ mod tests {
 
     use super::*;
     use arrow::array::{
-        FixedSizeBinaryArray, Int64Array, IntervalMonthDayNanoArray, StringArray, StructArray,
+        Decimal128Array, FixedSizeBinaryArray, Int32Array, Int64Array, IntervalMonthDayNanoArray,
+        ListArray, StringArray, StructArray,
     };
     use arrow::ffi::from_ffi;
 
@@ -574,5 +881,112 @@ mod tests {
         assert_eq!(v.months, 1);
         assert_eq!(v.days, 2);
         assert_eq!(v.nanoseconds, 3_000, "3us should widen to 3000ns");
+    }
+
+    #[test]
+    fn hugeint_column_round_trips_as_decimal128() {
+        let enc = ArrowEncoder::new(&[col("h", LogicalType::Hugeint)]).unwrap();
+        let rows = vec![
+            // Small positive: 42.
+            vec![DuckValue::Hugeint {
+                lower: 42,
+                upper: 0,
+            }],
+            // Negative: upper=-1 lower=0 → i128 = -1 << 64 = -(1<<64).
+            vec![DuckValue::Hugeint {
+                lower: 0,
+                upper: -1,
+            }],
+            // Null passthrough.
+            vec![DuckValue::Null],
+        ];
+        let s = round_trip(&enc, &rows);
+        let c = s
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.value(0), 42_i128);
+        assert_eq!(c.value(1), -(1_i128 << 64));
+        assert!(c.is_null(2));
+        assert_eq!(c.precision(), HUGEINT_PRECISION);
+        assert_eq!(c.scale(), 0);
+    }
+
+    #[test]
+    fn list_of_int32_round_trips() {
+        let enc = ArrowEncoder::new(&[col(
+            "l",
+            LogicalType::List(Box::new(LogicalType::Int32)),
+        )])
+        .unwrap();
+        let rows = vec![
+            vec![DuckValue::List(vec![
+                DuckValue::Int32(1),
+                DuckValue::Int32(2),
+            ])],
+            vec![DuckValue::List(vec![])],
+            vec![DuckValue::Null],
+            vec![DuckValue::List(vec![DuckValue::Int32(3)])],
+        ];
+        let s = round_trip(&enc, &rows);
+        let c = s.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(c.len(), 4);
+        assert!(!c.is_null(0));
+        assert!(!c.is_null(1));
+        assert!(c.is_null(2));
+        assert!(!c.is_null(3));
+        // Row 0: [1, 2]
+        let v0 = c.value(0);
+        let a0 = v0.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a0.values(), &[1, 2]);
+        // Row 1: []
+        let v1 = c.value(1);
+        assert_eq!(v1.len(), 0);
+        // Row 3: [3]
+        let v3 = c.value(3);
+        let a3 = v3.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a3.values(), &[3]);
+    }
+
+    #[test]
+    fn struct_of_int_and_text_round_trips() {
+        let enc = ArrowEncoder::new(&[col(
+            "s",
+            LogicalType::Struct(vec![
+                ("a".to_string(), LogicalType::Int32),
+                ("b".to_string(), LogicalType::Text),
+            ]),
+        )])
+        .unwrap();
+        let rows = vec![
+            vec![DuckValue::Struct(vec![
+                ("a".to_string(), DuckValue::Int32(1)),
+                ("b".to_string(), DuckValue::Text("hi".into())),
+            ])],
+            vec![DuckValue::Struct(vec![
+                ("a".to_string(), DuckValue::Int32(2)),
+                ("b".to_string(), DuckValue::Text("bye".into())),
+            ])],
+        ];
+        let s = round_trip(&enc, &rows);
+        let struct_col = s.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_col.len(), 2);
+        let a = struct_col
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b = struct_col
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(a.values(), &[1, 2]);
+        assert_eq!(b.value(0), "hi");
+        assert_eq!(b.value(1), "bye");
     }
 }
