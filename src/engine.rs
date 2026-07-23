@@ -1538,6 +1538,95 @@ impl Engine2 {
             .map_err(|e| anyhow!("copy_to_finalize dispatch failed: {e:?}"))
     }
 
+    /// COPY FROM: bind a reader for `path` with key=value `options`. Wraps
+    /// [`ExtensionInstance::copy_from_bind`]. Returns the guest's reader
+    /// handle plus the discovered column schema; the reader handle is then
+    /// passed to `dispatch_copy_from_scan` (to pull rows) and finally
+    /// `dispatch_copy_from_close` (to release reader state). Mirrors the
+    /// `dispatch_copy_to_bind` shape (F3-b upgrade-else-fallback registry
+    /// resolution) — a COPY FROM installation lands as a
+    /// `duckdb_table_function` on the COPY function via
+    /// `duckdb_copy_function_set_copy_from_function`, and that table
+    /// function's bind/init/func callbacks re-enter here.
+    pub fn dispatch_copy_from_bind(
+        &self,
+        callback_handle: u32,
+        path: &str,
+        options: &[(String, String)],
+    ) -> Result<ducklink_runtime::extension::CopyFromBindResult> {
+        let (dispatcher_handle, instance_arc) = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry.dispatcher_handle;
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        instance
+            .copy_from_bind(dispatcher_handle, path, options)
+            .map_err(|e| anyhow!("copy_from_bind dispatch failed: {e:?}"))
+    }
+
+    /// COPY FROM: pull up to `max_rows` from a bound reader. An empty result
+    /// signals EOF; the caller then invokes [`Self::dispatch_copy_from_close`]
+    /// to release reader state. Wraps [`ExtensionInstance::copy_from_scan`],
+    /// flattening the returned WIT `Resultset` into neutral `reg::DuckValue`s
+    /// (symmetric with [`Self::dispatch_arrow_next`]).
+    pub fn dispatch_copy_from_scan(
+        &self,
+        callback_handle: u32,
+        reader: u32,
+        max_rows: u32,
+    ) -> Result<Vec<Vec<reg::DuckValue>>> {
+        let (dispatcher_handle, instance_arc) = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry.dispatcher_handle;
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        let rs = instance
+            .copy_from_scan(dispatcher_handle, reader, max_rows)
+            .map_err(|e| anyhow!("copy_from_scan dispatch failed: {e:?}"))?;
+        Ok(rs
+            .into_iter()
+            .map(|row| row.into_iter().map(wit_to_neutral).collect())
+            .collect())
+    }
+
+    /// COPY FROM: close the reader and release its state. Returns whether the
+    /// reader was known to the guest. Wraps [`ExtensionInstance::copy_from_close`].
+    pub fn dispatch_copy_from_close(
+        &self,
+        callback_handle: u32,
+        reader: u32,
+    ) -> Result<bool> {
+        let (dispatcher_handle, instance_arc) = {
+            let registry = self.callbacks.read().expect("callback registry poisoned");
+            let entry = registry
+                .resolve(callback_handle)
+                .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry.dispatcher_handle;
+            match entry.instance.upgrade() {
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
+            }
+        };
+        let mut instance = instance_arc.lock().expect("instance lock poisoned");
+        instance
+            .copy_from_close(dispatcher_handle, reader)
+            .map_err(|e| anyhow!("copy_from_close dispatch failed: {e:?}"))
+    }
+
     /// Deliver one log entry to the component's registered log-storage sink.
     /// `callback_handle` is the value the component passed to
     /// `register-log-storage`; it resolves through the shared callback registry

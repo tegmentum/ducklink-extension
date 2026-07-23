@@ -3988,6 +3988,45 @@ impl ExtensionInstance {
     }
 }
 
+// T1-7: fire `guest.shutdown` before the store tears down. This is the only
+// hook the component has for flushing external resources it owns (a background
+// writer, an open file handle, a network client) — after Drop returns, the
+// wasmtime store is gone and no guest export is reachable. Ordering matters:
+// the shutdown call must happen BEFORE the fields of `self` (in declaration
+// order — `store` first) are dropped, which is exactly what a `Drop::drop`
+// body running before automatic field-drop gives us.
+//
+// A trap or panic from the guest during shutdown must NOT abort the process:
+// Drop can't return an error, so we log any failure to stderr and continue.
+// `catch_unwind` wraps the whole dispatch so a panic mid-drop (e.g. a
+// wasmtime invariant tripping during teardown) becomes a logged line, not a
+// process abort. `AssertUnwindSafe` is acceptable here because Drop is the
+// terminal action for this instance — no shared state survives to observe a
+// half-transitioned mutation.
+//
+// TODO T3-1 (reconfigure): `dispatch_reconfigure` awaits a per-option SET
+// notification hook in the DuckDB stable C API (no `duckdb_config_option_
+// on_set` or equivalent shipped). Not wired here — a Drop-time fire would
+// be the wrong shape (reconfigure is a mid-life event, not shutdown).
+impl Drop for ExtensionInstance {
+    fn drop(&mut self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.dispatch_shutdown()
+        }));
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                eprintln!("[ducklink] component shutdown failed: {err:?}");
+            }
+            Err(_) => {
+                eprintln!(
+                    "[ducklink] component shutdown panicked; continuing teardown"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests: the pure capture conversions + the capture-into-pending logic.
 //

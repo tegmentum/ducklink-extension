@@ -3159,30 +3159,11 @@ impl VScalar for DucklinkHelp {
 /// The function name is retained for backward compatibility with existing
 /// callers that once threaded through only the `ducklink_load` TF.
 ///
-/// T1-7 (shutdown / reconfigure) STATUS:
-///
-/// * SHUTDOWN — `ExtensionInstance::dispatch_shutdown` exists (per
-///   runtime/src/extension.rs:2602) and is meant to drive the guest's
-///   `guest.shutdown` export when the component is unloaded. The natural
-///   hook is `impl Drop for ExtensionInstance` in
-///   runtime/src/extension.rs, which the workflow prep note freezes.
-///   BLOCKED-UPSTREAM: add
-///     ```
-///     impl Drop for ExtensionInstance {
-///         fn drop(&mut self) {
-///             if let Err(e) = self.dispatch_shutdown() {
-///                 eprintln!("[ducklink] guest.shutdown failed: {e:?}");
-///             }
-///         }
-///     }
-///     ```
-///   in runtime/src/extension.rs. Then this file needs no change — the
-///   Arc<Mutex<ExtensionInstance>>::drop chain reaches ExtensionInstance
-///   naturally on load-replace / process exit.
-///
-/// * RECONFIGURE — awaits Tier 3 T3-1 (per-option SET-notification hook
-///   not in the DuckDB stable C API). No wiring possible without a
-///   `duckdb_config_option_on_set` C callback or equivalent.
+/// T1-7: `guest.shutdown` fires on Drop via `impl Drop for ExtensionInstance`
+/// (see runtime/src/extension.rs) — the Arc<Mutex<ExtensionInstance>>::drop
+/// chain reaches it naturally on load-replace / process exit. Reconfigure
+/// awaits T3-1 (per-option SET-notification hook not in the DuckDB stable
+/// C API).
 pub fn register_load_function(
     con: &Connection,
     db: ffi::duckdb_database,
@@ -8170,6 +8151,39 @@ fn wit_logicaltype_from_code(code: u8) -> WitLogicaltype {
     }
 }
 
+/// Inverse of [`wit_logicaltype_from_code`]: map a WIT `Logicaltype` variant
+/// (as returned by the guest's `copy-from-bind`) back to a bridge type code
+/// so the raw C table function that services COPY FROM can declare its
+/// result columns via `duckdb_bind_add_result_column` and marshal each
+/// scanned row through `write_ret_raw`. The `Complex` escape-hatch arm
+/// falls back to `T_TEXT` — matching the same fallback the forward map
+/// applies for out-of-set codes.
+fn code_from_wit_logicaltype(lt: &WitLogicaltype) -> u8 {
+    match lt {
+        WitLogicaltype::Boolean => T_BOOL,
+        WitLogicaltype::Int64 => T_I64,
+        WitLogicaltype::Uint64 => T_U64,
+        WitLogicaltype::Float64 => T_F64,
+        WitLogicaltype::Text => T_TEXT,
+        WitLogicaltype::Blob => T_BLOB,
+        WitLogicaltype::Int8 => T_I8,
+        WitLogicaltype::Int16 => T_I16,
+        WitLogicaltype::Int32 => T_I32,
+        WitLogicaltype::Uint8 => T_U8,
+        WitLogicaltype::Uint16 => T_U16,
+        WitLogicaltype::Uint32 => T_U32,
+        WitLogicaltype::Float32 => T_F32,
+        WitLogicaltype::Timestamp => T_TIMESTAMP,
+        WitLogicaltype::Date => T_DATE,
+        WitLogicaltype::Time => T_TIME,
+        WitLogicaltype::Timestamptz => T_TIMESTAMPTZ,
+        WitLogicaltype::Decimal => T_DECIMAL,
+        WitLogicaltype::Interval => T_INTERVAL,
+        WitLogicaltype::Uuid => T_UUID,
+        WitLogicaltype::Complex(_) => T_TEXT,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. register_settings — declares DB config options to DuckDB. `SET <name>=`
 // stores into the DB config catalog; `runtime.get-string` reads it back via
@@ -8520,6 +8534,264 @@ unsafe extern "C" fn ducklink_copy_finalize(info: ffi::duckdb_copy_function_fina
     }
 }
 
+// ---------------------------------------------------------------------------
+// T1-6 (COPY FROM): a dedicated raw C `duckdb_table_function` installed on
+// the COPY function via `duckdb_copy_function_set_copy_from_function`. The
+// C API surfaces COPY FROM as a table function (not a mirror of the TO
+// bind/sink/finalize triple) — DuckDB rewrites `COPY tbl FROM 'path'` into a
+// call on this table function with the path as parameter 0, and the scan is
+// driven by the standard table-function bind/init/func lifecycle.
+//
+// This is a lighter shim than the ArrowShim VTab: no duckdb-rs wrapper, no
+// per-column register step, no replacement-scan machinery — just three
+// `extern "C"` callbacks that trampoline into `Engine2::dispatch_copy_from_*`.
+// `bind` opens the reader (calling into the guest) and captures the column
+// schema; `func` pulls up to STANDARD_VECTOR_SIZE rows per call and writes
+// them column-by-column with `write_ret_raw`; the bind-data destroy callback
+// closes the reader so LIMIT-terminated scans still release guest state.
+// ---------------------------------------------------------------------------
+
+/// Extra info attached to the COPY FROM table function via
+/// `duckdb_table_function_set_extra_info`. Cloned from the `CopyExtra` the
+/// COPY function was installed with — the table function and COPY function
+/// are separate DuckDB objects with independent extra-info slots (each with
+/// its own destroy callback), so we cannot share the same `Box<CopyExtra>`.
+struct CopyFromExtra {
+    function_handle: u32,
+    engine: Arc<Engine2>,
+}
+
+unsafe extern "C" fn copy_from_extra_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut CopyFromExtra));
+    }
+}
+
+/// Per-query bind state. Owns the reader handle the guest returned from
+/// `copy-from-bind` plus the column type codes `func` needs to marshal
+/// each scanned row. `eof` short-circuits further `func` calls once the
+/// guest reports an empty batch. Dropped when DuckDB destroys the bind
+/// data (end-of-query or query error) — see [`copy_from_bind_state_destroy`],
+/// which is where the paired `dispatch_copy_from_close` fires.
+struct CopyFromBindState {
+    engine: Arc<Engine2>,
+    callback_handle: u32,
+    reader: u32,
+    col_codes: Vec<u8>,
+    eof: std::sync::atomic::AtomicBool,
+}
+
+unsafe extern "C" fn copy_from_bind_state_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        let state = Box::from_raw(ptr as *mut CopyFromBindState);
+        // Close the reader even if we short-circuited on EOF or a LIMIT — the
+        // guest allocated it in `copy-from-bind`, so it owns the release.
+        if let Err(e) = state
+            .engine
+            .dispatch_copy_from_close(state.callback_handle, state.reader)
+        {
+            eprintln!(
+                "[ducklink] copy_from_close on bind-data drop failed: {e}"
+            );
+        }
+    }
+}
+
+unsafe extern "C" fn ducklink_copy_from_bind(info: ffi::duckdb_bind_info) {
+    // T1-3: dispatch_copy_from_bind reaches the guest — mark thread so a
+    // re-entrant `NativeServices::query()` refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
+    let extra = ffi::duckdb_bind_get_extra_info(info) as *const CopyFromExtra;
+    if extra.is_null() {
+        let msg = CString::new("copy_from_bind: missing extra info").unwrap();
+        ffi::duckdb_bind_set_error(info, msg.as_ptr());
+        return;
+    }
+    let extra_ref = &*extra;
+
+    // COPY FROM lands here as a table function; DuckDB passes the source
+    // file path as positional parameter 0. Read it as VARCHAR.
+    let param_count = ffi::duckdb_bind_get_parameter_count(info);
+    if param_count == 0 {
+        let msg = CString::new("copy_from_bind: missing path parameter").unwrap();
+        ffi::duckdb_bind_set_error(info, msg.as_ptr());
+        return;
+    }
+    let mut path_value = ffi::duckdb_bind_get_parameter(info, 0);
+    let path_ptr = ffi::duckdb_get_varchar(path_value);
+    let path = if path_ptr.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(path_ptr).to_string_lossy().into_owned()
+    };
+    if !path_ptr.is_null() {
+        ffi::duckdb_free(path_ptr as *mut c_void);
+    }
+    ffi::duckdb_destroy_value(&mut path_value);
+
+    // COPY-clause options: the stable C API in libduckdb-sys 1.10504.0 does
+    // not expose typed iteration over the bind-info's option map from a
+    // table function bind (the peer `ducklink_copy_bind` on the COPY TO
+    // path has the same gap on its own accessor). Pass an empty list so
+    // the guest sees no options — parity with the TO path.
+    let options: Vec<(String, String)> = Vec::new();
+
+    let result = match extra_ref
+        .engine
+        .dispatch_copy_from_bind(extra_ref.function_handle, &path, &options)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = CString::new(format!("copy_from_bind failed: {e}")).unwrap();
+            ffi::duckdb_bind_set_error(info, msg.as_ptr());
+            return;
+        }
+    };
+
+    // Publish the discovered column schema to DuckDB + capture the codes
+    // `func` will use to write each scanned row.
+    let mut col_codes: Vec<u8> = Vec::with_capacity(result.columns.len());
+    for col in &result.columns {
+        let code = code_from_wit_logicaltype(&col.logical);
+        col_codes.push(code);
+        let name_c = match CString::new(col.name.as_str()) {
+            Ok(c) => c,
+            Err(_) => CString::new("").unwrap(),
+        };
+        let mut lt = logical_type_ffi(code);
+        ffi::duckdb_bind_add_result_column(info, name_c.as_ptr(), lt);
+        ffi::duckdb_destroy_logical_type(&mut lt);
+    }
+
+    let state = Box::into_raw(Box::new(CopyFromBindState {
+        engine: extra_ref.engine.clone(),
+        callback_handle: extra_ref.function_handle,
+        reader: result.reader,
+        col_codes,
+        eof: std::sync::atomic::AtomicBool::new(false),
+    })) as *mut c_void;
+    ffi::duckdb_bind_set_bind_data(info, state, Some(copy_from_bind_state_destroy));
+}
+
+unsafe extern "C" fn ducklink_copy_from_init(_info: ffi::duckdb_init_info) {
+    // No per-thread state: COPY FROM is single-cursor. `func` reads bind
+    // data directly (via `duckdb_function_get_bind_data`), so init has
+    // nothing to publish.
+}
+
+unsafe extern "C" fn ducklink_copy_from_function(
+    info: ffi::duckdb_function_info,
+    output: ffi::duckdb_data_chunk,
+) {
+    // T1-3: dispatch_copy_from_scan reaches the guest — mark thread so a
+    // re-entrant `NativeServices::query()` refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
+    let bind_data = ffi::duckdb_function_get_bind_data(info) as *const CopyFromBindState;
+    if bind_data.is_null() {
+        let msg = CString::new("copy_from_function: missing bind data").unwrap();
+        ffi::duckdb_function_set_error(info, msg.as_ptr());
+        return;
+    }
+    let state = &*bind_data;
+    if state.eof.load(Ordering::Relaxed) {
+        ffi::duckdb_data_chunk_set_size(output, 0);
+        return;
+    }
+    // Mirror the ArrowShim clamp (see `func` in that VTab): DuckDB output
+    // chunks allocate at most STANDARD_VECTOR_SIZE rows per column; a batch
+    // beyond that is a guest protocol violation.
+    const STANDARD_VECTOR_SIZE: u32 = 2048;
+    let rows = match state.engine.dispatch_copy_from_scan(
+        state.callback_handle,
+        state.reader,
+        STANDARD_VECTOR_SIZE,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = CString::new(format!("copy_from_scan failed: {e}")).unwrap();
+            ffi::duckdb_function_set_error(info, msg.as_ptr());
+            return;
+        }
+    };
+    if rows.is_empty() {
+        state.eof.store(true, Ordering::Relaxed);
+        ffi::duckdb_data_chunk_set_size(output, 0);
+        return;
+    }
+    if rows.len() > STANDARD_VECTOR_SIZE as usize {
+        let msg = CString::new(format!(
+            "copy_from_scan returned {} rows in a single batch, exceeds \
+             STANDARD_VECTOR_SIZE ({}). Producers must yield at most {} \
+             rows per `copy-from-scan` call.",
+            rows.len(),
+            STANDARD_VECTOR_SIZE,
+            STANDARD_VECTOR_SIZE,
+        ))
+        .unwrap();
+        ffi::duckdb_function_set_error(info, msg.as_ptr());
+        return;
+    }
+    let ncols = state.col_codes.len();
+    for (i, row) in rows.iter().enumerate() {
+        if row.len() != ncols {
+            let msg = CString::new(format!(
+                "copy_from_scan row width {} != expected {} columns",
+                row.len(),
+                ncols,
+            ))
+            .unwrap();
+            ffi::duckdb_function_set_error(info, msg.as_ptr());
+            return;
+        }
+        for (c, v) in row.iter().enumerate() {
+            let vec = ffi::duckdb_data_chunk_get_vector(output, c as u64);
+            if let Err(e) = write_ret_raw(state.col_codes[c], vec, i, v) {
+                let msg = CString::new(format!("copy_from_scan write failed: {e}"))
+                    .unwrap();
+                ffi::duckdb_function_set_error(info, msg.as_ptr());
+                return;
+            }
+        }
+    }
+    ffi::duckdb_data_chunk_set_size(output, rows.len() as u64);
+}
+
+/// Build the `duckdb_table_function` that services this COPY handler's FROM
+/// side. Wired onto the COPY function via
+/// `duckdb_copy_function_set_copy_from_function` in [`register_copy_handlers`].
+/// Ownership: the table function itself is owned by DuckDB once installed on
+/// the copy function (the copy function's destroy walks it), so the caller
+/// does NOT free it separately.
+unsafe fn build_copy_from_table_function(
+    handler_name: &str,
+    function_handle: u32,
+    engine: Arc<Engine2>,
+) -> ffi::duckdb_table_function {
+    let tf = ffi::duckdb_create_table_function();
+    // The name only surfaces if DuckDB ever advertises this as a plain
+    // table function (it doesn't for the COPY FROM install path), but set
+    // it defensively — it's also useful in any diagnostic that dumps the
+    // table function's identity.
+    let name_c = CString::new(format!("__ducklink_copy_from_{handler_name}"))
+        .unwrap_or_else(|_| CString::new("__ducklink_copy_from").unwrap());
+    ffi::duckdb_table_function_set_name(tf, name_c.as_ptr());
+    // Positional path parameter (VARCHAR). DuckDB always passes the source
+    // path here on a COPY FROM invocation.
+    let mut varchar = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+    ffi::duckdb_table_function_add_parameter(tf, varchar);
+    ffi::duckdb_destroy_logical_type(&mut varchar);
+
+    let extra = Box::into_raw(Box::new(CopyFromExtra {
+        function_handle,
+        engine,
+    })) as *mut c_void;
+    ffi::duckdb_table_function_set_extra_info(tf, extra, Some(copy_from_extra_destroy));
+    ffi::duckdb_table_function_set_bind(tf, Some(ducklink_copy_from_bind));
+    ffi::duckdb_table_function_set_init(tf, Some(ducklink_copy_from_init));
+    ffi::duckdb_table_function_set_function(tf, Some(ducklink_copy_from_function));
+    tf
+}
+
 /// Register every declared COPY handler on `raw_con`. Idempotency is
 /// delegated to DuckDB (a duplicate name returns failure, which we log and
 /// skip).
@@ -8558,25 +8830,15 @@ pub unsafe fn register_copy_handlers(
         ffi::duckdb_copy_function_set_global_init(cf, Some(ducklink_copy_global_init));
         ffi::duckdb_copy_function_set_sink(cf, Some(ducklink_copy_sink));
         ffi::duckdb_copy_function_set_finalize(cf, Some(ducklink_copy_finalize));
-        // T1-6 (COPY FROM): the C API surfaces this as a single
-        // `duckdb_copy_function_set_copy_from_function(cf, duckdb_table_function)`
-        // hook — it does NOT ship a separate copy-from-bind / -scan / -close
-        // triple. The runtime side already has
-        // `ExtensionInstance::copy_from_bind` / `copy_from_scan` /
-        // `copy_from_close` (per runtime/src/extension.rs:2809-2830), but
-        // wiring them requires:
-        //   1. A `Engine2::dispatch_copy_from_*` wrapper triple exposed
-        //      publicly so the C table-function callbacks can reach the
-        //      instance (Engine2's `instances` map is private and there is
-        //      currently no dispatch_copy_from_* wrapper — engine.rs is
-        //      frozen per the workflow prep note, so this cannot land in
-        //      this file alone).
-        //   2. A dedicated `duckdb_table_function` whose bind/init/func
-        //      callbacks trampoline into those Engine2 wrappers.
-        // BLOCKED-UPSTREAM: T1-6 requires the engine.rs additions above.
-        // The comment previously read "the guest has no copy-from-* export"
-        // — corrected: the guest DOES export copy-from-*; the missing piece
-        // is the Engine2 wrapper triple.
+        // T1-6 (COPY FROM): install the reader as a `duckdb_table_function`
+        // on the COPY function — the C API's single-hook shape for the FROM
+        // side (see `build_copy_from_table_function` above).
+        let tf = build_copy_from_table_function(
+            &h.file_extension,
+            h.function_handle,
+            engine.clone(),
+        );
+        ffi::duckdb_copy_function_set_copy_from_function(cf, tf);
 
         let rc = ffi::duckdb_register_copy_function(raw_con, cf);
         let mut cf_mut = cf;
