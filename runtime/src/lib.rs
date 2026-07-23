@@ -107,6 +107,19 @@ pub fn contract_digest() -> &'static str {
 /// every @3.x component by design -- taken now, in the no-users churn window
 /// (measured 82-110x on the dispatch boundary). The cold singleton paths
 /// (call-scalar/table/pragma/cast) stay row-major. See docs/v4-columnar-abi.md.
+///
+/// major-5 (2026-07-20): the TYPE-SURFACE break. Three coordinated changes land
+/// as one MAJOR bump because each alone re-shapes the canonical ABI: S1 collapses
+/// nested column payloads to an opaque `list<u8>` (with a `Complex(string)`
+/// escape hatch on `logicaltype` so scalar/table/pragma paths can still name a
+/// nested SQL type without a WIT shape); S2 promotes `decimal(width, scale)` to
+/// a first-class typed columnar entry (out of the old fallback path); T2-1
+/// removes residual HUGEINT / UHUGEINT surface (kept as row-major-only escape-
+/// hatch complex types via S1). The @4.x columnar entries change shape (nested
+/// column layout + decimal payload) and enum variants drop, so every @4.x
+/// component is REJECTED by design. Taken in the no-users churn window; the
+/// major-5 baseline is the new FROZEN reference and future growth is additive
+/// MINORS. See docs/v5-type-surface.md.
 pub const CONTRACT_MAJOR: u64 = 5;
 
 /// The MINOR version of the `duckdb:extension` WIT contract this host speaks.
@@ -118,7 +131,7 @@ pub const CONTRACT_MAJOR: u64 = 5;
 /// this host does not provide, so instantiation would fail with a cryptic
 /// missing-import error. [`check_component_contract`] turns that into a friendly,
 /// actionable message. Bump this in lockstep with each additive MINOR contract
-/// bump (set back to 0 on a new MAJOR). Reset to 0 for the major-3 baseline.
+/// bump (set back to 0 on a new MAJOR). Reset to 0 for the major-5 baseline.
 pub const CONTRACT_MINOR: u64 = 0;
 
 /// Full contract version string the host advertises (observability only; the

@@ -47,15 +47,49 @@ v5.x.
   now-orphaned `ts_filter_op` helper. `LoadedComponent` loses its
   `parsers`, `optimizers`, and `filterable_tables` fields.
 
+### Changed — WIT contract bump `duckdb:extension@4.0.0` → `@5.0.0`
+
+The package version stamped on every `duckdb:extension` `.wit` file
+(42 canonical + 42 mirrored) and every world moved from `4.0.0` to
+`5.0.0`; 218 `use` / `import` / `export` references were rewritten
+to match. `duckdb-extension-host.wit` was regenerated. This is a
+cross-major-rejected break: components built against `@4.0.0` do
+not load on v5.x and must be rebuilt against `@5.0.0`. The new
+contract digest is
+`99a5f94eba956bc0a7f828e8501e95560fa7d626349e78bd5548ac56d1e2f219`
+(recorded in `STABILITY.md` § 1.5).
+
+New variant arms introduced in the `@5.0.0` contract:
+
+- `types.wit` `logicaltype`: `Decimal(decimalshape { width: u8,
+  scale: u8 })`, `Hugeint`, `Uhugeint`.
+- `types.wit` `duckvalue`: `Hugeint(hugeintvalue)`,
+  `Uhugeint(uhugeintvalue)`.
+- `column-types.wit` `column`: `Hugeint(list<duck-int128>)`,
+  `Uhugeint(list<duck-uint128>)`, `List-col(nested-column)`,
+  `Struct-col(nested-column)`, `Map-col(map-column)`,
+  `Array-col(array-column)`.
+
+`wit-parser 0.251` rejects value-type cycles, so fully structural
+recursive logicaltypes still route through the existing
+`complex(string)` type-expression escape hatch (e.g.
+`"STRUCT(a INT, b VARCHAR)"`); the new nested column arms carry
+their payload as an opaque `list<u8>`. Fully structural nested
+logicals await wit-parser recursive-value-type support.
+
+The parser / optimizer / table-stream `.wit` files were carried
+forward into `@5.0.0` rather than removed; see the Deprecated
+section below for their removal target.
+
 ### Deprecated
 
 The following WIT surfaces and Rust types remain in the shipping
-`duckdb:extension@4.0.0` contract for backward compatibility with
-components built against v4.x. They are scheduled for REMOVAL at
-the next `duckdb:extension` MAJOR bump (which will coincide with
-ducklink v6.0.0). Components that call them today still load, but
-the host no longer wires them to DuckDB — registrations are silent
-no-ops.
+`duckdb:extension@5.0.0` contract, carried forward from `@4.0.0`
+so that components which merely link the interfaces continue to
+build. They are scheduled for REMOVAL at the next
+`duckdb:extension` MAJOR bump (which will coincide with ducklink
+v6.0.0). Components that call them today still load, but the host
+no longer wires them to DuckDB — registrations are silent no-ops.
 
 - WIT interfaces: `parser`, `parser-dispatch`, `optimizer`,
   `optimizer-dispatch`, `table-stream`, `table-stream-dispatch`.

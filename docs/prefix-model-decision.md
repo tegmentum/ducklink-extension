@@ -29,7 +29,7 @@ Two ducklink hosts implement the same conceptual capability ("give a component's
 - **Host A (this repo, v5.0.0 shipping)** uses SQL schema qualification: `ducklink_prefix('c', 'crypto')` creates schema `c` and populates it with `CREATE OR REPLACE MACRO c.hash(x) AS crypto.hash(x)` for every function in `crypto`. State lives in `ducklink.prefixes(alias, namespace)`; re-applied on reconnect by `replay_persisted_prefixes`. Prefix is user-declared at query time, persistent per catalog.
 - **Host B (workspace ducklink, feat branch)** uses SPARQL-style double-underscore concatenation: every function is dual-registered as bare `name(x)` and `<prefix>__name(x)`. Prefix is registry-declared and load-time-automatic. State lives in `__ducklink_prefix`, `__ducklink_prefix_function`, `__ducklink_prefix_pin`. A PIN table lets a user assign a bare name to a specific expansion, surviving load-order changes.
 
-Both hosts share `duckdb:extension@4.0.0` and the same wasm components.
+Both hosts share `duckdb:extension@5.0.0` and the same wasm components.
 
 ## 1. The essential tradeoffs
 

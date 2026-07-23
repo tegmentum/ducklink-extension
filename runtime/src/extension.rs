@@ -4339,24 +4339,28 @@ mod tests {
         )
     }
 
-    /// THE MAJOR-4 BREAK PROOF. The columnar @4.0.0 contract is a DELIBERATE
-    /// clean break: every pre-existing @3.x component is REJECTED by design (the
-    /// row-major batch ABI it exports no longer exists). The on-disk
-    /// `artifacts/extensions/*.wasm` are the OLD @3.0.0 builds (not yet rebuilt at
-    /// @4.0.0), so the contract guard must reject them with the friendly
-    /// major-mismatch message. (After the coordinated @4.0.0 rebuild they load.)
-    /// Skipped gracefully if the artifacts are absent (toolchain-free CI subset).
+    /// THE MAJOR-5 BREAK PROOF. The @5.0.0 contract is a DELIBERATE clean break
+    /// over @4.x: S1 nested types collapse to an opaque `list<u8>` for columns
+    /// (with a `Complex(string)` escape hatch on logicaltype), S2 introduces
+    /// `decimal(width, scale)` as a first-class typed columnar path, and T2-1
+    /// drops residual HUGEINT / UHUGEINT surface. Every pre-existing @4.x
+    /// component is REJECTED by design (the ABI it exports no longer matches).
+    /// The on-disk `artifacts/extensions/*.wasm` are the OLD @4.0.0 builds (not
+    /// yet rebuilt at @5.0.0), so the contract guard must reject them with the
+    /// friendly major-mismatch message. (After the coordinated @5.0.0 rebuild
+    /// they load.) Skipped gracefully if the artifacts are absent (toolchain-
+    /// free CI subset).
     #[test]
-    fn major_4_rejects_frozen_3_0_0_components() {
+    fn major_5_rejects_frozen_4_0_0_components() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let aba = std::path::Path::new(manifest).join("../../artifacts/extensions/aba.wasm");
         if !aba.exists() {
-            eprintln!("skipping major-4 break proof: artifacts/extensions/aba.wasm absent");
+            eprintln!("skipping major-5 break proof: artifacts/extensions/aba.wasm absent");
             return;
         }
 
-        // This host is the major-4 columnar baseline.
-        assert_eq!(crate::CONTRACT_MAJOR, 4);
+        // This host is the major-5 baseline.
+        assert_eq!(crate::CONTRACT_MAJOR, 5);
         assert_eq!(crate::CONTRACT_MINOR, 0);
 
         let engine = test_engine();
@@ -4370,20 +4374,20 @@ mod tests {
             let bytes = std::fs::read(&path).unwrap();
             let component = Component::new(&engine, &bytes).unwrap();
 
-            // The on-disk artifact is still the @3.0.0 build (major 3).
+            // The on-disk artifact is still the @4.0.0 build (major 4).
             let ver = crate::component_contract_version(&engine, &component);
             assert_eq!(
                 ver.map(|(maj, _)| maj),
-                Some(3),
-                "{name} on disk is expected to still be the @3.0.0 build pre-rebuild"
+                Some(4),
+                "{name} on disk is expected to still be the @4.0.0 build pre-rebuild"
             );
 
-            // The major-4 contract guard REJECTS it (the clean break by design).
+            // The major-5 contract guard REJECTS it (the clean break by design).
             assert!(
                 crate::check_component_contract(&engine, &component, name).is_err(),
-                "{name}: a @3.x component MUST be rejected by the major-4 host"
+                "{name}: a @4.x component MUST be rejected by the major-5 host"
             );
-            eprintln!("[major-4-break] @3.0.0 '{name}' correctly REJECTED by the @4.0.0 host");
+            eprintln!("[major-5-break] @4.0.0 '{name}' correctly REJECTED by the @5.0.0 host");
         }
     }
 

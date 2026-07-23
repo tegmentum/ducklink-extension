@@ -28,7 +28,7 @@ Related design docs:
 the loader and the catalog. Feature-specific implementations we ship
 belong in their own repos:
 
-- `ducklink-vegalite-wasm` — a `duckdb:extension@4.0.0` WebAssembly
+- `ducklink-vegalite-wasm` — a `duckdb:extension@5.0.0` WebAssembly
   component (Rust, wit-bindgen). Ducklink loads it through the
   standard `ducklink_load('vegalite')` path with `kind => 'wasm'`
   (the default).
@@ -72,7 +72,7 @@ the entries in `ducklink.docs`.
     {
       "id": "wasm-primary",
       "kind": "wasm",
-      "abi": "duckdb:extension@4.0.0",
+      "abi": "duckdb:extension@5.0.0",
       "artifact": "artifacts/extensions/vegalite.wasm",
       "content_digest": "...",
       "status": "supported"
@@ -248,7 +248,7 @@ Users load via `ducklink_load('vegalite', kind => 'native')`
 (requires `-unsigned` today — see `docs/duckdb-upstream-custom-trusted-keys.md`).
 
 **Milestone 2 — wasm.** Same Rust core exposed through the
-`duckdb:extension@4.0.0` WIT bindings. Catalog entry adds the
+`duckdb:extension@5.0.0` WIT bindings. Catalog entry adds the
 `wasm-primary` provider. `ducklink_load('vegalite')` (default kind)
 now serves the wasm build; the native path remains available.
 

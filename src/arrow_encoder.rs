@@ -989,4 +989,210 @@ mod tests {
         assert_eq!(b.value(0), "hi");
         assert_eq!(b.value(1), "bye");
     }
+
+    #[test]
+    fn map_of_text_to_int64_round_trips() {
+        let enc = ArrowEncoder::new(&[col(
+            "m",
+            LogicalType::Map(Box::new(LogicalType::Text), Box::new(LogicalType::Int64)),
+        )])
+        .unwrap();
+        let rows = vec![
+            vec![DuckValue::Map(vec![
+                (DuckValue::Text("a".into()), DuckValue::Int64(1)),
+                (DuckValue::Text("b".into()), DuckValue::Int64(2)),
+            ])],
+            // Empty map -- non-null but zero entries; distinct from a Null row.
+            vec![DuckValue::Map(vec![])],
+            vec![DuckValue::Null],
+            vec![DuckValue::Map(vec![(
+                DuckValue::Text("c".into()),
+                DuckValue::Int64(3),
+            )])],
+        ];
+        let s = round_trip(&enc, &rows);
+        let c = s.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(c.len(), 4);
+        // Null bitmap: only row 2 is Null.
+        assert!(!c.is_null(0));
+        assert!(!c.is_null(1));
+        assert!(c.is_null(2));
+        assert!(!c.is_null(3));
+        // Offsets are cumulative row lengths [2, 0, 0, 1] -> [0, 2, 2, 2, 3].
+        // (Null row contributes zero-length just like an empty map -- Arrow
+        // stores the null-ness in the bitmap, not the offset delta.)
+        assert_eq!(c.value_offsets(), &[0, 2, 2, 2, 3]);
+        // Flat keys / values -- three entries total across the two non-empty
+        // rows.
+        let keys = c.keys().as_any().downcast_ref::<StringArray>().unwrap();
+        let vals = c.values().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(vals.len(), 3);
+        assert_eq!(keys.value(0), "a");
+        assert_eq!(keys.value(1), "b");
+        assert_eq!(keys.value(2), "c");
+        assert_eq!(vals.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn array_of_int32_round_trips() {
+        let enc = ArrowEncoder::new(&[col(
+            "arr",
+            LogicalType::Array(3, Box::new(LogicalType::Int32)),
+        )])
+        .unwrap();
+        let rows = vec![
+            vec![DuckValue::Array(vec![
+                DuckValue::Int32(1),
+                DuckValue::Int32(2),
+                DuckValue::Int32(3),
+            ])],
+            vec![DuckValue::Null],
+            vec![DuckValue::Array(vec![
+                DuckValue::Int32(4),
+                DuckValue::Int32(5),
+                DuckValue::Int32(6),
+            ])],
+        ];
+        let s = round_trip(&enc, &rows);
+        let c = s
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(c.len(), 3);
+        assert!(!c.is_null(0));
+        assert!(c.is_null(1));
+        assert!(!c.is_null(2));
+        assert_eq!(c.value_length(), 3);
+        // Encoder rule: a Null parent row still occupies `size` child slots,
+        // filled with child-level Nulls. Verify the whole 9-entry backing.
+        let child = c
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(child.len(), 9);
+        assert_eq!(child.value(0), 1);
+        assert_eq!(child.value(1), 2);
+        assert_eq!(child.value(2), 3);
+        assert!(child.is_null(3));
+        assert!(child.is_null(4));
+        assert!(child.is_null(5));
+        assert_eq!(child.value(6), 4);
+        assert_eq!(child.value(7), 5);
+        assert_eq!(child.value(8), 6);
+    }
+
+    #[test]
+    fn list_of_struct_round_trips() {
+        // Nested combo: exercises encode_flat recursion from a List arm into
+        // a Struct arm (both nested types in one column).
+        let struct_ty = LogicalType::Struct(vec![
+            ("a".to_string(), LogicalType::Int32),
+            ("b".to_string(), LogicalType::Text),
+        ]);
+        let enc = ArrowEncoder::new(&[col(
+            "ls",
+            LogicalType::List(Box::new(struct_ty)),
+        )])
+        .unwrap();
+        let rows = vec![
+            vec![DuckValue::List(vec![
+                DuckValue::Struct(vec![
+                    ("a".to_string(), DuckValue::Int32(1)),
+                    ("b".to_string(), DuckValue::Text("one".into())),
+                ]),
+                DuckValue::Struct(vec![
+                    ("a".to_string(), DuckValue::Int32(2)),
+                    ("b".to_string(), DuckValue::Text("two".into())),
+                ]),
+            ])],
+            vec![DuckValue::List(vec![DuckValue::Struct(vec![
+                ("a".to_string(), DuckValue::Int32(3)),
+                ("b".to_string(), DuckValue::Text("three".into())),
+            ])])],
+        ];
+        let s = round_trip(&enc, &rows);
+        let list = s.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 2);
+        // Flat child struct: 2 + 1 = 3 entries.
+        let child = list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(child.len(), 3);
+        let a = child
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b = child
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(a.values(), &[1, 2, 3]);
+        assert_eq!(b.value(0), "one");
+        assert_eq!(b.value(1), "two");
+        assert_eq!(b.value(2), "three");
+    }
+
+    #[test]
+    fn map_of_text_to_list_round_trips() {
+        // Nested combo: Map arm recurses into a List arm for the value child,
+        // so this exercises recursion into a nested arm from inside a nested
+        // arm.
+        let list_ty = LogicalType::List(Box::new(LogicalType::Int32));
+        let enc = ArrowEncoder::new(&[col(
+            "m",
+            LogicalType::Map(Box::new(LogicalType::Text), Box::new(list_ty)),
+        )])
+        .unwrap();
+        let rows = vec![
+            vec![DuckValue::Map(vec![
+                (
+                    DuckValue::Text("evens".into()),
+                    DuckValue::List(vec![DuckValue::Int32(2), DuckValue::Int32(4)]),
+                ),
+                (
+                    DuckValue::Text("odds".into()),
+                    DuckValue::List(vec![DuckValue::Int32(1), DuckValue::Int32(3)]),
+                ),
+            ])],
+            vec![DuckValue::Map(vec![(
+                DuckValue::Text("empty".into()),
+                DuckValue::List(vec![]),
+            )])],
+        ];
+        let s = round_trip(&enc, &rows);
+        let map = s.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.len(), 2);
+        // Row 0 has 2 entries, row 1 has 1 -> offsets [0, 2, 3].
+        assert_eq!(map.value_offsets(), &[0, 2, 3]);
+        let keys = map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.value(0), "evens");
+        assert_eq!(keys.value(1), "odds");
+        assert_eq!(keys.value(2), "empty");
+        // Value child is itself a ListArray -- verify the inner recursion
+        // produced the right per-entry list contents.
+        let vals = map
+            .values()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(vals.len(), 3);
+        let v0 = vals.value(0);
+        let a0 = v0.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a0.values(), &[2, 4]);
+        let v1 = vals.value(1);
+        let a1 = v1.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a1.values(), &[1, 3]);
+        let v2 = vals.value(2);
+        assert_eq!(v2.len(), 0);
+    }
 }

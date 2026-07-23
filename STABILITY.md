@@ -73,9 +73,12 @@ Semantics and parsing are frozen. Adding new variables is MINOR.
 ### 1.5 `duckdb:extension` WIT contract
 
 Ducklink implements the WIT contract identified by digest
-`a2ad9764ac971345d6a650b92edbda034b160980acf148d354126f7e6f92ba40`,
-which corresponds to `duckdb:extension@4.0.0`. Components that
+`99a5f94eba956bc0a7f828e8501e95560fa7d626349e78bd5548ac56d1e2f219`,
+which corresponds to `duckdb:extension@5.0.0`. Components that
 target this contract are supported for the life of ducklink v5.x.
+Components built against the earlier `duckdb:extension@4.0.0`
+contract are cross-major-rejected at load time and must be rebuilt
+against `@5.0.0`.
 
 Adding new opt-in worlds (new interfaces components can import when
 they want a new capability) is MINOR. Modifying an existing WIT
@@ -207,8 +210,10 @@ another DuckDB extension that calls into ducklink, you can:
 - Take a dependency on any name in §1 and expect it to keep working
   through the current MAJOR series.
 - Read the discovery views and treat them as a stable API.
-- Ship components targeting the `duckdb:extension@4.0.0` contract
-  and expect them to load on any ducklink v5.x.
+- Ship components targeting the `duckdb:extension@5.0.0` contract
+  and expect them to load on any ducklink v5.x. Components built
+  against `duckdb:extension@4.0.0` are cross-major-rejected on
+  v5.x and must be rebuilt against `@5.0.0`.
 
 If you're building against a name that isn't in §1, we don't
 promise anything. Reach out and we can consider stabilizing it.

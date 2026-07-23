@@ -263,13 +263,13 @@ two paths coexist and are chosen by which loader the user calls:
   "categories": ["validators"],
   "exports": ["aba_validate"],
   "requires": ["scalar"],
-  "wit_contract_version": "4.0.0",
+  "wit_contract_version": "5.0.0",
   "content_digest": "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15",
   "providers": [
     {
       "id": "wasm-component",
       "kind": "wasm",
-      "abi": "duckdb:extension@4.0.0",
+      "abi": "duckdb:extension@5.0.0",
       "content_digest": "068b47e3ea5df366637eb3726e7efaa6bfb4ddd00564bf75c821956572c76a15",
       "status": "supported"
     },
@@ -404,7 +404,7 @@ the gap.
     {
       "id": "wasm-primary",
       "kind": "wasm",
-      "abi": "duckdb:extension@4.0.0",
+      "abi": "duckdb:extension@5.0.0",
       "content_digest": "aa1122...",
       "status": "supported"
     },
