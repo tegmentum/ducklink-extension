@@ -660,12 +660,19 @@ pub struct ScalarEx {
 /// A named cast between two DuckDB types the component registered.
 /// `callback_handle` routes every cast call back through the callback
 /// registry to the owning component's dispatcher.
+///
+/// `implicit_cost` (T2-4) carries the DuckDB implicit-conversion cost knob
+/// through from the WIT `cast-spec` — `None` = use DuckDB's default (100);
+/// `Some(-1)` = explicit-only (parity with the C API convention); any other
+/// `Some(v)` = a positive cost. The reg_duckdb consolidator lands this via
+/// `duckdb_cast_function_set_implicit_cost` at native-registration time.
 #[derive(Clone, Debug)]
 pub struct CastEntry {
     pub extension: String,
     pub source: String,
     pub target: String,
     pub callback_handle: u32,
+    pub implicit_cost: Option<i32>,
 }
 
 /// A user-defined logical type alias the component registered.
@@ -1035,6 +1042,10 @@ impl Engine2 {
                 source: c.source,
                 target: c.target,
                 callback_handle: c.callback_handle,
+                // T2-4: thread the WIT-supplied implicit-conversion cost through
+                // to LoadedComponent.casts so reg_duckdb's consolidator can call
+                // `duckdb_cast_function_set_implicit_cost` (default 100 if None).
+                implicit_cost: c.implicit_cost,
             })
             .collect();
         let macros = pending
@@ -1583,21 +1594,30 @@ impl Engine2 {
             .map_err(|e| anyhow!("copy_to_finalize dispatch failed: {e:?}"))
     }
 
-    /// COPY FROM: bind a reader for `path` with key=value `options`. Wraps
-    /// [`ExtensionInstance::copy_from_bind`]. Returns the guest's reader
-    /// handle plus the discovered column schema; the reader handle is then
-    /// passed to `dispatch_copy_from_scan` (to pull rows) and finally
-    /// `dispatch_copy_from_close` (to release reader state). Mirrors the
-    /// `dispatch_copy_to_bind` shape (F3-b upgrade-else-fallback registry
+    /// COPY FROM: bind a reader for `path` with key=value `options`, forwarding
+    /// the destination table's `target_columns` schema (from DuckDB's
+    /// `duckdb_table_function_bind_get_result_column_*` accessors on the COPY-
+    /// FROM install table function). Wraps [`ExtensionInstance::copy_from_bind`].
+    /// Returns the guest's reader handle plus the discovered column schema; the
+    /// reader handle is then passed to `dispatch_copy_from_scan` (to pull rows)
+    /// and finally `dispatch_copy_from_close` (to release reader state). Mirrors
+    /// the `dispatch_copy_to_bind` shape (F3-b upgrade-else-fallback registry
     /// resolution) — a COPY FROM installation lands as a
     /// `duckdb_table_function` on the COPY function via
     /// `duckdb_copy_function_set_copy_from_function`, and that table
     /// function's bind/init/func callbacks re-enter here.
+    ///
+    /// T1-6 landing: accepts `target_columns` in the neutral `reg::ColumnDef`
+    /// shape and converts to `extension_types::Columndef` at the WIT boundary
+    /// (using the same field mapping as `convert_extension_columndefs`, in
+    /// reverse). The guest sees the destination schema in `copy-from-bind` and
+    /// MUST prepare rows matching it.
     pub fn dispatch_copy_from_bind(
         &self,
         callback_handle: u32,
         path: &str,
         options: &[(String, String)],
+        target_columns: Vec<reg::ColumnDef>,
     ) -> Result<ducklink_runtime::extension::CopyFromBindResult> {
         let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
@@ -1610,9 +1630,13 @@ impl Engine2 {
                 None => (dispatcher_handle, self.instance_arc(&entry.extension)?),
             }
         };
+        let wit_target: Vec<extension_types::Columndef> = target_columns
+            .into_iter()
+            .map(neutral_to_wit_columndef)
+            .collect();
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         instance
-            .copy_from_bind(dispatcher_handle, path, options)
+            .copy_from_bind(dispatcher_handle, path, options, &wit_target)
             .map_err(|e| anyhow!("copy_from_bind dispatch failed: {e:?}"))
     }
 
@@ -1866,6 +1890,79 @@ fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
             type_expr: c.type_expr,
             json: c.json,
         },
+    }
+}
+
+/// Public inverse of `neutral_to_wit_logicaltype`: lift a WIT
+/// `extension_types::Logicaltype` back into the neutral `reg::LogicalType`.
+/// Exposed for `reg_duckdb::ducklink_copy_from_bind` (T1-6 landing) which
+/// captures the target-table schema as WIT columndefs and needs to forward
+/// them through the engine layer in the neutral shape. The consolidator that
+/// runs next will fold this call into a single-pass build.
+pub fn wit_logicaltype_to_neutral(lt: &extension_types::Logicaltype) -> reg::LogicalType {
+    match lt {
+        extension_types::Logicaltype::Boolean => reg::LogicalType::Boolean,
+        extension_types::Logicaltype::Int64 => reg::LogicalType::Int64,
+        extension_types::Logicaltype::Uint64 => reg::LogicalType::Uint64,
+        extension_types::Logicaltype::Float64 => reg::LogicalType::Float64,
+        extension_types::Logicaltype::Text => reg::LogicalType::Text,
+        extension_types::Logicaltype::Blob => reg::LogicalType::Blob,
+        extension_types::Logicaltype::Int32 => reg::LogicalType::Int32,
+        extension_types::Logicaltype::Timestamp => reg::LogicalType::Timestamp,
+        extension_types::Logicaltype::Int8 => reg::LogicalType::Int8,
+        extension_types::Logicaltype::Int16 => reg::LogicalType::Int16,
+        extension_types::Logicaltype::Uint8 => reg::LogicalType::Uint8,
+        extension_types::Logicaltype::Uint16 => reg::LogicalType::Uint16,
+        extension_types::Logicaltype::Uint32 => reg::LogicalType::Uint32,
+        extension_types::Logicaltype::Float32 => reg::LogicalType::Float32,
+        extension_types::Logicaltype::Date => reg::LogicalType::Date,
+        extension_types::Logicaltype::Time => reg::LogicalType::Time,
+        extension_types::Logicaltype::Timestamptz => reg::LogicalType::Timestamptz,
+        extension_types::Logicaltype::Decimal => reg::LogicalType::Decimal,
+        extension_types::Logicaltype::Interval => reg::LogicalType::Interval,
+        extension_types::Logicaltype::Uuid => reg::LogicalType::Uuid,
+        extension_types::Logicaltype::Complex(expr) => reg::LogicalType::Complex(expr.clone()),
+    }
+}
+
+/// Reverse of `convert_extension_logicaltype` in the runtime crate: lower a
+/// neutral `reg::LogicalType` into the WIT `extension_types::Logicaltype` shape
+/// the guest expects. Used by `dispatch_copy_from_bind` to forward the
+/// destination table's target-column schema (T1-6) — the incoming WIT enum
+/// arms mirror the neutral enum one-for-one so this is a total mapping with
+/// no fallible arms.
+fn neutral_to_wit_logicaltype(lt: reg::LogicalType) -> extension_types::Logicaltype {
+    match lt {
+        reg::LogicalType::Boolean => extension_types::Logicaltype::Boolean,
+        reg::LogicalType::Int64 => extension_types::Logicaltype::Int64,
+        reg::LogicalType::Uint64 => extension_types::Logicaltype::Uint64,
+        reg::LogicalType::Float64 => extension_types::Logicaltype::Float64,
+        reg::LogicalType::Text => extension_types::Logicaltype::Text,
+        reg::LogicalType::Blob => extension_types::Logicaltype::Blob,
+        reg::LogicalType::Int32 => extension_types::Logicaltype::Int32,
+        reg::LogicalType::Timestamp => extension_types::Logicaltype::Timestamp,
+        reg::LogicalType::Int8 => extension_types::Logicaltype::Int8,
+        reg::LogicalType::Int16 => extension_types::Logicaltype::Int16,
+        reg::LogicalType::Uint8 => extension_types::Logicaltype::Uint8,
+        reg::LogicalType::Uint16 => extension_types::Logicaltype::Uint16,
+        reg::LogicalType::Uint32 => extension_types::Logicaltype::Uint32,
+        reg::LogicalType::Float32 => extension_types::Logicaltype::Float32,
+        reg::LogicalType::Date => extension_types::Logicaltype::Date,
+        reg::LogicalType::Time => extension_types::Logicaltype::Time,
+        reg::LogicalType::Timestamptz => extension_types::Logicaltype::Timestamptz,
+        reg::LogicalType::Decimal => extension_types::Logicaltype::Decimal,
+        reg::LogicalType::Interval => extension_types::Logicaltype::Interval,
+        reg::LogicalType::Uuid => extension_types::Logicaltype::Uuid,
+        reg::LogicalType::Complex(expr) => extension_types::Logicaltype::Complex(expr),
+    }
+}
+
+/// Lower a neutral `reg::ColumnDef` into `extension_types::Columndef` for the
+/// WIT boundary. Companion to `neutral_to_wit_logicaltype`.
+fn neutral_to_wit_columndef(c: reg::ColumnDef) -> extension_types::Columndef {
+    extension_types::Columndef {
+        name: c.name,
+        logical: neutral_to_wit_logicaltype(c.logical),
     }
 }
 

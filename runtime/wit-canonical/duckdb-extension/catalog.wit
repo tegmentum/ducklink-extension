@@ -21,6 +21,16 @@ interface catalog {
     %from: string,
     to: string,
     kind: cast-kind,
+    // T2-4 (additive-within-the-record via option arm): DuckDB's cast-function
+    // implicit-conversion cost, forwarded to
+    // `duckdb_cast_function_set_implicit_cost` at native-registration time.
+    //   * `none`        -> use DuckDB's default (100)
+    //   * `some(s32)`   -> cost value; `-1` marks the cast explicit-only
+    //                       (parity with the C API's convention)
+    // Adding an `option` field keeps existing @4.0.0 producers wire-compatible
+    // when they leave the field unset — the canonical ABI treats `option<T>`
+    // as a variant, so the record grows without renumbering earlier fields.
+    implicit-cost: option<s32>,
   }
 
   record macro-def {

@@ -937,12 +937,20 @@ pub mod reg {
     }
 
     /// A cast between two named types, dispatched through a callback.
+    ///
+    /// `implicit_cost` (T2-4) mirrors DuckDB's cast-function implicit-conversion
+    /// cost knob (`duckdb_cast_function_set_implicit_cost` in libduckdb-sys
+    /// 1.10504.0). `None` means "use DuckDB's default (100)"; `Some(-1)` marks
+    /// the cast explicit-only (parity with the C API's convention); any other
+    /// `Some(v)` is a positive cost. The native reg_duckdb consolidator applies
+    /// this at cast-function creation time.
     #[derive(Clone, Debug)]
     pub struct CastReg {
         pub extension: String,
         pub source: String,
         pub target: String,
         pub callback_handle: u32,
+        pub implicit_cost: Option<i32>,
     }
 
     // --- 2.1.0 additive registrations ---

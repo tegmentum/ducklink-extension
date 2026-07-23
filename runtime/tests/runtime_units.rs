@@ -308,6 +308,7 @@ fn pending_append_merges_all_kinds_and_drains_other() {
         source: "a".to_string(),
         target: "b".to_string(),
         callback_handle: 3,
+        implicit_cost: None,
     });
 
     base.append(other);

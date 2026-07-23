@@ -1428,14 +1428,18 @@ impl extension_catalog::Host for ExtensionStoreState {
         let callback_handle = callback.rep();
         std::mem::forget(callback);
         verbose_log!(
-            "[extension-manager] catalog register-cast {}->{} ({:?}, callback={callback_handle}) for '{}'",
-            spec.from, spec.to, spec.kind, self.extension_name
+            "[extension-manager] catalog register-cast {}->{} ({:?}, callback={callback_handle}, implicit_cost={:?}) for '{}'",
+            spec.from, spec.to, spec.kind, spec.implicit_cost, self.extension_name
         );
         self.pending_casts.push(PendingCast {
             extension: self.extension_name.clone(),
             source: spec.from,
             target: spec.to,
             callback_handle,
+            // T2-4: drain the optional implicit-conversion cost the guest
+            // supplied; the reg_duckdb consolidator forwards to
+            // `duckdb_cast_function_set_implicit_cost` (default 100 if None).
+            implicit_cost: spec.implicit_cost,
         });
         Ok(())
     }
@@ -2879,45 +2883,30 @@ impl ExtensionInstance {
             .map_err(map_extension_trap)?
     }
 
-    /// COPY FROM: bind a reader for `path`; returns (reader handle, columns).
+    /// COPY FROM: bind a reader for `path`, forwarding the destination table's
+    /// `target_columns` (schema DuckDB has already resolved for e.g.
+    /// `INSERT INTO t(a,b) FROM COPY ...`) into the guest bind. Returns
+    /// (reader handle, columns).
+    ///
+    /// T1-6 landing: the copy-dispatch WIT `copy-from-bind` now carries
+    /// `target-columns: list<columndef>`; the guest MUST prepare rows matching
+    /// that schema. The host still validates returned-column arity against the
+    /// target and rejects mismatches at bind time (see `ducklink_copy_from_bind`
+    /// in reg_duckdb.rs). The prior `copy_from_bind_with_target` helper the
+    /// sweep-2 prep introduced is retired — this is now the single entry point.
     pub fn copy_from_bind(
         &mut self,
         handle: u32,
         path: &str,
         options: &[(String, String)],
+        target_columns: &[extension_types::Columndef],
     ) -> Result<CopyFromBindResult, extension_types::Duckerror> {
-        self.copy_from_bind_with_target(handle, path, options, None)
-    }
-
-    /// COPY FROM: bind a reader for `path`, additionally supplying the
-    /// destination table's target column schema (from e.g. `INSERT INTO t(a,b)
-    /// FROM COPY ...`).
-    ///
-    /// The runtime accepts and marshals `target_columns` so callers (dispatch
-    /// layer, planners) can pass it in one place, but it is intentionally NOT
-    /// forwarded to the guest today: the current `copy-dispatch` WIT (v4.0.0)
-    /// does not accept a target-schema arg, and adding one is a breaking
-    /// change to every registered COPY-capable component.
-    ///
-    /// TODO(T1-6): promote `target_columns` into copy-dispatch.wit
-    /// `copy-from-bind` (as `target-schema: option<list<columndef>>`) on the
-    /// next major bump so guests can project/cast to the destination schema
-    /// instead of the host coercing after the fact.
-    pub fn copy_from_bind_with_target(
-        &mut self,
-        handle: u32,
-        path: &str,
-        options: &[(String, String)],
-        target_columns: Option<&[extension_types::Columndef]>,
-    ) -> Result<CopyFromBindResult, extension_types::Duckerror> {
-        // Intentionally unused until WIT breaking change (see TODO above).
-        let _ = target_columns;
         self.copy_bindings()?;
         let bindings = self.copy_bindings.as_ref().unwrap();
         let guest = bindings.duckdb_extension_copy_dispatch();
         let store = &mut self.store;
         guest
-            .call_copy_from_bind(store.as_context_mut(), handle, path, options)
+            .call_copy_from_bind(store.as_context_mut(), handle, path, options, target_columns)
             .map_err(map_extension_trap)?
     }
 

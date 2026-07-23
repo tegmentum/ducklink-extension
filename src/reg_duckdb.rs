@@ -128,6 +128,13 @@ const T_UUID: u8 = 19;
 // type-expression is not reconstructed into a real LIST/STRUCT vector here.
 const T_COMPLEX: u8 = 20;
 
+/// DuckDB's per-column output chunk capacity. Every table-fn `func` clamps its
+/// batch to this so `set_len` never exceeds the chunk's allocated capacity
+/// (writing past it is UB). Also enforced as the upper bound on rows a guest
+/// producer (Arrow shim, COPY FROM) may yield per call — a larger batch is a
+/// protocol violation surfaced as a query error.
+pub(crate) const STANDARD_VECTOR_SIZE: u32 = 2048;
+
 /// Map a neutral logical type to a bridge type code. All current `reg`
 /// logical types are supported. Borrows `lt` because the `Complex` arm carries
 /// an owned `String`, so `reg::LogicalType` is no longer `Copy`.
@@ -1484,7 +1491,10 @@ impl VTab for WasmTable {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.total_rows.saturating_sub(start).min(2048);
+            let n = bind
+                .total_rows
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -2642,6 +2652,64 @@ unsafe extern "C" fn agg_extra_destroy(ptr: *mut c_void) {
     }
 }
 
+/// Build one `duckdb_aggregate_function` for the given overload. The caller
+/// owns the returned handle (destroy with `duckdb_destroy_aggregate_function`
+/// after registration OR after adding to a function set — the set deep-copies
+/// via TableFunction-style shared_ptr semantics on `function_info`, so the
+/// outer handle's release does NOT drop the extra-info while the set holds a
+/// reference). Returns `None` if the function name contains an interior NUL
+/// byte (already logged).
+///
+/// # Safety
+/// FFI: constructs a DuckDB handle via `duckdb_create_aggregate_function`.
+unsafe fn build_aggregate_function(
+    f: &AggregateFunc,
+    engine: Arc<Engine2>,
+) -> Option<ffi::duckdb_aggregate_function> {
+    let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
+    let ret_code = type_code(&f.returns);
+
+    let func = ffi::duckdb_create_aggregate_function();
+    let cname = match CString::new(f.name.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[ducklink] aggregate '{}' name contains NUL byte; skipping", f.name);
+            let mut func_mut = func;
+            ffi::duckdb_destroy_aggregate_function(&mut func_mut);
+            return None;
+        }
+    };
+    ffi::duckdb_aggregate_function_set_name(func, cname.as_ptr());
+    for &code in &arg_codes {
+        // T1-4: `logical_type_ffi` routes DECIMAL through
+        // `duckdb_create_decimal_type(18, 3)` so widths/scales are set.
+        let mut lt = logical_type_ffi(code);
+        ffi::duckdb_aggregate_function_add_parameter(func, lt);
+        ffi::duckdb_destroy_logical_type(&mut lt);
+    }
+    let mut rlt = logical_type_ffi(ret_code);
+    ffi::duckdb_aggregate_function_set_return_type(func, rlt);
+    ffi::duckdb_destroy_logical_type(&mut rlt);
+
+    let extra = Box::into_raw(Box::new(AggExtra {
+        callback_handle: f.callback_handle,
+        engine,
+        arg_codes,
+        ret_code,
+    })) as *mut c_void;
+    ffi::duckdb_aggregate_function_set_extra_info(func, extra, Some(agg_extra_destroy));
+    ffi::duckdb_aggregate_function_set_functions(
+        func,
+        Some(agg_state_size),
+        Some(agg_init),
+        Some(agg_update),
+        Some(agg_combine),
+        Some(agg_finalize),
+    );
+    ffi::duckdb_aggregate_function_set_destructor(func, Some(agg_destroy));
+    Some(func)
+}
+
 /// Register every component aggregate function on the raw connection `raw_con`
 /// via the DuckDB C API. Functions registered on any connection of a database
 /// are visible to all its connections, so `raw_con` need only share the database
@@ -2649,88 +2717,113 @@ unsafe extern "C" fn agg_extra_destroy(ptr: *mut c_void) {
 ///
 /// # Safety
 /// `raw_con` must be a valid `duckdb_connection`.
-/// T2-6: aggregates mirror the scalar overload gap. Registering `my_agg(INT)`
-/// then `my_agg(DOUBLE)` fails on the second registration because this path
-/// uses `duckdb_register_aggregate_function` (single-overload). The raw C
-/// API exposes `duckdb_create_aggregate_function_set` /
-/// `duckdb_add_aggregate_function_to_set` /
-/// `duckdb_register_aggregate_function_set` for the overload-set surface;
-/// wiring that in requires collecting per-name AggExtra instances and
-/// branching between the single-registration and set-registration paths.
-/// Interim: detect duplicate names in this pass and log the shortfall
-/// clearly instead of the generic "already present?" message.
+///
+/// T2-6: overload sets landed. Overloads within a single (extension, name)
+/// group are collected up front, and any group with >1 members is installed
+/// via `duckdb_create_aggregate_function_set` +
+/// `duckdb_add_aggregate_function_to_set` (per overload) +
+/// `duckdb_register_aggregate_function_set`. Singletons keep the single-fn
+/// install path. Ownership: the set deep-copies each added function via
+/// `AggregateFunctionSet::AddFunction` (a value copy of `AggregateFunction`,
+/// which holds `function_info` as a shared_ptr — so the extra-info's
+/// destroy callback fires only when the LAST holder drops). We destroy the
+/// per-overload handle immediately after adding it to the set; the extra-info
+/// then lives with the set's copy until the set itself is destroyed (which
+/// happens either explicitly on registration failure or via DuckDB's catalog
+/// when registration succeeds).
 pub unsafe fn register_aggregates(
     raw_con: ffi::duckdb_connection,
     engine: Arc<Engine2>,
     aggregates: &[AggregateFunc],
 ) -> duckdb::Result<usize> {
     use std::collections::HashMap;
-    let mut per_name: HashMap<&str, usize> = HashMap::new();
-    for f in aggregates {
-        *per_name.entry(f.name.as_str()).or_insert(0) += 1;
+    // Group by (extension, name) preserving first-seen order so error messages
+    // reference overloads in declaration order.
+    let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for (i, f) in aggregates.iter().enumerate() {
+        let key = (f.extension.clone(), f.name.clone());
+        match index.get(&key) {
+            Some(&g) => groups[g].2.push(i),
+            None => {
+                index.insert(key.clone(), groups.len());
+                groups.push((key.0, key.1, vec![i]));
+            }
+        }
     }
-    let mut seen: HashMap<&str, usize> = HashMap::new();
+
     let mut registered = 0usize;
-    for f in aggregates {
-        let count = per_name.get(f.name.as_str()).copied().unwrap_or(1);
-        let n_so_far = seen.entry(f.name.as_str()).or_insert(0);
-        *n_so_far += 1;
-        if count > 1 && *n_so_far > 1 {
+    for (_ext, name, member_ixs) in &groups {
+        if member_ixs.len() == 1 {
+            // Single-overload path (unchanged install semantics).
+            let f = &aggregates[member_ixs[0]];
+            let func = match build_aggregate_function(f, engine.clone()) {
+                Some(func) => func,
+                None => continue,
+            };
+            let rc = ffi::duckdb_register_aggregate_function(raw_con, func);
+            let mut func_mut = func;
+            ffi::duckdb_destroy_aggregate_function(&mut func_mut);
+            if rc != ffi::DuckDBSuccess {
+                // IDEMPOTENCY: duplicate name (re-load) is not a hard error.
+                eprintln!("[ducklink] aggregate '{}' not registered (already present?)", f.name);
+                continue;
+            }
+            registered += 1;
+            continue;
+        }
+
+        // Overload-set path (>=2 signatures under this name).
+        let set_name_c = match CString::new(name.as_str()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("[ducklink] aggregate set '{name}' name contains NUL byte; skipping");
+                continue;
+            }
+        };
+        let set = ffi::duckdb_create_aggregate_function_set(set_name_c.as_ptr());
+        if set.is_null() {
+            eprintln!("[ducklink] aggregate set '{name}' could not be created");
+            continue;
+        }
+        let mut set_ok = true;
+        let mut overloads_added = 0usize;
+        for &ix in member_ixs {
+            let f = &aggregates[ix];
+            let func = match build_aggregate_function(f, engine.clone()) {
+                Some(func) => func,
+                None => continue,
+            };
+            let add_rc = ffi::duckdb_add_aggregate_function_to_set(set, func);
+            let mut func_mut = func;
+            ffi::duckdb_destroy_aggregate_function(&mut func_mut);
+            if add_rc != ffi::DuckDBSuccess {
+                eprintln!(
+                    "[ducklink] aggregate '{}' overload {} failed to join set",
+                    f.name, ix
+                );
+                set_ok = false;
+                break;
+            }
+            overloads_added += 1;
+        }
+        if !set_ok || overloads_added == 0 {
+            let mut set_mut = set;
+            ffi::duckdb_destroy_aggregate_function_set(&mut set_mut);
+            continue;
+        }
+        let rc = ffi::duckdb_register_aggregate_function_set(raw_con, set);
+        let mut set_mut = set;
+        ffi::duckdb_destroy_aggregate_function_set(&mut set_mut);
+        if rc != ffi::DuckDBSuccess {
+            // IDEMPOTENCY: duplicate set name (re-load) is skipped like the
+            // single-fn path.
             eprintln!(
-                "[ducklink] aggregate function '{}' already registered on this load — \
-                 duckdb overloads under one name require \
-                 `duckdb_aggregate_function_set` support, which this path does not \
-                 yet use (T2-6). Skipping overload #{} of {}.",
-                f.name, n_so_far, count
+                "[ducklink] aggregate set '{name}' not registered (already present?)"
             );
             continue;
         }
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
-        let ret_code = type_code(&f.returns);
-
-        let func = ffi::duckdb_create_aggregate_function();
-        let cname = CString::new(f.name.as_str())
-            .map_err(|_| duckdb::Error::DuckDBFailure(ffi::Error::new(ffi::DuckDBError), None))?;
-        ffi::duckdb_aggregate_function_set_name(func, cname.as_ptr());
-        for &code in &arg_codes {
-            // T1-4: `logical_type_ffi` routes DECIMAL through
-            // `duckdb_create_decimal_type(18, 3)` so widths/scales are set.
-            let mut lt = logical_type_ffi(code);
-            ffi::duckdb_aggregate_function_add_parameter(func, lt);
-            ffi::duckdb_destroy_logical_type(&mut lt);
-        }
-        let mut rlt = logical_type_ffi(ret_code);
-        ffi::duckdb_aggregate_function_set_return_type(func, rlt);
-        ffi::duckdb_destroy_logical_type(&mut rlt);
-
-        let extra = Box::into_raw(Box::new(AggExtra {
-            callback_handle: f.callback_handle,
-            engine: engine.clone(),
-            arg_codes,
-            ret_code,
-        })) as *mut c_void;
-        ffi::duckdb_aggregate_function_set_extra_info(func, extra, Some(agg_extra_destroy));
-        ffi::duckdb_aggregate_function_set_functions(
-            func,
-            Some(agg_state_size),
-            Some(agg_init),
-            Some(agg_update),
-            Some(agg_combine),
-            Some(agg_finalize),
-        );
-        ffi::duckdb_aggregate_function_set_destructor(func, Some(agg_destroy));
-
-        let rc = ffi::duckdb_register_aggregate_function(raw_con, func);
-        let mut func_mut = func;
-        ffi::duckdb_destroy_aggregate_function(&mut func_mut);
-        // IDEMPOTENCY: a duplicate aggregate name (re-load) is skipped, not a
-        // hard error — the C API returns failure for an already-present name,
-        // which we treat as "already registered". See `register_scalars`.
-        if rc != ffi::DuckDBSuccess {
-            eprintln!("[ducklink] aggregate '{}' not registered (already present?)", f.name);
-            continue;
-        }
-        registered += 1;
+        registered += overloads_added;
     }
     Ok(registered)
 }
@@ -4800,7 +4893,11 @@ impl VTab for WasmModules {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind
+                .rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -4974,7 +5071,11 @@ impl VTab for WasmFunctions {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind
+                .rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -5069,7 +5170,11 @@ impl VTab for WasmHostCapabilities {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind
+                .rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -5440,7 +5545,10 @@ impl VTab for WasmDocs {
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
             let rows = &bind.docs.rows;
-            let n = rows.len().saturating_sub(start).min(2048);
+            let n = rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -5600,7 +5708,11 @@ impl VTab for WasmSearch {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind
+                .rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -5863,7 +5975,11 @@ impl VTab for WasmCache {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind
+                .rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -5942,7 +6058,11 @@ impl VTab for WasmEvents {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind
+                .rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -6142,7 +6262,11 @@ impl VTab for WasmModuleCompatibility {
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             let start = init.cursor.load(Ordering::Relaxed);
-            let n = bind.rows.len().saturating_sub(start).min(2048);
+            let n = bind
+                .rows
+                .len()
+                .saturating_sub(start)
+                .min(STANDARD_VECTOR_SIZE as usize);
             if n == 0 {
                 output.set_len(0);
                 return Ok(());
@@ -8624,20 +8748,28 @@ unsafe extern "C" fn ducklink_copy_from_bind(info: ffi::duckdb_bind_info) {
         });
     }
 
-    // Dispatch to the guest's `copy-from-bind` for the reader handle. The
-    // captured `target_columns` cannot cross the WIT boundary today —
-    // `copy-dispatch` (v4.0.0) has no target-schema arg on
-    // `copy-from-bind`, and the prep-agent-added runtime overload
-    // `copy_from_bind_with_target` accepts but does not forward it. When
-    // that WIT change lands, this call swaps to
-    // `dispatch_copy_from_bind_with_target(..., Some(&target_columns))`
-    // and the guest can prepare rows matching the target directly.
-    // Until then `target_columns` is used ONLY host-side: as col_codes for
-    // `func`'s writes (see above) and for the arity guard below.
-    let _ = &target_columns;
+    // Dispatch to the guest's `copy-from-bind` for the reader handle. T1-6:
+    // the copy-dispatch WIT now carries `target-columns` — lower the captured
+    // `target_columns` (Vec<WitColumndef>) into the neutral `reg::ColumnDef`
+    // shape the engine layer expects, then forward. The engine re-lowers to
+    // WIT at the wasmtime boundary. This mechanical conversion is intentionally
+    // minimal; the reg_duckdb consolidator will fold it into a single-pass
+    // build alongside col_codes / target_columns above.
+    let neutral_target_columns: Vec<ducklink_runtime::reg::ColumnDef> = target_columns
+        .iter()
+        .map(|c| ducklink_runtime::reg::ColumnDef {
+            name: c.name.clone(),
+            logical: crate::engine::wit_logicaltype_to_neutral(&c.logical),
+        })
+        .collect();
     let result = match extra_ref
         .engine
-        .dispatch_copy_from_bind(extra_ref.function_handle, &path, &options)
+        .dispatch_copy_from_bind(
+            extra_ref.function_handle,
+            &path,
+            &options,
+            neutral_target_columns,
+        )
     {
         Ok(r) => r,
         Err(e) => {
@@ -8711,7 +8843,6 @@ unsafe extern "C" fn ducklink_copy_from_function(
     // Mirror the ArrowShim clamp (see `func` in that VTab): DuckDB output
     // chunks allocate at most STANDARD_VECTOR_SIZE rows per column; a batch
     // beyond that is a guest protocol violation.
-    const STANDARD_VECTOR_SIZE: u32 = 2048;
     let rows = match state.engine.dispatch_copy_from_scan(
         state.callback_handle,
         state.reader,
@@ -8850,6 +8981,18 @@ pub unsafe fn register_copy_handlers(
             engine.clone(),
         );
         ffi::duckdb_copy_function_set_copy_from_function(cf, tf);
+        // P2 fix: `duckdb_copy_function_set_copy_from_function` value-copies
+        // the underlying `TableFunction` into the copy function's slot
+        // (upstream `copy_function-c.cpp:740` — `copy_function_ref.copy_from_function = tf;`
+        // invokes TableFunction's copy-constructor). The heap allocation
+        // returned by `duckdb_create_table_function` is NOT taken over.
+        // Free it now — leaking would strand the `CopyFromExtra` extra-info
+        // (and its cloned `Arc<Engine2>`) plus the TableFunction struct for
+        // the process lifetime. Note: the extra-info was already deep-copied
+        // by the set call's TableFunction copy-constructor into the slot
+        // held by the copy function, so its lifetime is not affected here.
+        let mut tf_mut = tf;
+        ffi::duckdb_destroy_table_function(&mut tf_mut);
 
         let rc = ffi::duckdb_register_copy_function(raw_con, cf);
         let mut cf_mut = cf;
@@ -8995,6 +9138,16 @@ struct ArrowShimInit {
 impl Drop for ArrowShimInit {
     fn drop(&mut self) {
         if let Some(c) = self.cursor.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            // P3 fix: wrap the guest dispatch in a QueryReentrancyGuard so a
+            // guest attempting `NativeServices::query()` from inside its own
+            // `arrow-close` refuses cleanly instead of deadlocking on the
+            // connection's read lock. Consistency with the sibling
+            // `copy_from_bind_state_destroy` path (whose destroy is invoked
+            // by DuckDB from the same execution contexts) — install even
+            // though the arrow shim's own bind/init/func are already guarded
+            // upstream, because drop can fire from a background finalizer
+            // path where no other guard is in scope.
+            let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
             if let Err(e) = self.engine.dispatch_arrow_close(self.callback_handle, c) {
                 eprintln!("[ducklink] arrow shim: dispatch_arrow_close failed: {e}");
             }
@@ -9089,12 +9242,12 @@ impl VTab for ArrowShim {
             // chunk allocates at most STANDARD_VECTOR_SIZE rows per column;
             // writing beyond that (or calling `set_len` past the capacity)
             // is UB. Peer table-fns in this file all clamp their batch to
-            // `.min(2048)`. Buffering the tail would require reshaping
-            // `ArrowShimInit` to hold a leftover; instead we treat a
-            // >2048-row batch as a guest protocol violation and surface a
-            // clear error so a well-behaved producer trims to 2048.
-            const STANDARD_VECTOR_SIZE: usize = 2048;
-            if rows.len() > STANDARD_VECTOR_SIZE {
+            // `.min(STANDARD_VECTOR_SIZE as usize)`. Buffering the tail
+            // would require reshaping `ArrowShimInit` to hold a leftover;
+            // instead we treat an oversized batch as a guest protocol
+            // violation and surface a clear error so a well-behaved
+            // producer trims to STANDARD_VECTOR_SIZE.
+            if rows.len() > STANDARD_VECTOR_SIZE as usize {
                 return Err(format!(
                     "arrow producer returned {} rows in a single batch, exceeds STANDARD_VECTOR_SIZE ({}). \
                      Producers must yield at most {} rows per `arrow-next` call.",
@@ -9360,10 +9513,85 @@ unsafe fn write_row_out(code: u8, out: ffi::duckdb_vector, row: usize, val: reg:
     }
 }
 
+/// Build one `duckdb_scalar_function` for a single `ScalarEx` overload,
+/// wiring the ex-flags (varargs / special-null / volatile) and the invoke
+/// callback + extra-info. The caller owns the returned handle. Returns
+/// `None` on interior NUL in the name (already logged).
+///
+/// # Safety
+/// FFI: constructs a DuckDB handle via `duckdb_create_scalar_function`.
+unsafe fn build_scalar_ex_function(
+    s: &ScalarEx,
+    engine: Arc<Engine2>,
+) -> Option<ffi::duckdb_scalar_function> {
+    let arg_codes: Vec<u8> = s.arguments.iter().map(|a| type_code(&a.logical)).collect();
+    let ret_code = type_code(&s.returns);
+    let cname = match CString::new(s.name.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[ducklink] scalar_ex '{}' has a NUL byte; skipping", s.name);
+            return None;
+        }
+    };
+    let func = ffi::duckdb_create_scalar_function();
+    ffi::duckdb_scalar_function_set_name(func, cname.as_ptr());
+    for &code in &arg_codes {
+        // T1-4: `logical_type_ffi` routes DECIMAL correctly.
+        let mut lt = logical_type_ffi(code);
+        ffi::duckdb_scalar_function_add_parameter(func, lt);
+        ffi::duckdb_destroy_logical_type(&mut lt);
+    }
+    let mut rlt = logical_type_ffi(ret_code);
+    ffi::duckdb_scalar_function_set_return_type(func, rlt);
+    ffi::duckdb_destroy_logical_type(&mut rlt);
+    // ---- the three ex flags (per-overload) ----
+    if let Some(v) = s.varargs.as_ref() {
+        let vcode = type_code(v);
+        let mut vlt = logical_type_ffi(vcode);
+        ffi::duckdb_scalar_function_set_varargs(func, vlt);
+        ffi::duckdb_destroy_logical_type(&mut vlt);
+    }
+    if s.special_null {
+        ffi::duckdb_scalar_function_set_special_handling(func);
+    }
+    // Gate VOLATILE on the per-function flag now that `ScalarEx` carries it —
+    // the runtime derives it from the register-scalar-ex attributes.
+    // Non-volatile scalar-ex skip the call entirely (immutable by default).
+    if s.volatile {
+        ffi::duckdb_scalar_function_set_volatile(func);
+    }
+    // ---- extra info + invoke callback ----
+    let extra = Box::into_raw(Box::new(ScalarExExtra {
+        callback_handle: s.callback_handle,
+        engine,
+        arg_codes,
+        ret_code,
+    })) as *mut c_void;
+    ffi::duckdb_scalar_function_set_extra_info(func, extra, Some(scalar_ex_extra_destroy));
+    ffi::duckdb_scalar_function_set_function(func, Some(ducklink_scalar_ex_invoke));
+    Some(func)
+}
+
 /// Register the ex-attributes for every scalar_ex on `raw_con`. Installs a
 /// C API-level scalar sibling with varargs / special-null / VOLATILE flags
 /// wired through the C API. The base scalar registration (name + core
 /// signature) is expected to have already run via `register_scalars`.
+///
+/// T2-6: overload sets landed on this raw-C-API path. Overloads within a
+/// single (extension, name) group install through
+/// `duckdb_create_scalar_function_set` + `duckdb_add_scalar_function_to_set`
+/// (per overload) + `duckdb_register_scalar_function_set`. Singletons keep
+/// the single-fn install path. See `register_aggregates` for the ownership
+/// argument that lets us destroy each per-overload handle immediately after
+/// adding it to the set (function_info shared_ptr keeps the extra-info
+/// alive with the set's copy).
+///
+/// Note: the base `register_scalars` path still routes through the duckdb-rs
+/// safe `VScalar` wrapper, which is single-overload and NOT migrated here —
+/// mixing the two APIs on the same connection under the same name is
+/// unsafe. In practice, overloaded ex-flagged scalars must all be declared
+/// via `register-scalar-ex`; the base overload skip in `register_scalars`
+/// remains the failure mode for the mixed path.
 pub unsafe fn register_scalar_ex(
     raw_con: ffi::duckdb_connection,
     engine: Arc<Engine2>,
@@ -9375,67 +9603,91 @@ pub unsafe fn register_scalar_ex(
     if raw_con.is_null() {
         return Err("register_scalar_ex: raw_con is null".to_string());
     }
+    use std::collections::HashMap;
+    let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for (i, s) in scalar_ex.iter().enumerate() {
+        let key = (s.extension.clone(), s.name.clone());
+        match index.get(&key) {
+            Some(&g) => groups[g].2.push(i),
+            None => {
+                index.insert(key.clone(), groups.len());
+                groups.push((key.0, key.1, vec![i]));
+            }
+        }
+    }
     let mut registered = 0usize;
-    for s in scalar_ex {
-        let arg_codes: Vec<u8> = s.arguments.iter().map(|a| type_code(&a.logical)).collect();
-        let ret_code = type_code(&s.returns);
-        let cname = match CString::new(s.name.as_str()) {
+    for (_ext, name, member_ixs) in &groups {
+        if member_ixs.len() == 1 {
+            let s = &scalar_ex[member_ixs[0]];
+            let func = match build_scalar_ex_function(s, engine.clone()) {
+                Some(func) => func,
+                None => continue,
+            };
+            let rc = ffi::duckdb_register_scalar_function(raw_con, func);
+            let mut func_mut = func;
+            ffi::duckdb_destroy_scalar_function(&mut func_mut);
+            if rc != ffi::DuckDBSuccess {
+                eprintln!(
+                    "[ducklink] scalar_ex '{}' not registered (already present?)",
+                    s.name
+                );
+                continue;
+            }
+            registered += 1;
+            continue;
+        }
+        // Overload-set path.
+        let set_name_c = match CString::new(name.as_str()) {
             Ok(c) => c,
             Err(_) => {
-                eprintln!("[ducklink] scalar_ex '{}' has a NUL byte; skipping", s.name);
+                eprintln!(
+                    "[ducklink] scalar_ex set '{name}' name contains NUL byte; skipping"
+                );
                 continue;
             }
         };
-        let func = ffi::duckdb_create_scalar_function();
-        ffi::duckdb_scalar_function_set_name(func, cname.as_ptr());
-        for &code in &arg_codes {
-            // T1-4: `logical_type_ffi` routes DECIMAL correctly.
-            let mut lt = logical_type_ffi(code);
-            ffi::duckdb_scalar_function_add_parameter(func, lt);
-            ffi::duckdb_destroy_logical_type(&mut lt);
+        let set = ffi::duckdb_create_scalar_function_set(set_name_c.as_ptr());
+        if set.is_null() {
+            eprintln!("[ducklink] scalar_ex set '{name}' could not be created");
+            continue;
         }
-        let mut rlt = logical_type_ffi(ret_code);
-        ffi::duckdb_scalar_function_set_return_type(func, rlt);
-        ffi::duckdb_destroy_logical_type(&mut rlt);
-        // ---- the three ex flags ----
-        if let Some(v) = s.varargs.as_ref() {
-            let vcode = type_code(v);
-            let mut vlt = logical_type_ffi(vcode);
-            ffi::duckdb_scalar_function_set_varargs(func, vlt);
-            ffi::duckdb_destroy_logical_type(&mut vlt);
+        let mut set_ok = true;
+        let mut overloads_added = 0usize;
+        for &ix in member_ixs {
+            let s = &scalar_ex[ix];
+            let func = match build_scalar_ex_function(s, engine.clone()) {
+                Some(func) => func,
+                None => continue,
+            };
+            let add_rc = ffi::duckdb_add_scalar_function_to_set(set, func);
+            let mut func_mut = func;
+            ffi::duckdb_destroy_scalar_function(&mut func_mut);
+            if add_rc != ffi::DuckDBSuccess {
+                eprintln!(
+                    "[ducklink] scalar_ex '{}' overload {} failed to join set",
+                    s.name, ix
+                );
+                set_ok = false;
+                break;
+            }
+            overloads_added += 1;
         }
-        if s.special_null {
-            ffi::duckdb_scalar_function_set_special_handling(func);
+        if !set_ok || overloads_added == 0 {
+            let mut set_mut = set;
+            ffi::duckdb_destroy_scalar_function_set(&mut set_mut);
+            continue;
         }
-        // Gate VOLATILE on the per-function flag now that `ScalarEx` carries
-        // it — the runtime derives it from the register-scalar-ex attributes.
-        // Non-volatile scalar-ex skip the call entirely (immutable by
-        // default), which closes the audit finding that treated every ex-path
-        // fn as VOLATILE unconditionally.
-        if s.volatile {
-            ffi::duckdb_scalar_function_set_volatile(func);
-        }
-        // ---- extra info + invoke callback ----
-        let extra = Box::into_raw(Box::new(ScalarExExtra {
-            callback_handle: s.callback_handle,
-            engine: engine.clone(),
-            arg_codes,
-            ret_code,
-        })) as *mut c_void;
-        ffi::duckdb_scalar_function_set_extra_info(func, extra, Some(scalar_ex_extra_destroy));
-        ffi::duckdb_scalar_function_set_function(func, Some(ducklink_scalar_ex_invoke));
-
-        let rc = ffi::duckdb_register_scalar_function(raw_con, func);
-        let mut func_mut = func;
-        ffi::duckdb_destroy_scalar_function(&mut func_mut);
+        let rc = ffi::duckdb_register_scalar_function_set(raw_con, set);
+        let mut set_mut = set;
+        ffi::duckdb_destroy_scalar_function_set(&mut set_mut);
         if rc != ffi::DuckDBSuccess {
             eprintln!(
-                "[ducklink] scalar_ex '{}' not registered (already present?)",
-                s.name
+                "[ducklink] scalar_ex set '{name}' not registered (already present?)"
             );
             continue;
         }
-        registered += 1;
+        registered += overloads_added;
     }
     Ok(registered)
 }
@@ -9510,6 +9762,24 @@ unsafe extern "C" fn ducklink_cast_invoke(
 ///     doesn't have a Hugeint arm, so we can't route through the bridge
 ///     without extending the whole logical-type set. Left as an unknown so
 ///     the warning fires with the concrete type name.
+///
+///     TODO(T2-1 residual, DEFERRED — bounded work item): add
+///     `LogicalType::Hugeint` + `Uhugeint` variants across the neutral
+///     logical-type set. Concretely this means: (1) two new arms in
+///     `reg::LogicalType` (runtime/src/lib.rs), (2) matching arms in
+///     `duckdb:extension/types.wit` `logicaltype` variant (both
+///     wit-canonical and wit/deps copies), (3) new bridge type codes
+///     (`T_HUGEINT` / `T_UHUGEINT`) plus writer/reader arms in every
+///     colvec encoder/decoder in reg_duckdb.rs (search for `T_DECIMAL`
+///     as the closest sibling — HUGEINT is DECIMAL's 128-bit backing
+///     store), (4) `neutral_to_wit_logicaltype` /
+///     `wit_logicaltype_to_neutral` / `convert_extension_logicaltype`
+///     arms across engine.rs + runtime, (5) `describe_runtime_logicaltype`.
+///     The audit flagged this as rippling through the whole neutral
+///     logical-type set — a `mix` of variants would be worse than none,
+///     so we choose (b) documented deferral over a partial (a). Route
+///     back through this docstring when landing.
+///
 ///   * ENUM by name: resolving requires cross-referencing
 ///     `register_enum_types` (which today has no queryable registry). Left
 ///     as an unknown so callers see the shortfall. TODO(T2-1 follow-up):
@@ -9583,17 +9853,29 @@ pub unsafe fn register_casts(
         ffi::duckdb_destroy_logical_type(&mut src_lt);
         ffi::duckdb_destroy_logical_type(&mut tgt_lt);
         // T2-4: DuckDB's cast planner uses this cost to pick between
-        // competing casts (lower = preferred; negative = explicit-only).
-        // Every ducklink-installed cast currently gets 100 (DuckDB's
-        // "default cost"), so a component that wants explicit-only or a
-        // preferred implicit cast has no way to say so. Exposing this
-        // requires an `implicit_cost: option<s32>` field on the
-        // `runtime.register-cast` WIT record (and a matching
-        // `implicit_cost: Option<i32>` on `CastReg` / `CastEntry`) — a
-        // small, additive WIT change that is out of scope for this pass
-        // per the "Do NOT touch WIT" guardrail. Follow-up: extend the WIT
-        // record, drain the value into `CastEntry`, and pass it here.
-        ffi::duckdb_cast_function_set_implicit_cast_cost(cf, 100);
+        // competing casts (lower = preferred). Wire the WIT-declared
+        // `implicit_cost` (now on CastEntry). The bindgen signature exposes
+        // the setter as `(duckdb_cast_function, cost: i64)`:
+        //   * None         — keep DuckDB's default (100).
+        //   * Some(v) v>=0 — call the setter with `v` as i64.
+        //   * Some(-1)     — SKIP the setter entirely. Per the task contract
+        //     this maps to "explicit-only" semantics: the cast is still
+        //     installed but never contributes to implicit-overload
+        //     resolution, so DuckDB's planner will only reach it via an
+        //     explicit CAST expression.
+        match c.implicit_cost {
+            None => {
+                ffi::duckdb_cast_function_set_implicit_cast_cost(cf, 100);
+            }
+            Some(v) if v >= 0 => {
+                ffi::duckdb_cast_function_set_implicit_cast_cost(cf, v as i64);
+            }
+            Some(_) => {
+                // Some(-1) or any other negative: explicit-only. Do not
+                // call the setter — leaves the cast unreachable via
+                // implicit overload resolution.
+            }
+        }
         ffi::duckdb_cast_function_set_function(cf, Some(ducklink_cast_invoke));
         let extra = Box::into_raw(Box::new(CastExtra {
             callback_handle: c.callback_handle,
@@ -9917,6 +10199,12 @@ struct LogStorageRegistration {
     callback_handle: u32,
     engine: Arc<Engine2>,
     name: String,
+    /// Owning extension. Used to purge stale entries when the same extension
+    /// re-registers the same log-storage name under a new `callback_handle`
+    /// (e.g. after a component reload). Without this key the old entry would
+    /// stay in the registry forever with a dangling engine and a
+    /// callback_handle no live component recognises.
+    extension: String,
 }
 
 /// Process-wide registry mirroring `REPLACEMENT_SCAN_REGISTRY`. Keyed by
@@ -10058,22 +10346,31 @@ pub unsafe fn register_log_storages(
         ffi::duckdb_log_storage_set_extra_data(ls, extra, Some(log_storage_extra_destroy));
         ffi::duckdb_log_storage_set_write_log_entry(ls, Some(ducklink_log_storage_write));
         // Publish (callback_handle -> engine) so the C callback can resolve
-        // its owning component. Idempotent on the callback_handle key so
-        // repeated LOADs of the same component don't stack duplicates.
+        // its owning component. Two dedupe axes:
+        //   * (extension, name) — P1 fix: purge any stale entries for the
+        //     same sink under this extension before appending. A component
+        //     reload assigns fresh `callback_handle`s, so keying only on
+        //     the handle (as before) leaked the previous registration and
+        //     its `Arc<Engine2>` for the process lifetime.
+        //   * callback_handle — repeated LOAD of the same component with
+        //     the same handle refreshes in place instead of stacking.
         {
             let reg = log_storage_registry();
             let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+            guard.retain(|r| !(r.extension == s.extension && r.name == s.name));
             if let Some(existing) = guard
                 .iter_mut()
                 .find(|r| r.callback_handle == s.callback_handle)
             {
                 existing.engine = engine.clone();
                 existing.name = s.name.clone();
+                existing.extension = s.extension.clone();
             } else {
                 guard.push(LogStorageRegistration {
                     callback_handle: s.callback_handle,
                     engine: engine.clone(),
                     name: s.name.clone(),
+                    extension: s.extension.clone(),
                 });
             }
         }
