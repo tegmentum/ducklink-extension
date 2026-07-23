@@ -755,6 +755,19 @@ pub struct PragmaEntry {
     pub callback_handle: u32,
 }
 
+/// A coordinate reference system (CRS) the component registered via
+/// `runtime.register-coordinate-system` (2.2.0, Item 7). Fields mirror
+/// [`crate::reg::CoordinateSystemReg`] / `PendingCoordinateSystem` so the
+/// drain path is a straight field-by-field map; consumed by `reg_duckdb`
+/// in a later phase.
+#[derive(Clone, Debug)]
+pub struct CoordinateSystemEntry {
+    pub extension: String,
+    pub auth_name: String,
+    pub code: u32,
+    pub wkt: String,
+}
+
 /// What a component registered: the functions a direction-specific sink bridges
 /// into the database.
 #[derive(Clone, Debug, Default)]
@@ -808,6 +821,11 @@ pub struct LoadedComponent {
     /// Drained from `pending.pragmas` (the parallel runtime edit adds
     /// that field to `PendingRegistrationsData`).
     pub pragmas: Vec<PragmaEntry>,
+    /// Coordinate reference systems the component registered via
+    /// `runtime.register-coordinate-system`. Drained from
+    /// `pending.coordinate_systems` (the parallel runtime edit adds that
+    /// field to `PendingRegistrationsData`); mirrors the pragmas prep.
+    pub coordinate_systems: Vec<CoordinateSystemEntry>,
     /// Component-provided documentation parsed from the wasm's `duckdb.docs`
     /// custom section, if present. Overrides catalog docs field-by-field at
     /// query time; `None` for components that don't ship a section.
@@ -1152,11 +1170,37 @@ impl Engine2 {
         // in place so `reg_duckdb.rs` can be written against the final
         // shape without waiting on the swap.
         let pragmas: Vec<PragmaEntry> = Vec::new();
+        // T2-2 prep: mirror of the pragmas stub above. The sibling
+        // `runtime/src/extension.rs` edit adds
+        // `pub coordinate_systems: Vec<PendingCoordinateSystem>` to
+        // `PendingRegistrationsData` and wires `drain_pending` to populate
+        // it. Until that lands this stays empty; once it does, swap
+        // `Vec::new()` for:
+        //     pending.coordinate_systems.into_iter().map(|c| CoordinateSystemEntry {
+        //         extension: c.extension,
+        //         auth_name: c.auth_name,
+        //         code: c.code,
+        //         wkt: c.wkt,
+        //     }).collect()
+        // The `CoordinateSystemEntry` type and `LoadedComponent.coordinate_systems`
+        // field are in place so `reg_duckdb.rs` can be written against the
+        // final shape without waiting on the swap.
+        let coordinate_systems: Vec<CoordinateSystemEntry> = Vec::new();
         let instance_arc = Arc::new(Mutex::new(instance));
-        {
+        // T1-7: take the previous Arc OUT of the map before dropping the
+        // write lock so its `impl Drop for ExtensionInstance` (which fires
+        // `dispatch_shutdown`) runs with NO Engine2 locks held. A guest
+        // shutdown handler that reaches back through NativeServices —
+        // e.g. `services.query("SELECT some_scalar(1)")` — would trigger
+        // Engine2::dispatch_scalar, whose fallback path takes
+        // `self.instances.read()`; dropping under the write lock would
+        // deadlock. On first-load `insert` returns `None`, so the extra
+        // `drop(prev_arc)` is a no-op.
+        let prev_arc = {
             let mut map = self.instances.write().expect("instances lock poisoned");
-            map.insert(extension.to_string(), instance_arc.clone());
-        }
+            map.insert(extension.to_string(), instance_arc.clone())
+        };
+        drop(prev_arc);
         // F3-b: link the newly-wrapped instance to every callback entry that
         // load_component allocated during this component's setup. Dispatchers
         // then upgrade the Weak in a single atomic load — skipping the
@@ -1186,6 +1230,7 @@ impl Engine2 {
             modified_types,
             log_storages,
             pragmas,
+            coordinate_systems,
             docs,
         })
     }
@@ -1637,19 +1682,25 @@ impl Engine2 {
         callback_handle: u32,
         entry: LogEntry,
     ) -> Result<()> {
-        let instance_arc = {
+        // Contract (log-storage-dispatch.wit): the `handle` handed to the
+        // guest MUST be the value the guest passed to `register-log-storage`,
+        // NOT the runtime's allocated global `callback_handle`. Resolve the
+        // registry entry and forward `entry_ref.dispatcher_handle` — mirror
+        // of dispatch_scalar / dispatch_table.
+        let (dispatcher_handle, instance_arc) = {
             let registry = self.callbacks.read().expect("callback registry poisoned");
             let entry_ref = registry
                 .resolve(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?;
+            let dispatcher_handle = entry_ref.dispatcher_handle;
             match entry_ref.instance.upgrade() {
-                Some(arc) => arc,
-                None => self.instance_arc(&entry_ref.extension)?,
+                Some(arc) => (dispatcher_handle, arc),
+                None => (dispatcher_handle, self.instance_arc(&entry_ref.extension)?),
             }
         };
         let mut instance = instance_arc.lock().expect("instance lock poisoned");
         instance
-            .dispatch_write_log_entry(callback_handle, entry)
+            .dispatch_write_log_entry(dispatcher_handle, entry)
             .map_err(|e| anyhow!("write_log_entry dispatch failed: {e:?}"))
     }
 

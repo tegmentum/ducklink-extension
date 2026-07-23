@@ -410,6 +410,16 @@ pub struct PendingRegistrationsData {
     /// impl and take/drain wiring for pushes into this buffer land in a
     /// sibling phase; the field is added here so the drain path is ready.
     pub log_storages: Vec<PendingLogStorage>,
+    /// Coordinate reference systems captured by `HostCoordSystemRegistry`.
+    ///
+    /// Downstream consumer contract: the .duckdb_extension shim / reg_duckdb
+    /// sink is responsible for deciding what to do with these SRID entries.
+    /// DuckDB core exposes no first-class CRS registration API, so today the
+    /// expected behavior is either (a) fail-loud so operators notice the
+    /// unimplemented path, or (b) observe/log for diagnostics. What we
+    /// guarantee here is that the entries no longer silently vanish between
+    /// `register_coordinate_system` and `drain_pending`.
+    pub coordinate_systems: Vec<PendingCoordinateSystem>,
 }
 
 impl PendingRegistrationsData {
@@ -432,6 +442,8 @@ impl PendingRegistrationsData {
         self.enum_types.append(&mut other.enum_types);
         self.modified_types.append(&mut other.modified_types);
         self.log_storages.append(&mut other.log_storages);
+        self.coordinate_systems
+            .append(&mut other.coordinate_systems);
     }
 }
 
@@ -749,6 +761,7 @@ impl ExtensionStoreState {
         let enum_types = self.take_pending_enum_types();
         let modified_types = self.take_pending_modified_types();
         let log_storages = self.take_pending_log_storages();
+        let coordinate_systems = self.take_pending_coordinate_systems();
         let pending = PendingRegistrationsData {
             scalars,
             tables,
@@ -767,6 +780,7 @@ impl ExtensionStoreState {
             enum_types,
             modified_types,
             log_storages,
+            coordinate_systems,
         };
         let scalar_names =
             summarize_registration_names(&pending.scalars, |entry| entry.name.as_str());
@@ -854,11 +868,31 @@ impl extension_runtime::Host for ExtensionStoreState {
                     wasmtime::component::Resource::new_own(id),
                 ))
             }
-            _ => None,
+            // `HostMacroRegistry::register_scalar` today returns Unsupported
+            // (see impl above), so handing back a Macro capability would let
+            // the guest hold a registry it cannot usefully call. The real
+            // registration path is `catalog.register-macro`; use that instead
+            // of the capability route. Kept as an explicit arm (rather than
+            // falling through to `_ => None`) so a future implementation is
+            // one edit away and the intent is legible.
+            extension_runtime::Capabilitykind::Macro => None,
+            // No `Capability::Catalog` variant exists in the runtime.wit
+            // `capability` union — catalog operations flow directly through
+            // the `catalog` interface (register-macro, register-table, ...)
+            // rather than being handed out here.
+            extension_runtime::Capabilitykind::Catalog => None,
+            // No `Capability::FileFormat` variant exists in the runtime.wit
+            // `capability` union — file-format registration flows through
+            // `files.register-copy-handler` + `copy-dispatch`. Explicit arm
+            // to document the omission, not silent `_ => None`.
+            extension_runtime::Capabilitykind::FileFormat => None,
         }
     }
 
     fn list_capabilities(&mut self) -> BindgenVec<extension_runtime::Capabilitykind> {
+        // Kinds we actively hand back a `Capability` for. Macro/Catalog/
+        // FileFormat are intentionally omitted: see the matching arms in
+        // `get_capability` above for why each returns None today.
         vec![
             extension_runtime::Capabilitykind::Scalar,
             extension_runtime::Capabilitykind::Table,
@@ -2852,6 +2886,32 @@ impl ExtensionInstance {
         path: &str,
         options: &[(String, String)],
     ) -> Result<CopyFromBindResult, extension_types::Duckerror> {
+        self.copy_from_bind_with_target(handle, path, options, None)
+    }
+
+    /// COPY FROM: bind a reader for `path`, additionally supplying the
+    /// destination table's target column schema (from e.g. `INSERT INTO t(a,b)
+    /// FROM COPY ...`).
+    ///
+    /// The runtime accepts and marshals `target_columns` so callers (dispatch
+    /// layer, planners) can pass it in one place, but it is intentionally NOT
+    /// forwarded to the guest today: the current `copy-dispatch` WIT (v4.0.0)
+    /// does not accept a target-schema arg, and adding one is a breaking
+    /// change to every registered COPY-capable component.
+    ///
+    /// TODO(T1-6): promote `target_columns` into copy-dispatch.wit
+    /// `copy-from-bind` (as `target-schema: option<list<columndef>>`) on the
+    /// next major bump so guests can project/cast to the destination schema
+    /// instead of the host coercing after the fact.
+    pub fn copy_from_bind_with_target(
+        &mut self,
+        handle: u32,
+        path: &str,
+        options: &[(String, String)],
+        target_columns: Option<&[extension_types::Columndef]>,
+    ) -> Result<CopyFromBindResult, extension_types::Duckerror> {
+        // Intentionally unused until WIT breaking change (see TODO above).
+        let _ = target_columns;
         self.copy_bindings()?;
         let bindings = self.copy_bindings.as_ref().unwrap();
         let guest = bindings.duckdb_extension_copy_dispatch();

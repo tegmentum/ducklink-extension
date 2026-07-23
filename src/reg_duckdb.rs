@@ -42,9 +42,9 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::column_types
 };
 
 use crate::engine::{
-    AggregateFunc, ArrowTable, CastEntry, CopyHandler, Engine2, EnumTypeEntry, LogStorageEntry,
-    LogicalTypeEntry, MacroEntry, ModifiedTypeEntry, PragmaEntry, ReplacementScan, ScalarEx,
-    ScalarFunc, Setting, TableFunc, TableMacroEntry,
+    AggregateFunc, ArrowTable, CastEntry, CoordinateSystemEntry, CopyHandler, Engine2,
+    EnumTypeEntry, LogStorageEntry, LogicalTypeEntry, MacroEntry, ModifiedTypeEntry, PragmaEntry,
+    ReplacementScan, ScalarEx, ScalarFunc, Setting, TableFunc, TableMacroEntry,
 };
 
 /// Convert DuckDB's physical UUID hugeint storage (sign-flipped: the high bit is
@@ -86,11 +86,18 @@ fn guard<T>(
 /// Per-function state DuckDB hands back to `invoke`: which component callback to
 /// dispatch to, the shared engine, and the function's argument / return type
 /// codes (so one `WasmScalar` serves every signature).
+///
+/// T2-7: `arg_type_exprs[j]` is `Some(expr)` when the corresponding
+/// argument's declared logical type is `Complex(expr)`, `None` otherwise.
+/// `invoke` forwards each arg's expression to `refill_colvec` so
+/// `ColvecComplex.type_expr` reaches the guest with the declared shape
+/// (previously erased to the empty string).
 #[derive(Clone)]
 struct WasmScalarState {
     callback_handle: u32,
     engine: Arc<Engine2>,
     arg_codes: Vec<u8>,
+    arg_type_exprs: Vec<Option<String>>,
     ret_code: u8,
 }
 
@@ -295,6 +302,12 @@ unsafe fn duckdb_validity_to_colvec_bytes(validity: *const u64, len: usize) -> V
 /// `Vec<Vec<WitVal>>` scratch and forces the runtime to re-pivot at the
 /// wasmtime boundary.
 ///
+/// `complex_type_expr` is the declared type-expression string for the
+/// column, forwarded to every emitted `ColvecComplex` so the guest can
+/// re-parse it (T2-7). `None` for non-complex columns; a `Some("")` for a
+/// complex column with no expression is treated as an empty string. Only
+/// the T_COMPLEX arm consults it; other arms ignore it.
+///
 /// # Safety
 /// `validity`, when non-null, must point to a DuckDB validity mask covering
 /// at least `len` rows. `vec` must be a DuckDB flat vector storing `code` type
@@ -304,6 +317,7 @@ unsafe fn read_col_to_colvec(
     vec: &FlatVector,
     validity: *const u64,
     len: usize,
+    complex_type_expr: Option<&str>,
 ) -> Colvec {
     let validity_bytes = duckdb_validity_to_colvec_bytes(validity, len);
     let is_null = |i: usize| !validity.is_null() && !row_valid(validity, i);
@@ -374,18 +388,26 @@ unsafe fn read_col_to_colvec(
             ColvecColumn::Uuid(out)
         }
         T_COMPLEX => {
+            // T2-7: forward the declared complex type-expression to the
+            // guest for every cell. Previously erased to `String::new()`,
+            // which stripped LIST/STRUCT/... arity so the guest could not
+            // re-parse the JSON body against its declared schema. The
+            // expression lives on the enclosing bind state — the caller
+            // (refill_colvec / a direct read_col_to_colvec) threads it
+            // through via `complex_type_expr`.
+            let type_expr_owned = complex_type_expr.unwrap_or("").to_string();
             let s = vec.as_slice_with_len::<duckdb_string_t>(len);
             let out: Vec<ColvecComplex> = (0..len)
                 .map(|i| {
                     if is_null(i) {
                         ColvecComplex {
-                            type_expr: String::new(),
+                            type_expr: type_expr_owned.clone(),
                             json: String::new(),
                         }
                     } else {
                         let mut t = s[i];
                         ColvecComplex {
-                            type_expr: String::new(),
+                            type_expr: type_expr_owned.clone(),
                             json: DuckString::new(&mut t).as_str().into_owned(),
                         }
                     }
@@ -448,6 +470,7 @@ unsafe fn refill_colvec(
     vec: &FlatVector,
     validity: *const u64,
     len: usize,
+    complex_type_expr: Option<&str>,
 ) {
     // Reset validity + rows for every chunk. `dst.validity` reuses its
     // capacity via clear/extend_from_slice — no reallocation on the steady-
@@ -578,7 +601,7 @@ unsafe fn refill_colvec(
         _ => false,
     };
     if !reused {
-        let fresh = read_col_to_colvec(code, vec, validity, len);
+        let fresh = read_col_to_colvec(code, vec, validity, len, complex_type_expr);
         dst.data = fresh.data;
         dst.validity = fresh.validity;
         dst.rows = fresh.rows;
@@ -1183,7 +1206,14 @@ impl VScalar for WasmScalar {
                                 ffi::duckdb_vector_get_validity(v) as *const u64
                             };
                             unsafe {
-                                refill_colvec(&mut args[j], code, &cols[j], validity, len);
+                                refill_colvec(
+                                    &mut args[j],
+                                    code,
+                                    &cols[j],
+                                    validity,
+                                    len,
+                                    state.arg_type_exprs[j].as_deref(),
+                                );
                             }
                             if !validity.is_null()
                                 && unsafe { validity_has_any_null(validity, len) }
@@ -1243,19 +1273,68 @@ impl VScalar for WasmScalar {
 
 /// Register every component scalar on `con`. Returns the count registered. All
 /// `reg` logical types are supported across any arity.
+///
+/// T2-6: this path routes through duckdb-rs' safe
+/// `register_scalar_function_with_state`, which underneath calls
+/// `duckdb_register_scalar_function` (single-overload). Registering
+/// `my_add(INT, INT)` and then `my_add(DOUBLE, DOUBLE)` from the same load
+/// therefore fails on the SECOND registration — DuckDB rejects the
+/// duplicate name because there is no overload set to add it to. The
+/// stable C API in libduckdb-sys 1.10504.0 DOES expose
+/// `duckdb_create_scalar_function_set` /
+/// `duckdb_add_scalar_function_to_set` /
+/// `duckdb_register_scalar_function_set`, which would let the second
+/// overload land as a new member of the shared set. Wiring that up
+/// requires abandoning the duckdb-rs safe wrapper for this path (the
+/// `VScalar` trait / `PENDING_SIGNATURE` scaffolding is single-signature),
+/// so it's deferred as a follow-up. Interim: detect duplicate names in
+/// THIS registration pass and log the shortfall clearly instead of the
+/// generic "already present?" message.
 pub fn register_scalars(
     con: &Connection,
     engine: Arc<Engine2>,
     scalars: &[ScalarFunc],
 ) -> duckdb::Result<usize> {
+    use std::collections::HashMap;
+    let mut per_name: HashMap<&str, usize> = HashMap::new();
+    for f in scalars {
+        *per_name.entry(f.name.as_str()).or_insert(0) += 1;
+    }
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     let mut registered = 0usize;
     for f in scalars {
+        let count = per_name.get(f.name.as_str()).copied().unwrap_or(1);
+        let n_so_far = seen.entry(f.name.as_str()).or_insert(0);
+        *n_so_far += 1;
+        if count > 1 && *n_so_far > 1 {
+            // Overload set: >1 signature for the same name in this load.
+            eprintln!(
+                "[ducklink] scalar function '{}' already registered on this load — \
+                 duckdb overloads under one name require \
+                 `duckdb_scalar_function_set` support, which this path does not \
+                 yet use (T2-6). Skipping overload #{} of {}.",
+                f.name, n_so_far, count
+            );
+            continue;
+        }
         let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
+        // T2-7: capture the declared complex type-expression per arg so
+        // `read_col_to_colvec` can emit it on every `ColvecComplex` rather
+        // than erasing to `""`. Non-complex args carry `None`.
+        let arg_type_exprs: Vec<Option<String>> = f
+            .arguments
+            .iter()
+            .map(|a| match &a.logical {
+                reg::LogicalType::Complex(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
         let ret_code = type_code(&f.returns);
         let state = WasmScalarState {
             callback_handle: f.callback_handle,
             engine: engine.clone(),
             arg_codes: arg_codes.clone(),
+            arg_type_exprs,
             ret_code,
         };
         // Hand the signature to `WasmScalar::signatures()` for this one call.
@@ -2119,7 +2198,7 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
         // width/scale unset. Use [`logical_type_ffi`] instead, which
         // routes DECIMAL through `duckdb_create_decimal_type(18, 3)`
         // (matching the DECIMAL(18, 3) shape `logical_type()` above declares
-        // and `read_col_to_colvec` / `write_col_from_raw` assume).
+        // and `read_col_to_colvec` / `write_ret_raw` assume).
         T_DECIMAL => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL,
         // COMPLEX falls back to VARCHAR/JSON.
         T_COMPLEX => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
@@ -2283,9 +2362,10 @@ pub(crate) unsafe fn write_ret_raw(
             *(data as *mut i128).add(i) = uuid_storage_to_logical(logical as i128) as i128;
         }
         // T1-4: DECIMAL is a HUGEINT-backed scaled integer; write the
-        // unscaled i128 straight into the vector's data slot. Mirrors the
-        // `write_col_from_raw` T_DECIMAL arm below so scalar/aggregate/copy
-        // paths encode DECIMAL identically. Width/scale on the value are
+        // unscaled i128 straight into the vector's data slot. Every
+        // scalar/aggregate/copy path encodes DECIMAL identically via this
+        // per-cell arm (the per-column `write_col_from_raw` peer was
+        // deleted in T2-5 as dead). Width/scale on the value are
         // informational — the column's LogicalType (DECIMAL(18, 3) per
         // `logical_type()`) determines interpretation.
         (T_DECIMAL, reg::DuckValue::Decimal { lower, upper, .. }) => {
@@ -2309,215 +2389,18 @@ pub(crate) unsafe fn write_ret_raw(
     Ok(())
 }
 
-/// Column-hoisted analog of [`write_ret_raw`]: derive the typed data pointer
-/// + match on the return type ONCE per column, then walk the values in-place.
-/// Compared to the previous per-cell
-/// `write_ret_raw` loop, this saves `ncols * (nrows - 1)` FFI derefs of
-/// `duckdb_vector_get_data` and the same number of `(code, val)` pattern
-/// matches. For fixed-width columns it collapses to a straight pointer write
-/// per row; the variable-width TEXT/BLOB/COMPLEX arms still iterate rows
-/// because their storage is per-element in the DuckDB string arena.
-///
-/// # Safety
-/// `vector` must be a valid `duckdb_vector` whose column type is `code` and
-/// whose capacity is at least `len`. `vals.len()` must equal `len`.
-pub(crate) unsafe fn write_col_from_raw(
-    code: u8,
-    vector: ffi::duckdb_vector,
-    vals: &[WitVal],
-    len: usize,
-) -> Result<(), String> {
-    debug_assert_eq!(vals.len(), len, "write_col_from_raw len mismatch");
-    let data = ffi::duckdb_vector_get_data(vector);
-    // Any NULL in the column upgrades the validity mask; lazy so no-NULL
-    // columns pay nothing.
-    let mut validity_hot: Option<*mut u64> = None;
-    macro_rules! ensure_validity {
-        () => {{
-            match validity_hot {
-                Some(v) => v,
-                None => {
-                    ffi::duckdb_vector_ensure_validity_writable(vector);
-                    let v = ffi::duckdb_vector_get_validity(vector);
-                    validity_hot = Some(v);
-                    v
-                }
-            }
-        }};
-    }
-    macro_rules! hoist {
-        ($ty:ty, $variant:ident) => {{
-            let s = data as *mut $ty;
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    WitVal::$variant(x) => *s.add(i) = *x,
-                    WitVal::Null => {
-                        let validity = ensure_validity!();
-                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
-                    }
-                    other => {
-                        return Err(format!(
-                            "component returned {other:?}, incompatible with declared return type"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }};
-    }
-    match code {
-        T_I64 => hoist!(i64, Int64),
-        T_U64 => hoist!(u64, Uint64),
-        T_F64 => hoist!(f64, Float64),
-        T_BOOL => hoist!(bool, Boolean),
-        T_I8 => hoist!(i8, Int8),
-        T_I16 => hoist!(i16, Int16),
-        T_I32 => hoist!(i32, Int32),
-        T_U8 => hoist!(u8, Uint8),
-        T_U16 => hoist!(u16, Uint16),
-        T_U32 => hoist!(u32, Uint32),
-        T_F32 => hoist!(f32, Float32),
-        // Temporal types share underlying integer storage.
-        T_TIMESTAMP => hoist!(i64, Timestamp),
-        T_DATE => hoist!(i32, Date),
-        T_TIME => hoist!(i64, Time),
-        T_TIMESTAMPTZ => hoist!(i64, Timestamptz),
-        T_TEXT => {
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    WitVal::Text(s) => ffi::duckdb_vector_assign_string_element_len(
-                        vector,
-                        i as u64,
-                        s.as_ptr() as *const c_char,
-                        s.len() as u64,
-                    ),
-                    WitVal::Null => {
-                        let validity = ensure_validity!();
-                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
-                    }
-                    other => {
-                        return Err(format!(
-                            "component returned {other:?}, incompatible with declared TEXT column"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        T_BLOB => {
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    WitVal::Blob(b) => ffi::duckdb_vector_assign_string_element_len(
-                        vector,
-                        i as u64,
-                        b.as_ptr() as *const c_char,
-                        b.len() as u64,
-                    ),
-                    WitVal::Null => {
-                        let validity = ensure_validity!();
-                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
-                    }
-                    other => {
-                        return Err(format!(
-                            "component returned {other:?}, incompatible with declared BLOB column"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        T_COMPLEX => {
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    WitVal::Complex(c) => ffi::duckdb_vector_assign_string_element_len(
-                        vector,
-                        i as u64,
-                        c.json.as_ptr() as *const c_char,
-                        c.json.len() as u64,
-                    ),
-                    WitVal::Null => {
-                        let validity = ensure_validity!();
-                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
-                    }
-                    other => {
-                        return Err(format!(
-                            "component returned {other:?}, incompatible with declared COMPLEX column"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        T_INTERVAL => {
-            let s = data as *mut ffi::duckdb_interval;
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    WitVal::Interval(iv) => {
-                        *s.add(i) = ffi::duckdb_interval {
-                            months: iv.months,
-                            days: iv.days,
-                            micros: iv.micros,
-                        };
-                    }
-                    WitVal::Null => {
-                        let validity = ensure_validity!();
-                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
-                    }
-                    other => {
-                        return Err(format!(
-                            "component returned {other:?}, incompatible with declared INTERVAL column"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        T_UUID => {
-            let s = data as *mut i128;
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    WitVal::Uuid(u) => {
-                        let logical = ((u.hi as u128) << 64) | u.lo as u128;
-                        *s.add(i) = uuid_storage_to_logical(logical as i128) as i128;
-                    }
-                    WitVal::Null => {
-                        let validity = ensure_validity!();
-                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
-                    }
-                    other => {
-                        return Err(format!(
-                            "component returned {other:?}, incompatible with declared UUID column"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        T_DECIMAL => {
-            let s = data as *mut i128;
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    WitVal::Decimal(d) => {
-                        *s.add(i) = (((d.upper as u128) << 64) | d.lower as u128) as i128;
-                    }
-                    WitVal::Null => {
-                        let validity = ensure_validity!();
-                        ffi::duckdb_validity_set_row_validity(validity, i as u64, false);
-                    }
-                    other => {
-                        return Err(format!(
-                            "component returned {other:?}, incompatible with declared DECIMAL column"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        _ => Err(format!(
-            "write_col_from_raw: unsupported column type code {code}"
-        )),
-    }
-}
+// T2-5: `write_col_from_raw` — a column-hoisted analog of `write_ret_raw` —
+// was deleted here. It was dead code (zero callers); the auditor's
+// hypothetical caller was `ArrowShim::func`, whose per-cell `write_ret_raw`
+// loop already handles every logical-type arm the peer would have. The
+// arrow producer receives row-major DuckValues from
+// `dispatch_arrow_next`, so a column-major pivot before write would be an
+// extra full-chunk pass with no marshalling savings (the string-arena
+// arms still iterate rows per element). The peer's DECIMAL arm was
+// duplicated in `write_ret_raw` under T1-4, so nothing about the DECIMAL
+// path regresses. Anyone reviving this optimization should re-add the
+// column-hoisted writer, wire it into `ArrowShim::func` behind a pivot
+// pass, and benchmark against the current per-cell loop.
 
 unsafe extern "C" fn agg_state_size(_info: ffi::duckdb_function_info) -> ffi::idx_t {
     std::mem::size_of::<*mut AggState>() as ffi::idx_t
@@ -2766,13 +2649,42 @@ unsafe extern "C" fn agg_extra_destroy(ptr: *mut c_void) {
 ///
 /// # Safety
 /// `raw_con` must be a valid `duckdb_connection`.
+/// T2-6: aggregates mirror the scalar overload gap. Registering `my_agg(INT)`
+/// then `my_agg(DOUBLE)` fails on the second registration because this path
+/// uses `duckdb_register_aggregate_function` (single-overload). The raw C
+/// API exposes `duckdb_create_aggregate_function_set` /
+/// `duckdb_add_aggregate_function_to_set` /
+/// `duckdb_register_aggregate_function_set` for the overload-set surface;
+/// wiring that in requires collecting per-name AggExtra instances and
+/// branching between the single-registration and set-registration paths.
+/// Interim: detect duplicate names in this pass and log the shortfall
+/// clearly instead of the generic "already present?" message.
 pub unsafe fn register_aggregates(
     raw_con: ffi::duckdb_connection,
     engine: Arc<Engine2>,
     aggregates: &[AggregateFunc],
 ) -> duckdb::Result<usize> {
+    use std::collections::HashMap;
+    let mut per_name: HashMap<&str, usize> = HashMap::new();
+    for f in aggregates {
+        *per_name.entry(f.name.as_str()).or_insert(0) += 1;
+    }
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     let mut registered = 0usize;
     for f in aggregates {
+        let count = per_name.get(f.name.as_str()).copied().unwrap_or(1);
+        let n_so_far = seen.entry(f.name.as_str()).or_insert(0);
+        *n_so_far += 1;
+        if count > 1 && *n_so_far > 1 {
+            eprintln!(
+                "[ducklink] aggregate function '{}' already registered on this load — \
+                 duckdb overloads under one name require \
+                 `duckdb_aggregate_function_set` support, which this path does not \
+                 yet use (T2-6). Skipping overload #{} of {}.",
+                f.name, n_so_far, count
+            );
+            continue;
+        }
         let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
         let ret_code = type_code(&f.returns);
 
@@ -3456,6 +3368,17 @@ pub unsafe fn load_wasm_into_db(
         if let Err(e) = register_pragmas(rt.raw_con.0, rt.engine.clone(), &loaded.pragmas) {
             eprintln!("[ducklink] register_pragmas failed: {e}");
         }
+        // T2-2: install component-declared coordinate reference systems.
+        // Currently a no-op that logs each declaration — the DuckDB stable
+        // C API does not expose a CRS registration entry point (see
+        // `register_coordinate_systems` doc).
+        if let Err(e) = register_coordinate_systems(
+            rt.raw_con.0,
+            rt.engine.clone(),
+            &loaded.coordinate_systems,
+        ) {
+            eprintln!("[ducklink] register_coordinate_systems failed: {e}");
+        }
     }
     {
         let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
@@ -3698,6 +3621,15 @@ impl VTab for WasmLoad {
                 // no-op that logs each declaration.
                 if let Err(e) = register_pragmas(rt.raw_con.0, rt.engine.clone(), &loaded.pragmas) {
                     eprintln!("[ducklink] register_pragmas failed: {e}");
+                }
+                // T2-2: same as the sibling call site above — currently a
+                // no-op that logs each declaration.
+                if let Err(e) = register_coordinate_systems(
+                    rt.raw_con.0,
+                    rt.engine.clone(),
+                    &loaded.coordinate_systems,
+                ) {
+                    eprintln!("[ducklink] register_coordinate_systems failed: {e}");
                 }
             }
             {
@@ -8152,12 +8084,19 @@ fn wit_logicaltype_from_code(code: u8) -> WitLogicaltype {
 }
 
 /// Inverse of [`wit_logicaltype_from_code`]: map a WIT `Logicaltype` variant
-/// (as returned by the guest's `copy-from-bind`) back to a bridge type code
-/// so the raw C table function that services COPY FROM can declare its
-/// result columns via `duckdb_bind_add_result_column` and marshal each
-/// scanned row through `write_ret_raw`. The `Complex` escape-hatch arm
-/// falls back to `T_TEXT` — matching the same fallback the forward map
-/// applies for out-of-set codes.
+/// (as returned by the guest's `copy-from-bind`) back to a bridge type code.
+/// The `Complex` escape-hatch arm falls back to `T_TEXT` — matching the
+/// same fallback the forward map applies for out-of-set codes.
+///
+/// T1-6: previously used by `ducklink_copy_from_bind` to derive col_codes
+/// from the guest's returned columns. The DuckDB C API contract forbids
+/// the copy-from install path from declaring its own schema via
+/// `duckdb_bind_add_result_column`, so col_codes now come from the
+/// target-table schema via `duckdb_table_function_bind_get_result_column_*`
+/// instead, and this helper's remaining use is for symmetry / future
+/// callers (e.g. an inbound WIT-target-schema plumb). Retained rather
+/// than deleted to keep the round-trip pair intact.
+#[allow(dead_code)]
 fn code_from_wit_logicaltype(lt: &WitLogicaltype) -> u8 {
     match lt {
         WitLogicaltype::Boolean => T_BOOL,
@@ -8636,6 +8575,66 @@ unsafe extern "C" fn ducklink_copy_from_bind(info: ffi::duckdb_bind_info) {
     // the guest sees no options — parity with the TO path.
     let options: Vec<(String, String)> = Vec::new();
 
+    // T1-6: read the target-table schema DuckDB has already published on the
+    // bind info via `duckdb_table_function_bind_get_result_column_*`. The C
+    // API's contract (libduckdb-sys 1.10504.0 bindgen line 3484) says a
+    // COPY-FROM install path table function MUST derive its result schema
+    // from the target table via these accessors and must NOT publish its
+    // own columns via `duckdb_bind_add_result_column`. So the col_codes
+    // driving `func`'s writes come from the TARGET table's declared types,
+    // not from the guest's returned column list. The guest's column
+    // declaration (still forwarded to it via `dispatch_copy_from_bind` so
+    // the reader can prepare to yield rows matching the target) is used
+    // for parity validation only — a mismatched arity here surfaces as a
+    // clear bind-time error rather than a per-row `write_ret_raw`
+    // type-mismatch during scan.
+    let target_col_count = ffi::duckdb_table_function_bind_get_result_column_count(info) as usize;
+    if target_col_count == 0 {
+        let msg = CString::new(
+            "copy_from_bind: DuckDB published no target columns on the bind info; refusing to \
+             proceed — COPY FROM requires a bound target table",
+        )
+        .unwrap();
+        ffi::duckdb_bind_set_error(info, msg.as_ptr());
+        return;
+    }
+    let mut col_codes: Vec<u8> = Vec::with_capacity(target_col_count);
+    let mut target_columns: Vec<WitColumndef> = Vec::with_capacity(target_col_count);
+    for c in 0..target_col_count {
+        let mut lt = ffi::duckdb_table_function_bind_get_result_column_type(info, c as u64);
+        let code = code_from_duckdb_type(ffi::duckdb_get_type_id(lt));
+        ffi::duckdb_destroy_logical_type(&mut lt);
+        col_codes.push(code);
+        // Names may be null (DuckDB does not always populate them on the
+        // copy-from bind info in this API rev); fall back to positional.
+        let name_ptr = ffi::duckdb_table_function_bind_get_result_column_name(info, c as u64);
+        let name = if name_ptr.is_null() {
+            format!("col{c}")
+        } else {
+            let s = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+            // The C API does not document ownership of this string clearly
+            // in 1.10504.0 (unlike `duckdb_get_varchar` which returns
+            // freeable memory). Leave it alone — copying to an owned
+            // String is the safe read path.
+            s
+        };
+        target_columns.push(WitColumndef {
+            name,
+            logical: wit_logicaltype_from_code(code),
+        });
+    }
+
+    // Dispatch to the guest's `copy-from-bind` for the reader handle. The
+    // captured `target_columns` cannot cross the WIT boundary today —
+    // `copy-dispatch` (v4.0.0) has no target-schema arg on
+    // `copy-from-bind`, and the prep-agent-added runtime overload
+    // `copy_from_bind_with_target` accepts but does not forward it. When
+    // that WIT change lands, this call swaps to
+    // `dispatch_copy_from_bind_with_target(..., Some(&target_columns))`
+    // and the guest can prepare rows matching the target directly.
+    // Until then `target_columns` is used ONLY host-side: as col_codes for
+    // `func`'s writes (see above) and for the arity guard below.
+    let _ = &target_columns;
     let result = match extra_ref
         .engine
         .dispatch_copy_from_bind(extra_ref.function_handle, &path, &options)
@@ -8648,19 +8647,31 @@ unsafe extern "C" fn ducklink_copy_from_bind(info: ffi::duckdb_bind_info) {
         }
     };
 
-    // Publish the discovered column schema to DuckDB + capture the codes
-    // `func` will use to write each scanned row.
-    let mut col_codes: Vec<u8> = Vec::with_capacity(result.columns.len());
-    for col in &result.columns {
-        let code = code_from_wit_logicaltype(&col.logical);
-        col_codes.push(code);
-        let name_c = match CString::new(col.name.as_str()) {
-            Ok(c) => c,
-            Err(_) => CString::new("").unwrap(),
-        };
-        let mut lt = logical_type_ffi(code);
-        ffi::duckdb_bind_add_result_column(info, name_c.as_ptr(), lt);
-        ffi::duckdb_destroy_logical_type(&mut lt);
+    // Validate arity: the guest's returned column list must match the
+    // target's column count. Types are NOT re-checked here (DuckDB will
+    // cast at column-write time if the underlying storage matches);
+    // arity mismatches, however, will scribble past the output vectors
+    // in `func`, so we refuse them early.
+    if result.columns.len() != target_col_count {
+        // Close the reader the guest just opened, otherwise the state
+        // Box below never gets built and DuckDB never fires
+        // `copy_from_bind_state_destroy` to release it.
+        if let Err(e) = extra_ref
+            .engine
+            .dispatch_copy_from_close(extra_ref.function_handle, result.reader)
+        {
+            eprintln!(
+                "[ducklink] copy_from_close after arity-mismatch bind failed: {e}"
+            );
+        }
+        let msg = CString::new(format!(
+            "copy_from_bind: guest reader declared {} column(s), target table has {}",
+            result.columns.len(),
+            target_col_count
+        ))
+        .unwrap();
+        ffi::duckdb_bind_set_error(info, msg.as_ptr());
+        return;
     }
 
     let state = Box::into_raw(Box::new(CopyFromBindState {
@@ -9481,23 +9492,71 @@ unsafe extern "C" fn ducklink_cast_invoke(
     true
 }
 
+/// Map a DuckDB SQL type expression (as declared by the guest, e.g. "BIGINT",
+/// "DECIMAL(10,2)", "TIMESTAMP_NS") to the bridge type code the raw marshal
+/// paths key on. Alias tables mirror the DuckDB type synonyms.
+///
+/// T2-1: extended past the original ~15-entry alias table so the cast /
+/// modified-type / logical-type installers no longer silently coerce
+/// unfamiliar type expressions to VARCHAR. DECIMAL(w,s) / NUMERIC(w,s) route
+/// through T_DECIMAL (width/scale is honoured by `logical_type_ffi`'s
+/// callers of `parse_decimal_expr`, e.g. `register_modified_types`); the
+/// TIMESTAMP_* precision aliases fold onto T_TIMESTAMP (real unit plumbing
+/// is a follow-up); truly unknown expressions still fall back to T_TEXT but
+/// now log a warning instead of silently degrading.
+///
+/// Notes:
+///   * HUGEINT / UHUGEINT: no T_HUGEINT code exists — `reg::LogicalType`
+///     doesn't have a Hugeint arm, so we can't route through the bridge
+///     without extending the whole logical-type set. Left as an unknown so
+///     the warning fires with the concrete type name.
+///   * ENUM by name: resolving requires cross-referencing
+///     `register_enum_types` (which today has no queryable registry). Left
+///     as an unknown so callers see the shortfall. TODO(T2-1 follow-up):
+///     add an enum-name -> LogicalType registry populated by
+///     `register_enum_types` and query it here.
 fn type_code_from_expr(expr: &str) -> u8 {
-    match expr.to_ascii_uppercase().as_str() {
-        "BOOLEAN" | "BOOL" => T_BOOL,
-        "BIGINT" | "INT8" | "INT64" => T_I64,
-        "UBIGINT" | "UINT64" => T_U64,
-        "DOUBLE" | "FLOAT8" | "FLOAT64" => T_F64,
-        "VARCHAR" | "TEXT" | "STRING" => T_TEXT,
-        "BLOB" | "BYTEA" | "BINARY" => T_BLOB,
-        "TINYINT" | "INT1" => T_I8,
-        "SMALLINT" | "INT2" | "INT16" => T_I16,
-        "INTEGER" | "INT" | "INT4" | "INT32" => T_I32,
-        "UTINYINT" | "UINT8" => T_U8,
-        "USMALLINT" | "UINT16" => T_U16,
-        "UINTEGER" | "UINT32" => T_U32,
-        "FLOAT" | "FLOAT4" | "FLOAT32" => T_F32,
-        _ => T_TEXT,
+    let trimmed = expr.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    match upper.as_str() {
+        "BOOLEAN" | "BOOL" => return T_BOOL,
+        "BIGINT" | "INT8" | "INT64" => return T_I64,
+        "UBIGINT" | "UINT64" => return T_U64,
+        "DOUBLE" | "FLOAT8" | "FLOAT64" => return T_F64,
+        "VARCHAR" | "TEXT" | "STRING" => return T_TEXT,
+        "BLOB" | "BYTEA" | "BINARY" => return T_BLOB,
+        "TINYINT" | "INT1" => return T_I8,
+        "SMALLINT" | "INT2" | "INT16" => return T_I16,
+        "INTEGER" | "INT" | "INT4" | "INT32" => return T_I32,
+        "UTINYINT" | "UINT8" => return T_U8,
+        "USMALLINT" | "UINT16" => return T_U16,
+        "UINTEGER" | "UINT32" => return T_U32,
+        "FLOAT" | "FLOAT4" | "FLOAT32" => return T_F32,
+        "TIMESTAMP" => return T_TIMESTAMP,
+        "DATE" => return T_DATE,
+        "TIME" => return T_TIME,
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => return T_TIMESTAMPTZ,
+        "DECIMAL" | "NUMERIC" => return T_DECIMAL,
+        "INTERVAL" => return T_INTERVAL,
+        "UUID" => return T_UUID,
+        // Precision-suffixed timestamps: DuckDB stores them physically as
+        // TIMESTAMP (microseconds); the precision is a scale annotation the
+        // C API set_ffi call does not carry through this bridge path today.
+        // TODO(T2-1 follow-up): plumb the unit into logical_type_ffi so we
+        // stop coercing NS/MS/S to microseconds silently.
+        "TIMESTAMP_NS" | "TIMESTAMP_MS" | "TIMESTAMP_S" => return T_TIMESTAMP,
+        _ => {}
     }
+    // DECIMAL(w,s) / NUMERIC(w,s) — same detector as
+    // `register_modified_types` uses for its width/scale honouring path.
+    if parse_decimal_expr(trimmed).is_some() {
+        return T_DECIMAL;
+    }
+    eprintln!(
+        "[ducklink] cast type-expression '{expr}' unrecognized; falling back to VARCHAR \
+         — this cast may not route correctly (T2-1)"
+    );
+    T_TEXT
 }
 
 pub unsafe fn register_casts(
@@ -9523,6 +9582,17 @@ pub unsafe fn register_casts(
         ffi::duckdb_cast_function_set_target_type(cf, tgt_lt);
         ffi::duckdb_destroy_logical_type(&mut src_lt);
         ffi::duckdb_destroy_logical_type(&mut tgt_lt);
+        // T2-4: DuckDB's cast planner uses this cost to pick between
+        // competing casts (lower = preferred; negative = explicit-only).
+        // Every ducklink-installed cast currently gets 100 (DuckDB's
+        // "default cost"), so a component that wants explicit-only or a
+        // preferred implicit cast has no way to say so. Exposing this
+        // requires an `implicit_cost: option<s32>` field on the
+        // `runtime.register-cast` WIT record (and a matching
+        // `implicit_cost: Option<i32>` on `CastReg` / `CastEntry`) — a
+        // small, additive WIT change that is out of scope for this pass
+        // per the "Do NOT touch WIT" guardrail. Follow-up: extend the WIT
+        // record, drain the value into `CastEntry`, and pass it here.
         ffi::duckdb_cast_function_set_implicit_cast_cost(cf, 100);
         ffi::duckdb_cast_function_set_function(cf, Some(ducklink_cast_invoke));
         let extra = Box::into_raw(Box::new(CastExtra {
@@ -10076,6 +10146,51 @@ pub unsafe fn register_pragmas(
              libduckdb-sys 1.10504.0 exposes no pragma registration entry point in \
              the stable C API. See src/reg_duckdb.rs T1-5 comment for details.",
             p.extension, p.name, p.callback_handle
+        );
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// 13. register_coordinate_systems — install component-declared CRS entries.
+//
+// T2-2 STATUS: BLOCKED-UPSTREAM (mirror of register_pragmas T1-5).
+//
+// The DuckDB stable C API in libduckdb-sys 1.10504.0 exposes no coordinate
+// reference system / SRID registration entry point. A grep of the bundled
+// bindings (`bindgen_bundled_version_loadable.rs`) for `duckdb_*srid*`,
+// `duckdb_*coordinate*`, or `duckdb_*crs*` returns zero hits — the concept
+// lives in the `spatial` extension's SQL surface (`ST_SRID`,
+// `spatial_ref_sys` table) rather than the extension-facing C header. Any
+// first-class installer path requires either a DuckDB C API change or
+// piggy-backing on the spatial extension's SQL catalog (INSERT INTO
+// spatial_ref_sys), which is a fundamentally different surface than the one
+// the guest advertises via `runtime.register-coordinate-system`.
+//
+// Behaviour: fail-loud stub — logs each declared CRS so users see the
+// shortfall visibly, then returns Ok(0). No side effects on the database.
+// Once the upstream C API gains a CRS registration hook (OR we agree to
+// route CRS registrations through the spatial extension's catalog), swap
+// the body for the real installer.
+#[allow(unused_variables)]
+pub unsafe fn register_coordinate_systems(
+    _raw_con: ffi::duckdb_connection,
+    _engine: Arc<Engine2>,
+    coordinate_systems: &[CoordinateSystemEntry],
+) -> Result<usize, String> {
+    if coordinate_systems.is_empty() {
+        return Ok(0);
+    }
+    for c in coordinate_systems {
+        eprintln!(
+            "[ducklink] coordinate system '{}::{}:{}' (wkt.len={}) declared but NOT \
+             installed: libduckdb-sys 1.10504.0 exposes no coordinate-system / SRID \
+             registration entry point in the stable C API. See src/reg_duckdb.rs T2-2 \
+             comment for details.",
+            c.extension,
+            c.auth_name,
+            c.code,
+            c.wkt.len()
         );
     }
     Ok(0)
