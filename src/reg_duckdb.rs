@@ -8649,13 +8649,30 @@ unsafe extern "C" fn copy_from_bind_state_destroy(ptr: *mut c_void) {
         let state = Box::from_raw(ptr as *mut CopyFromBindState);
         // Close the reader even if we short-circuited on EOF or a LIMIT — the
         // guest allocated it in `copy-from-bind`, so it owns the release.
-        if let Err(e) = state
-            .engine
-            .dispatch_copy_from_close(state.callback_handle, state.reader)
-        {
-            eprintln!(
-                "[ducklink] copy_from_close on bind-data drop failed: {e}"
-            );
+        //
+        // FIX 2: this is a C-ABI callback. `dispatch_copy_from_close` locks
+        // the engine's instance map — a poisoned lock, or a wasm trap surfaced
+        // as a Rust panic anywhere in the dispatch chain, would unwind
+        // through this `extern "C"` boundary (UB, per T1-7's ExtensionInstance
+        // Drop guard note). Wrap the whole dispatch in `catch_unwind` and
+        // log; Drop-of-bind-data has no better outlet than stderr.
+        let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state
+                .engine
+                .dispatch_copy_from_close(state.callback_handle, state.reader)
+        }));
+        match dispatch {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[ducklink] copy-from destroy: dispatch failed: {e}"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "[ducklink] copy-from destroy: dispatch failed: panic caught (continuing teardown)"
+                );
+            }
         }
     }
 }
@@ -9029,7 +9046,30 @@ fn code_from_duckdb_type(t: ffi::duckdb_type) -> u8 {
         // DECIMAL target columns as `Logicaltype::Decimal` to the guest
         // instead of silently dropping to VARCHAR.
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => T_DECIMAL,
-        _ => T_TEXT,
+        // Temporal + UUID arms mirror `code_from_logical_type` above so the
+        // T1-6 COPY FROM target-column lift and the R1 COPY TO schema
+        // forwarding path surface `DATE`, `TIME`, `TIMESTAMP`,
+        // `TIMESTAMP WITH TIME ZONE`, `INTERVAL`, and `UUID` targets to the
+        // guest as their actual `LogicalType` variants — previously these
+        // all silently collapsed to `T_TEXT`, so a target column of
+        // e.g. `TIMESTAMP` looked like `VARCHAR` to the guest.
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE => T_DATE,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME => T_TIME,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP => T_TIMESTAMP,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => T_TIMESTAMPTZ,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL => T_INTERVAL,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID => T_UUID,
+        // HUGEINT/UHUGEINT have no `reg::LogicalType` arm yet — see the
+        // T2-1 residual note. Rather than silently collapse them to
+        // `T_TEXT`, warn once at eprintln so misclassification is visible
+        // in host logs. Non-recognised codes hit the same branch.
+        other => {
+            eprintln!(
+                "code_from_duckdb_type: unsupported duckdb type '{}' \u{2192} T_TEXT (see T2-1 residual)",
+                other as u32
+            );
+            T_TEXT
+        }
     }
 }
 
@@ -9148,8 +9188,26 @@ impl Drop for ArrowShimInit {
             // upstream, because drop can fire from a background finalizer
             // path where no other guard is in scope.
             let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
-            if let Err(e) = self.engine.dispatch_arrow_close(self.callback_handle, c) {
-                eprintln!("[ducklink] arrow shim: dispatch_arrow_close failed: {e}");
+            // FIX 2: DuckDB drops init data from an `extern "C"` teardown
+            // callback. `dispatch_arrow_close` locks the engine's instance
+            // map (the same lock the T1-7 note flags), and a poisoned lock
+            // or wasm trap surfacing as a Rust panic would unwind across
+            // the C ABI boundary — UB. Mirror the shape of
+            // `copy_from_bind_state_destroy` above and `ExtensionInstance::
+            // drop` (runtime/src/extension.rs) with a catch_unwind wrap.
+            let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.engine.dispatch_arrow_close(self.callback_handle, c)
+            }));
+            match dispatch {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    eprintln!("[ducklink] arrow shim: dispatch_arrow_close failed: {e}");
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[ducklink] arrow shim: dispatch_arrow_close panicked (continuing teardown)"
+                    );
+                }
             }
         }
     }
@@ -9856,7 +9914,13 @@ pub unsafe fn register_casts(
         // competing casts (lower = preferred). Wire the WIT-declared
         // `implicit_cost` (now on CastEntry). The bindgen signature exposes
         // the setter as `(duckdb_cast_function, cost: i64)`:
-        //   * None         — keep DuckDB's default (100).
+        //   * None         — apply ducklink's default of 100. (DuckDB's C
+        //                    API default is -1 / explicit-only, per
+        //                    cast_function-c.cpp:20 CCastFunction::
+        //                    implicit_cast_cost, but ducklink treats unset
+        //                    as implicit-cost 100 to match the typical
+        //                    scalar-registration ergonomic — we do so by
+        //                    explicitly calling the setter with 100 below.)
         //   * Some(v) v>=0 — call the setter with `v` as i64.
         //   * Some(-1)     — SKIP the setter entirely. Per the task contract
         //     this maps to "explicit-only" semantics: the cast is still

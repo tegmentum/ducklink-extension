@@ -321,3 +321,41 @@ fn pending_append_merges_all_kinds_and_drains_other() {
     assert_eq!(base.casts.len(), 1);
     assert_eq!(base.aggregates.len(), 0);
 }
+
+// --- T2-4: CastReg.implicit_cost round-trip --------------------------------
+//
+// The three legal shapes the WIT `option<s32>` field can carry once captured
+// into a `reg::CastReg` are: `None` (unset → ducklink applies its 100
+// default at native-registration time), `Some(v)` with `v >= 0` (positive
+// implicit cost forwarded verbatim), and `Some(-1)` (the DuckDB C API's
+// "explicit-only" convention; the consolidator skips the setter). Sweep 4
+// added the `Some(50)` / `Some(-1)` coverage — previously only the `None`
+// arm was exercised in `pending_append_merges_all_kinds_and_drains_other`.
+
+fn cast_reg_with_cost(cost: Option<i32>) -> reg::CastReg {
+    reg::CastReg {
+        extension: "ext".to_string(),
+        source: "src".to_string(),
+        target: "tgt".to_string(),
+        callback_handle: 1,
+        implicit_cost: cost,
+    }
+}
+
+#[test]
+fn cast_reg_carries_implicit_cost_none() {
+    let c = cast_reg_with_cost(None);
+    assert_eq!(c.implicit_cost, None);
+}
+
+#[test]
+fn cast_reg_carries_implicit_cost_some_positive() {
+    let c = cast_reg_with_cost(Some(50));
+    assert_eq!(c.implicit_cost, Some(50));
+}
+
+#[test]
+fn cast_reg_carries_implicit_cost_some_explicit_only() {
+    let c = cast_reg_with_cost(Some(-1));
+    assert_eq!(c.implicit_cost, Some(-1));
+}
