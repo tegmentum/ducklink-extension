@@ -616,6 +616,11 @@ pub enum CallbackKind {
     Aggregate,
     Pragma,
     Cast,
+    /// A named log-storage sink (Class B parity with the stable
+    /// `duckdb_register_log_storage` C API). The dispatcher_handle routes
+    /// every `write-log-entry` re-entry back to the owning component via
+    /// [`ExtensionInstance::dispatch_write_log_entry`].
+    LogStorage,
 }
 
 impl CallbackKind {
@@ -626,6 +631,7 @@ impl CallbackKind {
             CallbackKind::Aggregate => "aggregate",
             CallbackKind::Pragma => "pragma",
             CallbackKind::Cast => "cast",
+            CallbackKind::LogStorage => "log-storage",
         }
     }
 }

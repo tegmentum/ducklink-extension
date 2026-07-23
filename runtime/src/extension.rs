@@ -398,6 +398,7 @@ pub struct PendingRegistrationsData {
     // buffers on `ExtensionStoreState` that were already captured by the
     // register_* host impls but not previously carried through
     // `drain_pending` into the .duckdb_extension shim.
+    pub pragmas: Vec<PendingPragma>,
     pub settings: Vec<PendingSetting>,
     pub copy_handlers: Vec<PendingCopyHandler>,
     pub arrow_tables: Vec<PendingArrowTable>,
@@ -422,6 +423,7 @@ impl PendingRegistrationsData {
         self.casts.append(&mut other.casts);
         self.storages.append(&mut other.storages);
         // Additive fields (Phase: drain-plumbing).
+        self.pragmas.append(&mut other.pragmas);
         self.settings.append(&mut other.settings);
         self.copy_handlers.append(&mut other.copy_handlers);
         self.arrow_tables.append(&mut other.arrow_tables);
@@ -738,6 +740,7 @@ impl ExtensionStoreState {
         // captured but never forwarded into `PendingRegistrationsData`;
         // draining them here plugs the leak between the runtime and the
         // .duckdb_extension shim without touching any register_* host impl.
+        let pragmas = self.take_pending_pragmas();
         let settings = self.take_pending_settings();
         let copy_handlers = self.take_pending_copy_handlers();
         let arrow_tables = self.take_pending_arrow_tables();
@@ -755,6 +758,7 @@ impl ExtensionStoreState {
             logical_types,
             casts,
             storages,
+            pragmas,
             settings,
             copy_handlers,
             arrow_tables,
@@ -1193,9 +1197,9 @@ impl extension_runtime::HostAggregateRegistry for ExtensionStoreState {
 impl extension_runtime::HostPragmaRegistry for ExtensionStoreState {
     // Item 4: a component declares a PRAGMA in `load()`. The host captures its
     // name + the callback handle into the neutral pending buffer; the core
-    // later pulls the list (the `pragma-host` pull-back interface for this
-    // capability was never produced; enumeration goes through
-    // PendingRegistrationsData instead), intercepts `PRAGMA <name>(...)`,
+    // later pulls the list via `drain_pending`'s `pragmas` field on
+    // `PendingRegistrationsData` (the `pragma-host` pull-back interface for
+    // this capability was never produced), intercepts `PRAGMA <name>(...)`,
     // dispatches via callback-dispatch.call-pragma (the component RETURNS a
     // SQL script as text), and runs that script.
     fn register_call(
@@ -1876,15 +1880,23 @@ impl extension_log_storage::Host for ExtensionStoreState {
         name: String,
         callback_handle: u32,
     ) -> Result<u32, extension_types::Duckerror> {
+        // Allocate a GLOBALLY-ROUTABLE handle (mapping global -> this extension +
+        // the component-local `callback_handle` dispatcher) so the C API
+        // installer in `ducklink-extension/src/reg_duckdb.rs` can carry ONE u32
+        // through the `duckdb_register_log_storage` write callback and the host
+        // routes every re-entry (`write-log-entry`) back to the owning component
+        // via `ExtensionInstance::dispatch_write_log_entry` — matching the
+        // register_filterable_table wiring above.
+        let global = self.allocate_callback_handle(callback_handle, CallbackKind::LogStorage);
         verbose_log!(
-            "[extension-runtime:{}] registered log storage '{name}' (callback={callback_handle})",
+            "[extension-runtime:{}] registered log storage '{name}' (global={global}, dispatcher={callback_handle})",
             self.extension_name
         );
         self.pending_log_storages.push(PendingLogStorage {
             name,
-            callback_handle,
+            callback_handle: global,
         });
-        Ok(self.alloc_resource_id())
+        Ok(global)
     }
 }
 
@@ -2579,6 +2591,34 @@ impl ExtensionInstance {
         let mut ctx = self.store.as_context_mut();
         let data: *mut ExtensionStoreState = ctx.data_mut();
         unsafe { (*data).drain_pending() }
+    }
+
+    /// Drive the component's `guest.shutdown` export. The C API installer in
+    /// `ducklink-extension/src/reg_duckdb.rs` calls this on Drop so a component
+    /// that owns external resources (a background writer, an open file handle,
+    /// a network client) can flush + release them before the wasmtime store
+    /// tears down. Mirrors the `bindings.duckdb_extension_guest().call_load`
+    /// shape used at load time (see `load_component`).
+    pub fn dispatch_shutdown(&mut self) -> Result<bool, extension_types::Duckerror> {
+        let guest = self.bindings.duckdb_extension_guest();
+        let mut store = self.store.as_context_mut();
+        guest.call_shutdown(&mut store).map_err(map_extension_trap)?
+    }
+
+    /// Drive the component's `guest.reconfigure` export. The C API installer
+    /// forwards `SET`-triggered option changes here (the `keys` list is the set
+    /// of option names whose values just changed) so the component can refresh
+    /// any cached derived state before the next dispatch. Mirrors the
+    /// `bindings.duckdb_extension_guest().call_load` shape used at load time.
+    pub fn dispatch_reconfigure(
+        &mut self,
+        keys: &[String],
+    ) -> Result<bool, extension_types::Duckerror> {
+        let guest = self.bindings.duckdb_extension_guest();
+        let mut store = self.store.as_context_mut();
+        guest
+            .call_reconfigure(&mut store, keys)
+            .map_err(map_extension_trap)?
     }
 
     /// Drains only the captured storage-backend registrations (see

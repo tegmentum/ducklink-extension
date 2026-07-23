@@ -191,6 +191,11 @@ pub unsafe extern "C" fn update(
     input: ffi::duckdb_data_chunk,
     states: *mut ffi::duckdb_aggregate_state,
 ) {
+    // Hold the DuckDB executor lock while this dispatcher runs — a
+    // re-entrant `NativeServices::query()` routed back to this thread
+    // would deadlock. The RAII guard restores the previous value even
+    // if `extract_value` panics on a malformed vector.
+    let _guard = crate::engine::QueryReentrancyGuard::new();
     let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const DelegatingAggExtra);
     let n = ffi::duckdb_data_chunk_get_size(input) as usize;
     if n == 0 {
@@ -262,6 +267,9 @@ pub unsafe extern "C" fn combine(
     target: *mut ffi::duckdb_aggregate_state,
     count: ffi::idx_t,
 ) {
+    // Same re-entrancy reasoning as `update`; combine runs on DuckDB
+    // executor threads holding the same lock.
+    let _guard = crate::engine::QueryReentrancyGuard::new();
     for i in 0..count as usize {
         let src_slot = *source.add(i) as *mut *mut DelegatingAggState;
         let tgt_slot = *target.add(i) as *mut *mut DelegatingAggState;
@@ -291,6 +299,10 @@ pub unsafe extern "C" fn finalize(
     count: ffi::idx_t,
     offset: ffi::idx_t,
 ) {
+    // Finalize runs the nested delegation query on `extra.con` while
+    // still on a DuckDB executor thread; a guest-side re-entrant call
+    // into `NativeServices::query()` from this thread would deadlock.
+    let _guard = crate::engine::QueryReentrancyGuard::new();
     let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const DelegatingAggExtra);
     ffi::duckdb_vector_ensure_validity_writable(result);
     let base = offset as usize;

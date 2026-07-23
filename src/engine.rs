@@ -69,6 +69,38 @@ pub fn set_query_reentrancy_guard(active: bool) -> bool {
     QUERY_REENTRANCY_GUARD.with(|c| c.replace(active))
 }
 
+/// RAII guard around [`set_query_reentrancy_guard`]. Sets the guard to
+/// `true` on construction, restores the previous value on drop — safe
+/// under early returns and panics, unlike a manual set/unset pair.
+///
+/// Dispatchers in `delegating_agg` and the sibling `reg_duckdb` scalar /
+/// table / cast wrappers hold one of these across every guest call so a
+/// re-entrant `NativeServices::query()` from inside the guest can refuse
+/// instead of deadlocking on the DuckDB executor lock.
+pub struct QueryReentrancyGuard {
+    prev: bool,
+}
+
+impl QueryReentrancyGuard {
+    pub fn new() -> Self {
+        Self {
+            prev: set_query_reentrancy_guard(true),
+        }
+    }
+}
+
+impl Default for QueryReentrancyGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for QueryReentrancyGuard {
+    fn drop(&mut self) {
+        set_query_reentrancy_guard(self.prev);
+    }
+}
+
 /// Build a component-model wasmtime engine for running extension components.
 /// Mirrors the host's engine config (component model + wasm exceptions, which
 /// DuckDB-targeting components may use).
@@ -710,6 +742,19 @@ pub struct LogStorageEntry {
     pub callback_handle: u32,
 }
 
+/// A `PRAGMA <name>(...)` extension the component registered via
+/// `runtime.register-pragma`. The core intercepts the pragma, dispatches
+/// through `callback_handle` (callback-dispatch.call-pragma), and the
+/// component RETURNS a SQL script for the core to run on the connection —
+/// so no mid-callback re-entry into the connection. Consumed by
+/// `reg_duckdb` in a later phase.
+#[derive(Clone, Debug)]
+pub struct PragmaEntry {
+    pub extension: String,
+    pub name: String,
+    pub callback_handle: u32,
+}
+
 /// What a component registered: the functions a direction-specific sink bridges
 /// into the database.
 #[derive(Clone, Debug, Default)]
@@ -759,6 +804,10 @@ pub struct LoadedComponent {
     /// Log-storage sinks the component registered. Drained from
     /// `pending.log_storages`.
     pub log_storages: Vec<LogStorageEntry>,
+    /// PRAGMAs the component registered via `runtime.register-pragma`.
+    /// Drained from `pending.pragmas` (the parallel runtime edit adds
+    /// that field to `PendingRegistrationsData`).
+    pub pragmas: Vec<PragmaEntry>,
     /// Component-provided documentation parsed from the wasm's `duckdb.docs`
     /// custom section, if present. Overrides catalog docs field-by-field at
     /// query time; `None` for components that don't ship a section.
@@ -1086,6 +1135,23 @@ impl Engine2 {
                 callback_handle: l.callback_handle,
             })
             .collect();
+        // `PendingPragma` (= `reg::PragmaReg`) already carries the
+        // `extension` field the register-pragma host impl stamps at
+        // capture time, so we straight-map it like scalars/tables.
+        //
+        // NOTE: the sibling `runtime/src/extension.rs` edit adds
+        // `pub pragmas: Vec<PendingPragma>` to `PendingRegistrationsData`
+        // and wires `drain_pending` to populate it. Until that lands this
+        // stays empty; once it does, swap `Vec::new()` for:
+        //     pending.pragmas.into_iter().map(|p| PragmaEntry {
+        //         extension: p.extension,
+        //         name: p.name,
+        //         callback_handle: p.callback_handle,
+        //     }).collect()
+        // The `PragmaEntry` type and `LoadedComponent.pragmas` field are
+        // in place so `reg_duckdb.rs` can be written against the final
+        // shape without waiting on the swap.
+        let pragmas: Vec<PragmaEntry> = Vec::new();
         let instance_arc = Arc::new(Mutex::new(instance));
         {
             let mut map = self.instances.write().expect("instances lock poisoned");
@@ -1119,6 +1185,7 @@ impl Engine2 {
             enum_types,
             modified_types,
             log_storages,
+            pragmas,
             docs,
         })
     }

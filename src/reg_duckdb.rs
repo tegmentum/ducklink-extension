@@ -43,8 +43,8 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::column_types
 
 use crate::engine::{
     AggregateFunc, ArrowTable, CastEntry, CopyHandler, Engine2, EnumTypeEntry, LogStorageEntry,
-    LogicalTypeEntry, MacroEntry, ModifiedTypeEntry, ReplacementScan, ScalarEx, ScalarFunc,
-    Setting, TableFunc, TableMacroEntry,
+    LogicalTypeEntry, MacroEntry, ModifiedTypeEntry, PragmaEntry, ReplacementScan, ScalarEx,
+    ScalarFunc, Setting, TableFunc, TableMacroEntry,
 };
 
 /// Convert DuckDB's physical UUID hugeint storage (sign-flipped: the high bit is
@@ -1135,6 +1135,10 @@ impl VScalar for WasmScalar {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Never let a panic in marshalling/dispatch unwind into DuckDB's C call.
         guard("scalar dispatch", || {
+            // T1-3: mark the current thread as inside a guest dispatch so a
+            // reentrant `NativeServices::query()` from the guest refuses
+            // instead of deadlocking on the DuckDB executor lock.
+            let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
             let len = input.len();
             let cols: Vec<FlatVector> = (0..state.arg_codes.len())
                 .map(|j| input.flat_vector(j))
@@ -1350,6 +1354,10 @@ impl VTab for WasmTable {
                 .map(|(j, &code)| param_to_neutral(code, &bind.get_parameter(j as u64)))
                 .collect();
             let rows = {
+                // T1-3: bind is a guest dispatch — mark the thread so a
+                // reentrant NativeServices::query() from inside the guest
+                // refuses instead of deadlocking the DuckDB executor lock.
+                let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
                 let engine = &extra.engine;
                 engine
                     .dispatch_table(extra.callback_handle, args)
@@ -2105,11 +2113,43 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
         T_TIMESTAMPTZ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ,
         T_INTERVAL => ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL,
         T_UUID => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID,
-        // DECIMAL via this enum has no width/scale; aggregates over DECIMAL are a
-        // known limitation (the scalar/table path declares DECIMAL(18, 3) via a
-        // dedicated constructor instead). COMPLEX falls back to VARCHAR/JSON.
+        // T1-4: DECIMAL now yields the correct enum discriminant. Callers
+        // building a `duckdb_logical_type` from this must NOT use
+        // `duckdb_create_logical_type(DUCKDB_TYPE_DECIMAL)` — that leaves
+        // width/scale unset. Use [`logical_type_ffi`] instead, which
+        // routes DECIMAL through `duckdb_create_decimal_type(18, 3)`
+        // (matching the DECIMAL(18, 3) shape `logical_type()` above declares
+        // and `read_col_to_colvec` / `write_col_from_raw` assume).
+        T_DECIMAL => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL,
+        // COMPLEX falls back to VARCHAR/JSON.
         T_COMPLEX => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
         _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+    }
+}
+
+/// T1-4: Construct a `duckdb_logical_type` from a bridge type `code`. This
+/// mirrors [`duckdb_type_of`] but branches to
+/// `duckdb_create_decimal_type(18, 3)` for T_DECIMAL so callers get a
+/// properly-widthed DECIMAL type instead of the width/scale-less shape
+/// `duckdb_create_logical_type(DUCKDB_TYPE_DECIMAL)` yields. TODO (Gap 2):
+/// when component-declared decimal precision/scale is threaded through
+/// `reg::LogicalType`, replace the hardcoded (18, 3) with the per-column
+/// values. `logical_type()` (LogicalTypeHandle) already hardcodes (18, 3)
+/// so round-trip stays consistent.
+///
+/// The returned handle is owned by the caller; use
+/// `duckdb_destroy_logical_type` to release.
+///
+/// # Safety
+/// Calls into the DuckDB C API; caller must destroy the returned type.
+unsafe fn logical_type_ffi(code: u8) -> ffi::duckdb_logical_type {
+    if code == T_DECIMAL {
+        // Interim shape: DECIMAL(18, 3). Aligns with `logical_type()`
+        // above (which returns `LogicalTypeHandle::decimal(18, 3)`) so
+        // read_arg_raw / write_ret_raw round-trip correctly.
+        ffi::duckdb_create_decimal_type(18, 3)
+    } else {
+        ffi::duckdb_create_logical_type(duckdb_type_of(code))
     }
 }
 
@@ -2159,8 +2199,26 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
                 lo: logical as u64,
             }
         }
-        // DECIMAL (needs per-value width/scale) and COMPLEX (nested) over the raw
-        // aggregate path are not yet marshalled; surface as NULL.
+        // T1-4: DECIMAL round-trips through the raw aggregate path as an
+        // i128 unscaled value. Scale is defaulted to 3 because Gap 2
+        // (decimal precision/scale plumbing) is not yet landed and
+        // `logical_type(T_DECIMAL)` above declares columns as
+        // DECIMAL(18, 3); read_arg_raw stays in lockstep so the value the
+        // guest sees matches the type the column was declared with.
+        // TODO Gap 2: read the real width/scale from the vector's own
+        // `duckdb_decimal_scale(duckdb_vector_get_column_type(vector))`
+        // once the neutral `reg::LogicalType::Decimal` carries them.
+        T_DECIMAL => {
+            let unscaled = *(data as *const i128).add(i);
+            reg::DuckValue::Decimal {
+                lower: unscaled as u64,
+                upper: (unscaled >> 64) as u64,
+                width: 18,
+                scale: 3,
+            }
+        }
+        // COMPLEX (nested) over the raw aggregate path is not yet marshalled;
+        // surface as NULL.
         _ => reg::DuckValue::Null,
     }
 }
@@ -2223,6 +2281,16 @@ pub(crate) unsafe fn write_ret_raw(
         (T_UUID, reg::DuckValue::Uuid { hi, lo }) => {
             let logical = ((*hi as u128) << 64) | *lo as u128;
             *(data as *mut i128).add(i) = uuid_storage_to_logical(logical as i128) as i128;
+        }
+        // T1-4: DECIMAL is a HUGEINT-backed scaled integer; write the
+        // unscaled i128 straight into the vector's data slot. Mirrors the
+        // `write_col_from_raw` T_DECIMAL arm below so scalar/aggregate/copy
+        // paths encode DECIMAL identically. Width/scale on the value are
+        // informational — the column's LogicalType (DECIMAL(18, 3) per
+        // `logical_type()`) determines interpretation.
+        (T_DECIMAL, reg::DuckValue::Decimal { lower, upper, .. }) => {
+            *(data as *mut i128).add(i) =
+                (((*upper as u128) << 64) | *lower as u128) as i128;
         }
         (T_COMPLEX, reg::DuckValue::Complex { json, .. }) => {
             ffi::duckdb_vector_assign_string_element_len(
@@ -2592,6 +2660,14 @@ unsafe extern "C" fn agg_finalize(
     offset: ffi::idx_t,
 ) {
     agg_guard(info, "aggregate finalize", || {
+        // T1-3: finalize dispatches into the guest via
+        // `engine.dispatch_aggregate_col` / `dispatch_aggregate` below.
+        // Mark the thread so a re-entrant `NativeServices::query()` from
+        // inside the guest refuses instead of deadlocking on the DuckDB
+        // executor lock. `agg_update` and `agg_combine` just accumulate
+        // row data locally and never call into the guest, so they don't
+        // need a guard.
+        let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
         let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const AggExtra);
         for i in 0..count as usize {
             let group = &mut **(*source.add(i) as *mut *mut AggState);
@@ -2705,11 +2781,13 @@ pub unsafe fn register_aggregates(
             .map_err(|_| duckdb::Error::DuckDBFailure(ffi::Error::new(ffi::DuckDBError), None))?;
         ffi::duckdb_aggregate_function_set_name(func, cname.as_ptr());
         for &code in &arg_codes {
-            let mut lt = ffi::duckdb_create_logical_type(duckdb_type_of(code));
+            // T1-4: `logical_type_ffi` routes DECIMAL through
+            // `duckdb_create_decimal_type(18, 3)` so widths/scales are set.
+            let mut lt = logical_type_ffi(code);
             ffi::duckdb_aggregate_function_add_parameter(func, lt);
             ffi::duckdb_destroy_logical_type(&mut lt);
         }
-        let mut rlt = ffi::duckdb_create_logical_type(duckdb_type_of(ret_code));
+        let mut rlt = logical_type_ffi(ret_code);
         ffi::duckdb_aggregate_function_set_return_type(func, rlt);
         ffi::duckdb_destroy_logical_type(&mut rlt);
 
@@ -3080,6 +3158,31 @@ impl VScalar for DucklinkHelp {
 ///
 /// The function name is retained for backward compatibility with existing
 /// callers that once threaded through only the `ducklink_load` TF.
+///
+/// T1-7 (shutdown / reconfigure) STATUS:
+///
+/// * SHUTDOWN — `ExtensionInstance::dispatch_shutdown` exists (per
+///   runtime/src/extension.rs:2602) and is meant to drive the guest's
+///   `guest.shutdown` export when the component is unloaded. The natural
+///   hook is `impl Drop for ExtensionInstance` in
+///   runtime/src/extension.rs, which the workflow prep note freezes.
+///   BLOCKED-UPSTREAM: add
+///     ```
+///     impl Drop for ExtensionInstance {
+///         fn drop(&mut self) {
+///             if let Err(e) = self.dispatch_shutdown() {
+///                 eprintln!("[ducklink] guest.shutdown failed: {e:?}");
+///             }
+///         }
+///     }
+///     ```
+///   in runtime/src/extension.rs. Then this file needs no change — the
+///   Arc<Mutex<ExtensionInstance>>::drop chain reaches ExtensionInstance
+///   naturally on load-replace / process exit.
+///
+/// * RECONFIGURE — awaits Tier 3 T3-1 (per-option SET-notification hook
+///   not in the DuckDB stable C API). No wiring possible without a
+///   `duckdb_config_option_on_set` C callback or equivalent.
 pub fn register_load_function(
     con: &Connection,
     db: ffi::duckdb_database,
@@ -3366,6 +3469,12 @@ pub unsafe fn load_wasm_into_db(
         if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
             eprintln!("[ducklink] register_log_storages failed: {e}");
         }
+        // T1-5: install component-declared PRAGMAs. Currently a no-op that
+        // logs each declaration — the DuckDB stable C API does not expose
+        // a pragma-registration entry point (see `register_pragmas` doc).
+        if let Err(e) = register_pragmas(rt.raw_con.0, rt.engine.clone(), &loaded.pragmas) {
+            eprintln!("[ducklink] register_pragmas failed: {e}");
+        }
     }
     {
         let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
@@ -3603,6 +3712,11 @@ impl VTab for WasmLoad {
                 }
                 if let Err(e) = register_log_storages(rt.db, rt.engine.clone(), &loaded.log_storages) {
                     eprintln!("[ducklink] register_log_storages failed: {e}");
+                }
+                // T1-5: same as the sibling call site above — currently a
+                // no-op that logs each declaration.
+                if let Err(e) = register_pragmas(rt.raw_con.0, rt.engine.clone(), &loaded.pragmas) {
+                    eprintln!("[ducklink] register_pragmas failed: {e}");
                 }
             }
             {
@@ -8021,6 +8135,40 @@ pub unsafe extern "C" fn ducklink_replacement_scan_callback(
 // return so LOAD fails visibly, not a silent no-op.
 
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Columndef as WitColumndef;
+use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::Logicaltype as WitLogicaltype;
+
+/// R1 (COPY TO): map a bridge type code to the WIT `logicaltype` variant the
+/// guest's `copy-to-bind` receives on each column of the target schema. Codes
+/// outside the neutral logical-type set fall back to `Text` — they're what
+/// `code_from_duckdb_type` yields for any unmapped duckdb_type, so the
+/// column's declared type is preserved as VARCHAR at the boundary. DECIMAL
+/// crosses as the fieldless `Decimal` arm — width/scale are conveyed
+/// per-value (Gap 2 for column-level plumbing).
+fn wit_logicaltype_from_code(code: u8) -> WitLogicaltype {
+    match code {
+        T_I64 => WitLogicaltype::Int64,
+        T_U64 => WitLogicaltype::Uint64,
+        T_F64 => WitLogicaltype::Float64,
+        T_BOOL => WitLogicaltype::Boolean,
+        T_TEXT => WitLogicaltype::Text,
+        T_BLOB => WitLogicaltype::Blob,
+        T_I8 => WitLogicaltype::Int8,
+        T_I16 => WitLogicaltype::Int16,
+        T_I32 => WitLogicaltype::Int32,
+        T_U8 => WitLogicaltype::Uint8,
+        T_U16 => WitLogicaltype::Uint16,
+        T_U32 => WitLogicaltype::Uint32,
+        T_F32 => WitLogicaltype::Float32,
+        T_TIMESTAMP => WitLogicaltype::Timestamp,
+        T_DATE => WitLogicaltype::Date,
+        T_TIME => WitLogicaltype::Time,
+        T_TIMESTAMPTZ => WitLogicaltype::Timestamptz,
+        T_DECIMAL => WitLogicaltype::Decimal,
+        T_INTERVAL => WitLogicaltype::Interval,
+        T_UUID => WitLogicaltype::Uuid,
+        _ => WitLogicaltype::Text,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 1. register_settings — declares DB config options to DuckDB. `SET <name>=`
@@ -8182,9 +8330,20 @@ struct CopyExtra {
 }
 
 /// Per-invocation state stashed on the bind info; sink/finalize read the
-/// writer handle it carries.
+/// writer handle it carries. R1: the schema + option list captured from the
+/// DuckDB copy-function bind accessors is held here so `global_init` can
+/// forward them to the guest's `copy-to-bind` (which returns the writer
+/// handle). This makes the guest receive the full COPY target schema +
+/// COPY-clause option map instead of empty lists.
 struct CopyBindState {
     writer_handle: u32,
+    /// Target column schema captured at bind (WIT column defs — names are
+    /// empty because the C API surfaces types only, no column names).
+    columns: Vec<WitColumndef>,
+    /// COPY-clause options, if the C API surfaced any. Best-effort: only
+    /// rendered when `duckdb_copy_function_bind_get_options` returns a
+    /// non-null map-shaped value; otherwise empty (guest sees no options).
+    options: Vec<(String, String)>,
 }
 
 unsafe extern "C" fn copy_extra_destroy(ptr: *mut c_void) {
@@ -8206,17 +8365,48 @@ unsafe extern "C" fn ducklink_copy_bind(info: ffi::duckdb_copy_function_bind_inf
         ffi::duckdb_copy_function_bind_set_error(info, msg.as_ptr());
         return;
     }
-    // Bind time: DuckDB has not yet exposed the target path through the
-    // stable C API surface at THIS callback stage (`duckdb_copy_function_
-    // bind_get_file_path` does not exist — only the global-init variant
-    // does). We just stash a placeholder bind state so `sink` can find the
-    // writer handle that `global_init` will set.
-    let state = Box::into_raw(Box::new(CopyBindState { writer_handle: 0 })) as *mut c_void;
+    // R1: BIND is where DuckDB surfaces the target COLUMN SCHEMA
+    // (`duckdb_copy_function_bind_get_column_{count,type}`). The file
+    // PATH is only available at global_init
+    // (`duckdb_copy_function_global_init_get_file_path`), so we stash the
+    // captured schema here and forward it to the guest's `copy-to-bind`
+    // from `global_init` along with the path. Column NAMES are absent from
+    // the C API — every WitColumndef gets an empty `name` and only its
+    // `logical` carries information.
+    let ncols = ffi::duckdb_copy_function_bind_get_column_count(info) as usize;
+    let mut columns: Vec<WitColumndef> = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        let mut lt = ffi::duckdb_copy_function_bind_get_column_type(info, c as u64);
+        let code = code_from_duckdb_type(ffi::duckdb_get_type_id(lt));
+        ffi::duckdb_destroy_logical_type(&mut lt);
+        columns.push(WitColumndef {
+            name: String::new(),
+            logical: wit_logicaltype_from_code(code),
+        });
+    }
+    // COPY options: `duckdb_copy_function_bind_get_options` returns a
+    // `duckdb_value` (an opaque map-shaped value). The stable C API does
+    // not expose typed iterators over that map in
+    // libduckdb-sys 1.10504.0, so we cannot faithfully unpack it to
+    // (String, String) pairs. Leaving `options` empty is the safe default:
+    // the guest sees an empty options list. TODO Gap: when the C API
+    // exposes options-map traversal, populate this list from
+    // `bind_get_options`.
+    let options: Vec<(String, String)> = Vec::new();
+
+    let state = Box::into_raw(Box::new(CopyBindState {
+        writer_handle: 0,
+        columns,
+        options,
+    })) as *mut c_void;
     ffi::duckdb_copy_function_bind_set_bind_data(info, state, Some(copy_bind_state_destroy));
     let _ = extra;
 }
 
 unsafe extern "C" fn ducklink_copy_global_init(info: ffi::duckdb_copy_function_global_init_info) {
+    // T1-3: dispatch_copy_to_bind reaches the guest — mark thread so a
+    // re-entrant `NativeServices::query()` refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
     let extra = ffi::duckdb_copy_function_global_init_get_extra_info(info) as *const CopyExtra;
     if extra.is_null() {
         let msg = CString::new("copy_global_init: missing extra info").unwrap();
@@ -8230,12 +8420,17 @@ unsafe extern "C" fn ducklink_copy_global_init(info: ffi::duckdb_copy_function_g
     } else {
         std::ffi::CStr::from_ptr(path_ptr).to_string_lossy().into_owned()
     };
-    // The runtime's copy-to-bind needs a `[Columndef]` and options map. The
-    // C API path here does not surface either, so we call with an empty
-    // schema + options. Components that require the schema at bind time need
-    // to look it up through a sibling `get_columns()` guest export.
-    let cols: Vec<WitColumndef> = Vec::new();
-    let opts: Vec<(String, String)> = Vec::new();
+    // R1: pull the column list + options `ducklink_copy_bind` captured on
+    // the bind info's data slot and forward them to the guest along with
+    // the target path. `bind_data` is set at bind (see `ducklink_copy_bind`);
+    // NULL only if bind was skipped, which shouldn't happen — treat as an
+    // empty schema then.
+    let bind_data = ffi::duckdb_copy_function_global_init_get_bind_data(info) as *mut CopyBindState;
+    let (cols, opts): (Vec<WitColumndef>, Vec<(String, String)>) = if bind_data.is_null() {
+        (Vec::new(), Vec::new())
+    } else {
+        ((*bind_data).columns.clone(), (*bind_data).options.clone())
+    };
     let writer = match extra_ref
         .engine
         .dispatch_copy_to_bind(extra_ref.function_handle, &path, &cols, &opts)
@@ -8247,7 +8442,6 @@ unsafe extern "C" fn ducklink_copy_global_init(info: ffi::duckdb_copy_function_g
             return;
         }
     };
-    let bind_data = ffi::duckdb_copy_function_global_init_get_bind_data(info) as *mut CopyBindState;
     if !bind_data.is_null() {
         (*bind_data).writer_handle = writer;
     }
@@ -8267,6 +8461,9 @@ unsafe extern "C" fn ducklink_copy_sink(
     info: ffi::duckdb_copy_function_sink_info,
     input: ffi::duckdb_data_chunk,
 ) {
+    // T1-3: dispatch_copy_to_sink reaches the guest — mark thread so a
+    // re-entrant `NativeServices::query()` refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
     let extra = ffi::duckdb_copy_function_sink_get_extra_info(info) as *const CopyExtra;
     if extra.is_null() {
         let msg = CString::new("copy_sink: missing extra info").unwrap();
@@ -8302,6 +8499,9 @@ unsafe extern "C" fn ducklink_copy_sink(
 }
 
 unsafe extern "C" fn ducklink_copy_finalize(info: ffi::duckdb_copy_function_finalize_info) {
+    // T1-3: dispatch_copy_to_finalize reaches the guest — mark thread so a
+    // re-entrant `NativeServices::query()` refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
     let extra = ffi::duckdb_copy_function_finalize_get_extra_info(info) as *const CopyExtra;
     if extra.is_null() {
         let msg = CString::new("copy_finalize: missing extra info").unwrap();
@@ -8358,10 +8558,25 @@ pub unsafe fn register_copy_handlers(
         ffi::duckdb_copy_function_set_global_init(cf, Some(ducklink_copy_global_init));
         ffi::duckdb_copy_function_set_sink(cf, Some(ducklink_copy_sink));
         ffi::duckdb_copy_function_set_finalize(cf, Some(ducklink_copy_finalize));
-        // COPY FROM: not yet wired (the guest currently has no
-        // `copy-from-*` export in this bindings shape). Leaving it unset
-        // means `COPY <tbl> FROM 'x.<ext>'` reports "unsupported" — the
-        // sink registration side is still visibly installed.
+        // T1-6 (COPY FROM): the C API surfaces this as a single
+        // `duckdb_copy_function_set_copy_from_function(cf, duckdb_table_function)`
+        // hook — it does NOT ship a separate copy-from-bind / -scan / -close
+        // triple. The runtime side already has
+        // `ExtensionInstance::copy_from_bind` / `copy_from_scan` /
+        // `copy_from_close` (per runtime/src/extension.rs:2809-2830), but
+        // wiring them requires:
+        //   1. A `Engine2::dispatch_copy_from_*` wrapper triple exposed
+        //      publicly so the C table-function callbacks can reach the
+        //      instance (Engine2's `instances` map is private and there is
+        //      currently no dispatch_copy_from_* wrapper — engine.rs is
+        //      frozen per the workflow prep note, so this cannot land in
+        //      this file alone).
+        //   2. A dedicated `duckdb_table_function` whose bind/init/func
+        //      callbacks trampoline into those Engine2 wrappers.
+        // BLOCKED-UPSTREAM: T1-6 requires the engine.rs additions above.
+        // The comment previously read "the guest has no copy-from-* export"
+        // — corrected: the guest DOES export copy-from-*; the missing piece
+        // is the Engine2 wrapper triple.
 
         let rc = ffi::duckdb_register_copy_function(raw_con, cf);
         let mut cf_mut = cf;
@@ -8394,6 +8609,10 @@ fn code_from_duckdb_type(t: ffi::duckdb_type) -> u8 {
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT => T_U16,
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => T_U32,
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT => T_F32,
+        // T1-4: recognise DECIMAL so R1 (COPY schema forwarding) surfaces
+        // DECIMAL target columns as `Logicaltype::Decimal` to the guest
+        // instead of silently dropping to VARCHAR.
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => T_DECIMAL,
         _ => T_TEXT,
     }
 }
@@ -8555,6 +8774,12 @@ impl VTab for ArrowShim {
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
         guard("arrow shim scan", || {
+            // T1-3: this callback dispatches into the guest via
+            // `dispatch_arrow_open` / `dispatch_arrow_next` — mark the
+            // thread so a re-entrant `NativeServices::query()` from
+            // inside the guest refuses instead of deadlocking on the
+            // DuckDB executor lock.
+            let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
             let bind = func.get_bind_data();
             let init = func.get_init_data();
             if init.eof.load(Ordering::Relaxed) {
@@ -8586,6 +8811,25 @@ impl VTab for ArrowShim {
                 init.eof.store(true, Ordering::Relaxed);
                 output.set_len(0);
                 return Ok(());
+            }
+            // T1-1: clamp to STANDARD_VECTOR_SIZE (2048). DuckDB's output
+            // chunk allocates at most STANDARD_VECTOR_SIZE rows per column;
+            // writing beyond that (or calling `set_len` past the capacity)
+            // is UB. Peer table-fns in this file all clamp their batch to
+            // `.min(2048)`. Buffering the tail would require reshaping
+            // `ArrowShimInit` to hold a leftover; instead we treat a
+            // >2048-row batch as a guest protocol violation and surface a
+            // clear error so a well-behaved producer trims to 2048.
+            const STANDARD_VECTOR_SIZE: usize = 2048;
+            if rows.len() > STANDARD_VECTOR_SIZE {
+                return Err(format!(
+                    "arrow producer returned {} rows in a single batch, exceeds STANDARD_VECTOR_SIZE ({}). \
+                     Producers must yield at most {} rows per `arrow-next` call.",
+                    rows.len(),
+                    STANDARD_VECTOR_SIZE,
+                    STANDARD_VECTOR_SIZE,
+                )
+                .into());
             }
             let ncols = bind.col_codes.len();
             let raw_chunk = output.get_ptr();
@@ -8762,6 +9006,9 @@ unsafe extern "C" fn ducklink_scalar_ex_invoke(
     input: ffi::duckdb_data_chunk,
     output: ffi::duckdb_vector,
 ) {
+    // T1-3: mark the thread as inside a guest dispatch so a re-entrant
+    // `NativeServices::query()` from the guest refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
     let extra = ffi::duckdb_scalar_function_get_extra_info(info) as *const ScalarExExtra;
     if extra.is_null() {
         let msg = CString::new("scalar_ex_invoke: missing extra info").unwrap();
@@ -8869,17 +9116,18 @@ pub unsafe fn register_scalar_ex(
         let func = ffi::duckdb_create_scalar_function();
         ffi::duckdb_scalar_function_set_name(func, cname.as_ptr());
         for &code in &arg_codes {
-            let mut lt = ffi::duckdb_create_logical_type(duckdb_type_of(code));
+            // T1-4: `logical_type_ffi` routes DECIMAL correctly.
+            let mut lt = logical_type_ffi(code);
             ffi::duckdb_scalar_function_add_parameter(func, lt);
             ffi::duckdb_destroy_logical_type(&mut lt);
         }
-        let mut rlt = ffi::duckdb_create_logical_type(duckdb_type_of(ret_code));
+        let mut rlt = logical_type_ffi(ret_code);
         ffi::duckdb_scalar_function_set_return_type(func, rlt);
         ffi::duckdb_destroy_logical_type(&mut rlt);
         // ---- the three ex flags ----
         if let Some(v) = s.varargs.as_ref() {
             let vcode = type_code(v);
-            let mut vlt = ffi::duckdb_create_logical_type(duckdb_type_of(vcode));
+            let mut vlt = logical_type_ffi(vcode);
             ffi::duckdb_scalar_function_set_varargs(func, vlt);
             ffi::duckdb_destroy_logical_type(&mut vlt);
         }
@@ -8946,6 +9194,9 @@ unsafe extern "C" fn ducklink_cast_invoke(
     input: ffi::duckdb_vector,
     output: ffi::duckdb_vector,
 ) -> bool {
+    // T1-3: mark the thread as inside a guest dispatch so a re-entrant
+    // `NativeServices::query()` from the guest refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
     let extra = ffi::duckdb_cast_function_get_extra_info(info) as *const CastExtra;
     if extra.is_null() {
         let msg = CString::new("cast_invoke: missing extra info").unwrap();
@@ -9003,8 +9254,9 @@ pub unsafe fn register_casts(
         let src_code = type_code_from_expr(&c.source);
         let tgt_code = type_code_from_expr(&c.target);
         let cf = ffi::duckdb_create_cast_function();
-        let mut src_lt = ffi::duckdb_create_logical_type(duckdb_type_of(src_code));
-        let mut tgt_lt = ffi::duckdb_create_logical_type(duckdb_type_of(tgt_code));
+        // T1-4: `logical_type_ffi` routes DECIMAL correctly.
+        let mut src_lt = logical_type_ffi(src_code);
+        let mut tgt_lt = logical_type_ffi(tgt_code);
         ffi::duckdb_cast_function_set_source_type(cf, src_lt);
         ffi::duckdb_cast_function_set_target_type(cf, tgt_lt);
         ffi::duckdb_destroy_logical_type(&mut src_lt);
@@ -9052,7 +9304,8 @@ pub unsafe fn register_logical_types(
     let mut registered = 0usize;
     for t in types {
         let code = type_code_from_expr(&t.physical);
-        let mut lt = ffi::duckdb_create_logical_type(duckdb_type_of(code));
+        // T1-4: `logical_type_ffi` routes DECIMAL correctly.
+        let mut lt = logical_type_ffi(code);
         let name_c = match CString::new(t.name.as_str()) {
             Ok(c) => c,
             Err(_) => {
@@ -9117,7 +9370,9 @@ pub unsafe fn register_modified_types(
             ffi::duckdb_create_decimal_type(w, sc)
         } else {
             let code = type_code_from_expr(&t.type_expr);
-            ffi::duckdb_create_logical_type(duckdb_type_of(code))
+            // T1-4: `logical_type_ffi` routes DECIMAL correctly (for the
+            // `DECIMAL` fallback path that has no width/scale suffix).
+            logical_type_ffi(code)
         };
         let name_c = match CString::new(t.name.as_str()) {
             Ok(c) => c,
@@ -9314,6 +9569,18 @@ pub fn register_table_macros(
 /// One (callback_handle -> Engine2, name) mapping the C callback consults on
 /// every DuckDB log entry. Populated by `register_log_storages`; installed at
 /// extension init and on subsequent LOADs.
+///
+/// T1-2 (path A): after the runtime-side prep landed
+/// (`register_log_storage` now allocates a callback handle via
+/// `allocate_callback_handle` before returning it to the guest), the
+/// `callback_handle` stored here IS the same allocated global that:
+///   * the guest received from `log-storage.register-log-storage`,
+///   * `LogStorageEntry.callback_handle` propagates through, and
+///   * `Engine2::dispatch_write_log_entry` resolves via the shared
+///     callback registry to reach the owning ExtensionInstance.
+/// So the local lookup here (`resolve_log_storage`) and the engine-side
+/// registry lookup route to the SAME logical sink. The stale-handle bug
+/// (guest-only handle stored in a global-keyed slot) is fixed at source.
 struct LogStorageRegistration {
     callback_handle: u32,
     engine: Arc<Engine2>,
@@ -9375,6 +9642,9 @@ unsafe extern "C" fn ducklink_log_storage_write(
     log_type: *const c_char,
     log_message: *const c_char,
 ) {
+    // T1-3: mark the thread as inside a guest dispatch so a re-entrant
+    // `NativeServices::query()` from the guest refuses instead of deadlocking.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
     if extra_data.is_null() {
         return;
     }
@@ -9489,4 +9759,62 @@ pub unsafe fn register_log_storages(
         registered += 1;
     }
     Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// 12. register_pragmas — install component-declared PRAGMAs.
+//
+// T1-5 STATUS: BLOCKED-UPSTREAM.
+//
+// A. C API surface: libduckdb-sys 1.10504.0 does NOT export a pragma
+//    registration entry point. A grep of the bundled bindings
+//    (`bindgen_bundled_version_loadable.rs`) for `duckdb_add_pragma`,
+//    `duckdb_create_pragma_function`, `duckdb_register_pragma_function`,
+//    or `duckdb_pragma_function` returns zero hits — the stable C API
+//    treats PRAGMAs as an internal concept exposed only through the C++
+//    catalog, not the extension-facing C header. Any first-class
+//    pragma-installer path requires a DuckDB C API change, and no
+//    "install-me-as-a-pragma" symbol exists to wrap.
+//
+// B. Table-macro fallback: DuckDB does let user code register a macro
+//    via SQL (`CREATE OR REPLACE MACRO name(...) AS TABLE (...)`), which
+//    would route `SELECT * FROM myext.mypragma()` to a supporting scalar.
+//    That is NOT the same surface the runtime advertises through
+//    `runtime.register-pragma` (which the guest expects to see fire on
+//    `PRAGMA myext.mypragma;` — bare, no parentheses). Users would need
+//    to invoke it as a table macro (with parens) instead of a pragma,
+//    which changes the guest contract. Left unimplemented for that
+//    reason; if users are willing to accept the different call shape a
+//    follow-up can register `pragmas` as table macros here.
+//
+// C. Engine wrapper: even the fallback needs a dispatch path from the C
+//    callback into the guest's `callback-dispatch.call-pragma` export.
+//    `ExtensionInstance::dispatch_pragma` exists (see
+//    runtime/src/extension.rs:2558) but no `Engine2::dispatch_pragma`
+//    public wrapper does — engine.rs is frozen per the prep note, so
+//    the fallback can't be wired from this file alone either.
+//
+// Behaviour: `register_pragmas` logs each declared pragma so users see
+// the shortfall visibly, then returns Ok(0). No side effects on the
+// database. Once one of the two blockers clears (native C API arrives
+// OR the table-macro fallback + Engine2 wrapper lands), swap the body
+// for the real installer.
+#[allow(unused_variables)]
+pub unsafe fn register_pragmas(
+    _raw_con: ffi::duckdb_connection,
+    _engine: Arc<Engine2>,
+    pragmas: &[PragmaEntry],
+) -> Result<usize, String> {
+    if pragmas.is_empty() {
+        return Ok(0);
+    }
+    for p in pragmas {
+        eprintln!(
+            "[ducklink] pragma '{}::{}' (callback={}) declared but NOT installed: \
+             libduckdb-sys 1.10504.0 exposes no pragma registration entry point in \
+             the stable C API. See src/reg_duckdb.rs T1-5 comment for details.",
+            p.extension, p.name, p.callback_handle
+        );
+    }
+    Ok(0)
 }
