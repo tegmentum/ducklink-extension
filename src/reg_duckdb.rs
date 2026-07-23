@@ -2719,9 +2719,31 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
             );
             reg::DuckValue::Null
         }
-        // COMPLEX (nested) over the raw aggregate path is not yet marshalled;
-        // surface as NULL.
-        _ => reg::DuckValue::Null,
+        // Sweep-7 FIX F1: COMPLEX escape-hatch is stored as VARCHAR JSON on the
+        // raw aggregate path too. Mirror the `read_arg_neutral` T_COMPLEX arm so
+        // the two peers stay in lockstep — previously this fell through the
+        // catch-all and silently surfaced NULL, dropping COMPLEX aggregate
+        // arguments on the floor.
+        T_COMPLEX => {
+            let strs = data as *const duckdb_string_t;
+            let mut s = std::ptr::read(strs.add(i));
+            let mut raw = DuckString::new(&mut s);
+            reg::DuckValue::Complex {
+                type_expr: "COMPLEX".to_string(),
+                json: raw.as_str().to_string(),
+            }
+        }
+        // Sweep-7 FIX F1: fail-loud catch-all (mirrors `read_arg_neutral`).
+        // Any type code newly added to `code_from_duckdb_type` /
+        // `type_code_from_expr` but not wired here used to silently return
+        // NULL; log the code so the next gap is visible.
+        unhandled => {
+            eprintln!(
+                "ducklink: read_arg_raw: unhandled code {unhandled} (row {i}) — \
+                 add an arm here to mirror `read_arg_neutral` or extend the code table"
+            );
+            reg::DuckValue::Null
+        }
     }
 }
 
@@ -8755,7 +8777,20 @@ unsafe fn wit_logicaltype_from_code(
         T_STRUCT => WitLogicaltype::Complex("STRUCT".to_string()),
         T_MAP => WitLogicaltype::Complex("MAP".to_string()),
         T_ARRAY => WitLogicaltype::Complex("ARRAY".to_string()),
-        _ => WitLogicaltype::Text,
+        // Sweep-7 FIX F2: COMPLEX previously fell through the catch-all and
+        // silently degraded to Text — the guest lost the escape-hatch label.
+        // Preserve the "COMPLEX" kind label so callers see the actual shape.
+        T_COMPLEX => WitLogicaltype::Complex("COMPLEX".to_string()),
+        // Sweep-7 FIX F2: fail-loud catch-all. Any type code newly added but
+        // not wired here used to silently degrade to Text; log the code so
+        // the gap is visible. Still return Text so callers don't panic.
+        unhandled => {
+            eprintln!(
+                "ducklink: wit_logicaltype_from_code: unhandled code {unhandled} — \
+                 add an arm here or extend the code table (returning Text as fallback)"
+            );
+            WitLogicaltype::Text
+        }
     }
 }
 
