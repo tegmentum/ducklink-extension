@@ -2506,7 +2506,19 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
         T_STRUCT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT,
         T_MAP => ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP,
         T_ARRAY => ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY,
-        _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        // Sweep-8 FIX 4: fail-loud catch-all. Mirrors the sweep-7 F2 shape at
+        // `wit_logicaltype_from_code`. Any type code newly added but not wired
+        // here used to silently degrade to VARCHAR; log the code so the gap is
+        // visible. Still return VARCHAR so callers don't panic — the peer
+        // `logical_type_and_duckdb_type_cover_every_code` test guarantees this
+        // arm is currently unreachable.
+        unhandled => {
+            eprintln!(
+                "ducklink: duckdb_type_of: unhandled code {unhandled} — \
+                 add an arm here or extend the code table (returning VARCHAR as fallback)"
+            );
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR
+        }
     }
 }
 
@@ -9258,6 +9270,13 @@ unsafe extern "C" fn copy_from_bind_state_destroy(ptr: *mut c_void) {
         // through this `extern "C"` boundary (UB, per T1-7's ExtensionInstance
         // Drop guard note). Wrap the whole dispatch in `catch_unwind` and
         // log; Drop-of-bind-data has no better outlet than stderr.
+        //
+        // Sweep-8 P3: install QueryReentrancyGuard here for parity with
+        // ArrowShimInit::drop at ~9933. DuckDB may invoke this teardown from
+        // a background finalizer path where no other guard is in scope; a
+        // guest attempting `NativeServices::query()` from inside its own
+        // `copy-from-close` should refuse cleanly rather than deadlock.
+        let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
         let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state
                 .engine
@@ -10300,8 +10319,12 @@ unsafe fn write_row_out(code: u8, out: ffi::duckdb_vector, row: usize, val: reg:
         (T_U32, reg::DuckValue::Uint32(v)) => *(data as *mut u32).add(row) = v,
         (T_F32, reg::DuckValue::Float32(v)) => *(data as *mut f32).add(row) = v,
         (T_TEXT, reg::DuckValue::Text(s)) => {
-            let c = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
-            ffi::duckdb_vector_assign_string_element(out, row as u64, c.as_ptr());
+            ffi::duckdb_vector_assign_string_element_len(
+                out,
+                row as u64,
+                s.as_ptr() as *const c_char,
+                s.len() as u64,
+            );
         }
         (T_BLOB, reg::DuckValue::Blob(b)) => {
             ffi::duckdb_vector_assign_string_element_len(

@@ -177,6 +177,38 @@ unsafe fn extract_value(
 
 // -- C API callbacks ----------------------------------------------------------
 
+/// Format a caught-panic payload as a one-line reason. Mirrors the
+/// `panic_msg` helper in `reg_duckdb.rs`; kept local to avoid a
+/// cross-module `pub` on a purely defensive helper.
+fn panic_reason(p: &(dyn std::any::Any + Send + 'static)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Sweep-8 FIX 5: run an aggregate callback body under `catch_unwind` so a
+/// Rust panic cannot unwind across the DuckDB `extern "C"` boundary (which
+/// would abort the host process — duckdb-rs installs no catch of its own).
+/// A caught panic is logged to stderr and surfaced to DuckDB via
+/// `duckdb_aggregate_function_set_error`, then the callback returns without
+/// further work — mirroring the shape of `reg_duckdb::agg_guard` and the
+/// `ExtensionInstance::drop` T1-7 catch_unwind pattern.
+///
+/// # Safety
+/// `info` must be the valid `duckdb_function_info` for the running aggregate.
+unsafe fn agg_guard(info: ffi::duckdb_function_info, fn_name: &str, f: impl FnOnce()) {
+    if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        let reason = panic_reason(&*p);
+        eprintln!("[ducklink] delegating_agg::{fn_name} panicked: {reason}");
+        if let Ok(c) =
+            std::ffi::CString::new(format!("delegating_agg::{fn_name} panicked: {reason}"))
+        {
+            ffi::duckdb_aggregate_function_set_error(info, c.as_ptr());
+        }
+    }
+}
+
 pub unsafe extern "C" fn state_size(_info: ffi::duckdb_function_info) -> ffi::idx_t {
     std::mem::size_of::<*mut DelegatingAggState>() as ffi::idx_t
 }
@@ -187,6 +219,18 @@ pub unsafe extern "C" fn init(_info: ffi::duckdb_function_info, state: ffi::duck
 }
 
 pub unsafe extern "C" fn update(
+    info: ffi::duckdb_function_info,
+    input: ffi::duckdb_data_chunk,
+    states: *mut ffi::duckdb_aggregate_state,
+) {
+    // Sweep-8 FIX 5: wrap in catch_unwind via agg_guard so an unexpected
+    // panic in `extract_value` (malformed vector) or elsewhere fails one
+    // query rather than aborting the host process. Body extracted to
+    // `update_impl` — >50 lines inlined would obscure the guard.
+    agg_guard(info, "update", || update_impl(info, input, states));
+}
+
+unsafe fn update_impl(
     info: ffi::duckdb_function_info,
     input: ffi::duckdb_data_chunk,
     states: *mut ffi::duckdb_aggregate_state,
@@ -262,34 +306,37 @@ pub unsafe extern "C" fn update(
 }
 
 pub unsafe extern "C" fn combine(
-    _info: ffi::duckdb_function_info,
+    info: ffi::duckdb_function_info,
     source: *mut ffi::duckdb_aggregate_state,
     target: *mut ffi::duckdb_aggregate_state,
     count: ffi::idx_t,
 ) {
-    // Same re-entrancy reasoning as `update`; combine runs on DuckDB
-    // executor threads holding the same lock.
-    let _guard = crate::engine::QueryReentrancyGuard::new();
-    for i in 0..count as usize {
-        let src_slot = *source.add(i) as *mut *mut DelegatingAggState;
-        let tgt_slot = *target.add(i) as *mut *mut DelegatingAggState;
-        if src_slot.is_null() || tgt_slot.is_null() {
-            continue;
+    // Sweep-8 FIX 5: catch_unwind wrapper; see `update` for rationale.
+    agg_guard(info, "combine", || {
+        // Same re-entrancy reasoning as `update`; combine runs on DuckDB
+        // executor threads holding the same lock.
+        let _guard = crate::engine::QueryReentrancyGuard::new();
+        for i in 0..count as usize {
+            let src_slot = *source.add(i) as *mut *mut DelegatingAggState;
+            let tgt_slot = *target.add(i) as *mut *mut DelegatingAggState;
+            if src_slot.is_null() || tgt_slot.is_null() {
+                continue;
+            }
+            let src = *src_slot;
+            let tgt = *tgt_slot;
+            if src.is_null() || tgt.is_null() {
+                continue;
+            }
+            // Clone rather than `mem::take`: DuckDB's window framework uses
+            // segment trees over partial states and may combine the same
+            // source into multiple targets (a stable segment-tree node feeds
+            // several overlapping frames). A destructive move would leave the
+            // source empty on the second visit, so later frames see only the
+            // rows appended after the destructive combine — the bug the OVER
+            // (...) snapshot test surfaced.
+            (*tgt).rows.extend((*src).rows.iter().cloned());
         }
-        let src = *src_slot;
-        let tgt = *tgt_slot;
-        if src.is_null() || tgt.is_null() {
-            continue;
-        }
-        // Clone rather than `mem::take`: DuckDB's window framework uses
-        // segment trees over partial states and may combine the same
-        // source into multiple targets (a stable segment-tree node feeds
-        // several overlapping frames). A destructive move would leave the
-        // source empty on the second visit, so later frames see only the
-        // rows appended after the destructive combine — the bug the OVER
-        // (...) snapshot test surfaced.
-        (*tgt).rows.extend((*src).rows.iter().cloned());
-    }
+    });
 }
 
 pub unsafe extern "C" fn finalize(
@@ -299,46 +346,50 @@ pub unsafe extern "C" fn finalize(
     count: ffi::idx_t,
     offset: ffi::idx_t,
 ) {
-    // Finalize runs the nested delegation query on `extra.con` while
-    // still on a DuckDB executor thread; a guest-side re-entrant call
-    // into `NativeServices::query()` from this thread would deadlock.
-    let _guard = crate::engine::QueryReentrancyGuard::new();
-    let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const DelegatingAggExtra);
-    ffi::duckdb_vector_ensure_validity_writable(result);
-    let base = offset as usize;
+    // Sweep-8 FIX 5: catch_unwind wrapper; see `update` for rationale.
+    agg_guard(info, "finalize", || {
+        // Finalize runs the nested delegation query on `extra.con` while
+        // still on a DuckDB executor thread; a guest-side re-entrant call
+        // into `NativeServices::query()` from this thread would deadlock.
+        let _guard = crate::engine::QueryReentrancyGuard::new();
+        let extra =
+            &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const DelegatingAggExtra);
+        ffi::duckdb_vector_ensure_validity_writable(result);
+        let base = offset as usize;
 
-    for i in 0..count as usize {
-        // `i` indexes the STATE array (source[0..count]); the RESULT
-        // vector slot is `base + i`. Window aggregates split a result
-        // vector across multiple finalize calls with different offsets;
-        // ignoring `offset` writes past the vector's end / into other
-        // frames' cells.
-        let out_idx = base + i;
-        let slot = *source.add(i) as *mut *mut DelegatingAggState;
-        if slot.is_null() {
-            write_result_null(result, out_idx);
-            continue;
-        }
-        let state_ptr = *slot;
-        if state_ptr.is_null() {
-            write_result_null(result, out_idx);
-            continue;
-        }
-        let state = &mut *state_ptr;
+        for i in 0..count as usize {
+            // `i` indexes the STATE array (source[0..count]); the RESULT
+            // vector slot is `base + i`. Window aggregates split a result
+            // vector across multiple finalize calls with different offsets;
+            // ignoring `offset` writes past the vector's end / into other
+            // frames' cells.
+            let out_idx = base + i;
+            let slot = *source.add(i) as *mut *mut DelegatingAggState;
+            if slot.is_null() {
+                write_result_null(result, out_idx);
+                continue;
+            }
+            let state_ptr = *slot;
+            if state_ptr.is_null() {
+                write_result_null(result, out_idx);
+                continue;
+            }
+            let state = &mut *state_ptr;
 
-        if state.rows.is_empty() {
-            write_result_null(result, out_idx);
-            continue;
-        }
+            if state.rows.is_empty() {
+                write_result_null(result, out_idx);
+                continue;
+            }
 
-        if let Err(e) = run_delegation_and_write(extra, &state.rows, result, out_idx) {
-            eprintln!(
-                "[ducklink] delegating aggregate '{}' finalize failed: {e}",
-                extra.target_name
-            );
-            write_result_null(result, out_idx);
+            if let Err(e) = run_delegation_and_write(extra, &state.rows, result, out_idx) {
+                eprintln!(
+                    "[ducklink] delegating aggregate '{}' finalize failed: {e}",
+                    extra.target_name
+                );
+                write_result_null(result, out_idx);
+            }
         }
-    }
+    });
 }
 
 /// Build the nested delegation SQL, invoke it on the sibling connection,
@@ -430,11 +481,10 @@ fn run_delegation_and_write(
                 match v {
                     Some(v) => {
                         let bytes = v.as_bytes();
-                        let c = std::ffi::CString::new(bytes).unwrap_or_default();
                         ffi::duckdb_vector_assign_string_element_len(
                             result,
                             idx as u64,
-                            c.as_ptr(),
+                            bytes.as_ptr() as *const std::os::raw::c_char,
                             bytes.len() as u64,
                         );
                         set_valid(result, idx);
