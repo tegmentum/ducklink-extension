@@ -159,7 +159,12 @@ mod loadable {
         // even before any component is configured.
         con.register_scalar_function::<DucklinkVersion>("ducklink_version")
             .map_err(stringify)?;
-        let engine = Arc::new(Mutex::new(Engine2::new().map_err(stringify)?));
+        // Give the engine the shared database handle so components can invoke
+        // `nested-exec` on a sibling connection. SAFETY: `db` is the raw
+        // handle DuckDB just handed us; DuckDB owns it for the process lifetime.
+        let engine = Arc::new(Mutex::new(
+            unsafe { Engine2::with_database(db) }.map_err(stringify)?,
+        ));
         let specs = component_specs_from_env();
         let registered = register_components(&con, have_raw.then_some(raw_con), engine, &specs)
             .map_err(stringify)?;

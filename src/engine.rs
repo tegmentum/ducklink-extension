@@ -22,7 +22,7 @@ use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::{
 use ducklink_runtime::reg;
 use ducklink_runtime::{
     load_component, CallbackRegistry, ConfigError, ExtensionInstance, ExtensionServices, LogField,
-    LogLevel, PendingRegistrationsData,
+    LogLevel, NestedExecResult, PendingRegistrationsData,
 };
 
 /// Build a component-model wasmtime engine for running extension components.
@@ -51,11 +51,47 @@ fn build_engine() -> Result<Engine> {
         .context("failed to create wasmtime engine")
 }
 
+/// Raw `duckdb_database` handle wrapper that is safely `Send + Sync` for the
+/// nested-exec sibling-connection path.
+///
+/// DuckDB's raw database handle is owned by DuckDB itself (the loading process);
+/// this crate merely borrows it for the lifetime of the loaded extension. Opening
+/// sibling `duckdb_connection`s off the same database is documented as safe for
+/// concurrent use (each connection has its own transaction). The wrapper carries
+/// only the raw pointer; Drop is a no-op because the extension does NOT own the
+/// database (DuckDB frees it at process teardown).
+///
+/// Direction 2 (this crate) always has an owning database; Direction 1 (the
+/// standalone wasm host) never wires this in — its `NativeServices` equivalent
+/// (`CoreServices` in `crates/ducklink-host`) uses its own path.
+#[cfg(feature = "duckdb-api")]
+#[derive(Clone, Copy)]
+pub struct SharedDatabase(pub duckdb::ffi::duckdb_database);
+
+// SAFETY: `duckdb_database` is a raw pointer to a database instance whose
+// lifetime is managed by DuckDB itself. DuckDB's C API supports concurrent use
+// of the database handle from multiple threads to `duckdb_connect`; the returned
+// per-thread connection is what handles the actual query state, not the shared
+// database. The wrapper only ever hands the raw pointer to `duckdb_connect`,
+// never mutates it, so cross-thread sharing is sound.
+#[cfg(feature = "duckdb-api")]
+unsafe impl Send for SharedDatabase {}
+#[cfg(feature = "duckdb-api")]
+unsafe impl Sync for SharedDatabase {}
+
 /// Config/logging sink for native DuckDB. Logging goes to stderr; config reads
 /// are not yet wired to DuckDB's settings (they return `None`). Routing these to
 /// the DuckDB C API is a follow-up; components that only register functions do
 /// not depend on it.
-struct NativeServices;
+///
+/// `database` is `Some` when the extension was loaded from a native DuckDB
+/// process (Engine2 constructed via [`Engine2::with_database`]), which is what
+/// enables `nested_exec` — the sibling-connection path opens a fresh
+/// `duckdb_connect` on this handle for every nested SQL execution.
+struct NativeServices {
+    #[cfg(feature = "duckdb-api")]
+    database: Option<SharedDatabase>,
+}
 
 impl ExtensionServices for NativeServices {
     fn provider_version(&mut self) -> Result<String, ConfigError> {
@@ -98,6 +134,135 @@ impl ExtensionServices for NativeServices {
             .collect();
         eprintln!("[ducklink:{level:?}] {message} {{{}}}", rendered.join(", "));
     }
+
+    /// Direction-2 nested-exec: open a fresh sibling `duckdb_connection` on the
+    /// captured database handle, run `sql`, marshal the result rows into the
+    /// neutral [`NestedExecResult`] shape, and disconnect. Each call runs in its
+    /// OWN autocommitted transaction on a fresh connection, which is exactly
+    /// what sidesteps the outer statement's active call site.
+    ///
+    /// Fallback: when the extension was loaded without a captured database
+    /// handle (e.g. `Engine2::new()` for a unit test, or a partial init that
+    /// couldn't reach `get_database`), reports unavailability.
+    fn nested_exec(&mut self, sql: &str) -> Result<NestedExecResult, String> {
+        #[cfg(feature = "duckdb-api")]
+        {
+            let db = self
+                .database
+                .ok_or_else(|| "nested-exec: no shared database handle captured".to_string())?;
+            // SAFETY: `SharedDatabase::0` is the raw `duckdb_database` handle
+            // DuckDB gave us at extension init; every FFI call below matches
+            // the C API contract, and every allocated resource (result, error
+            // message, sibling connection, per-cell varchar) is freed on both
+            // the success and error paths before returning.
+            unsafe { native_nested_exec(db.0, sql) }
+        }
+        #[cfg(not(feature = "duckdb-api"))]
+        {
+            let _ = sql;
+            Err("nested-exec: duckdb-api feature is not enabled".to_string())
+        }
+    }
+}
+
+/// The raw-FFI body of Direction-2 nested-exec. Kept out of the trait impl so
+/// it is one clearly-scoped `unsafe` block instead of an unsafe method body.
+///
+/// # Safety
+/// `db` must be the valid `duckdb_database` handle the extension captured at
+/// init (or via [`Engine2::with_database`]); the caller must guarantee it is
+/// still valid for the duration of this call. `sql` is copied into a fresh
+/// `CString` before crossing FFI.
+#[cfg(feature = "duckdb-api")]
+unsafe fn native_nested_exec(
+    db: duckdb::ffi::duckdb_database,
+    sql: &str,
+) -> Result<NestedExecResult, String> {
+    use duckdb::ffi;
+    use std::ffi::{CStr, CString};
+    use std::os::raw::c_char;
+
+    if db.is_null() {
+        return Err("nested-exec: database handle is null".to_string());
+    }
+    let cstr = CString::new(sql)
+        .map_err(|e| format!("nested-exec: SQL contains an interior NUL: {e}"))?;
+
+    // Sibling connection — one per nested_exec call, so each run is a fresh
+    // autocommitted transaction (documented WIT semantic).
+    let mut conn: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(db, &mut conn) != ffi::DuckDBSuccess || conn.is_null() {
+        return Err("nested-exec: duckdb_connect failed".to_string());
+    }
+
+    let mut result: ffi::duckdb_result = std::mem::zeroed();
+    let query_rc = ffi::duckdb_query(conn, cstr.as_ptr() as *const c_char, &mut result);
+
+    if query_rc != ffi::DuckDBSuccess {
+        // DuckDB fills the error message even on failure; retrieve, copy, free.
+        let err_ptr = ffi::duckdb_result_error(&mut result);
+        let msg = if err_ptr.is_null() {
+            "nested-exec: query failed with no error message".to_string()
+        } else {
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        ffi::duckdb_destroy_result(&mut result);
+        ffi::duckdb_disconnect(&mut conn);
+        return Err(msg);
+    }
+
+    let n_cols = ffi::duckdb_column_count(&mut result) as usize;
+    let n_rows = ffi::duckdb_row_count(&mut result) as usize;
+    let rows_affected = ffi::duckdb_rows_changed(&mut result) as u64;
+
+    // Row-producing statement <-> DML: DuckDB reports 0 columns for pure DML
+    // (INSERT/UPDATE/DELETE with no RETURNING), so use column-count as the
+    // discriminator. A SELECT with zero rows still has columns; a DML with
+    // RETURNING has columns AND a nonzero rows_affected — we surface both.
+    let out_rows: Option<Vec<Vec<String>>> = if n_cols > 0 {
+        let mut buf = Vec::with_capacity(n_rows);
+        for r in 0..n_rows {
+            let mut row = Vec::with_capacity(n_cols);
+            for c in 0..n_cols {
+                if ffi::duckdb_value_is_null(&mut result, c as u64, r as u64) {
+                    row.push(String::new());
+                    continue;
+                }
+                let ptr =
+                    ffi::duckdb_value_varchar(&mut result, c as u64, r as u64);
+                if ptr.is_null() {
+                    row.push(String::new());
+                    continue;
+                }
+                let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+                ffi::duckdb_free(ptr as *mut _);
+                row.push(s);
+            }
+            buf.push(row);
+        }
+        Some(buf)
+    } else {
+        None
+    };
+
+    let out_rows_affected: Option<u64> = if n_cols == 0 {
+        // Pure DML with no columns: report the affected-row count.
+        Some(rows_affected)
+    } else if rows_affected != 0 {
+        // DML with RETURNING (or a statement DuckDB reports rows_changed for
+        // while also producing rows): include the count alongside `rows`.
+        Some(rows_affected)
+    } else {
+        None
+    };
+
+    ffi::duckdb_destroy_result(&mut result);
+    ffi::duckdb_disconnect(&mut conn);
+
+    Ok(NestedExecResult {
+        rows: out_rows,
+        rows_affected: out_rows_affected,
+    })
 }
 
 /// A scalar function a loaded component registered, ready to bridge into
@@ -177,6 +342,13 @@ pub struct Engine2 {
     engine: Engine,
     callbacks: Arc<Mutex<CallbackRegistry>>,
     instances: HashMap<String, ExtensionInstance>,
+    /// Captured `duckdb_database` handle for the nested-exec sibling-connection
+    /// path. `Some` when the extension was loaded from a live DuckDB (the
+    /// `.duckdb_extension` init path grabs it via `get_database` and calls
+    /// [`Engine2::with_database`]); `None` for tests / non-DB entry points, in
+    /// which case nested-exec reports unavailability instead of trapping.
+    #[cfg(feature = "duckdb-api")]
+    database: Option<SharedDatabase>,
 }
 
 impl Engine2 {
@@ -185,6 +357,26 @@ impl Engine2 {
             engine: build_engine()?,
             callbacks: Arc::new(Mutex::new(CallbackRegistry::new())),
             instances: HashMap::new(),
+            #[cfg(feature = "duckdb-api")]
+            database: None,
+        })
+    }
+
+    /// Like [`Engine2::new`] but captures the DuckDB `duckdb_database` handle
+    /// the extension init hook received, so `nested_exec` can open sibling
+    /// connections on the same database.
+    ///
+    /// # Safety
+    /// `db` must be a valid `duckdb_database` handle whose lifetime outlives the
+    /// loaded components (the DuckDB process owns it, so this is trivially true
+    /// for a loadable extension that lives inside DuckDB).
+    #[cfg(feature = "duckdb-api")]
+    pub unsafe fn with_database(db: duckdb::ffi::duckdb_database) -> Result<Self> {
+        Ok(Self {
+            engine: build_engine()?,
+            callbacks: Arc::new(Mutex::new(CallbackRegistry::new())),
+            instances: HashMap::new(),
+            database: Some(SharedDatabase(db)),
         })
     }
 
@@ -204,11 +396,15 @@ impl Engine2 {
             .inherit_network()
             .allow_ip_name_lookup(true)
             .build();
+        let services = NativeServices {
+            #[cfg(feature = "duckdb-api")]
+            database: self.database,
+        };
         let mut instance = load_component(
             &self.engine,
             &component,
             wasi,
-            Box::new(NativeServices),
+            Box::new(services),
             self.callbacks.clone(),
             extension.to_string(),
         )?;

@@ -21,7 +21,8 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use crate::duckdb_extension_bindings::duckdb::extension::{
     catalog as extension_catalog, config as extension_config, files as extension_files,
     collation as extension_collation, files_reg as extension_files_reg, index as extension_index,
-    logging as extension_logging, query as extension_query, runtime as extension_runtime,
+    logging as extension_logging, nested_exec as extension_nested_exec,
+    query as extension_query, runtime as extension_runtime,
     storage as extension_storage, types as extension_types,
 };
 use crate::duckdb_extension_bindings::{DuckdbExtension, DuckdbExtensionPre};
@@ -62,6 +63,55 @@ pub struct LogField {
     pub value: String,
 }
 
+/// Result of a `nested-exec` invocation. Neutral mirror of
+/// `duckdb:extension/nested-exec.exec-result`. Either `rows` (for row-producing
+/// statements) or `rows_affected` (for DML) is populated; both may be `None`
+/// for a statement that produced neither (e.g. `SET`, `PRAGMA` with no result).
+#[derive(Debug, Clone, Default)]
+pub struct NestedExecResult {
+    pub rows: Option<Vec<Vec<String>>>,
+    pub rows_affected: Option<u64>,
+}
+
+/// Maximum nesting depth the host enforces for `nested-exec`. Applied per
+/// OS-thread (a re-entrant chain of extension callbacks stays on one thread,
+/// so a thread-local counter catches accidental cascades — e.g. a fieldbook
+/// entry that itself calls `fieldbook_run`). Documented default from the WIT.
+pub const NESTED_EXEC_MAX_DEPTH: u32 = 4;
+
+thread_local! {
+    /// Per-OS-thread nesting-depth counter for `nested-exec`. Bumped on entry
+    /// via [`NestedExecDepthGuard::enter`], decremented on drop.
+    static NESTED_EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that bumps the per-thread nested-exec depth on construction and
+/// decrements it on drop. `enter` returns `Err(message)` when a bump would push
+/// the counter past [`NESTED_EXEC_MAX_DEPTH`] — the counter is left unchanged
+/// in that case, so the caller must not decrement it.
+struct NestedExecDepthGuard;
+
+impl NestedExecDepthGuard {
+    fn enter() -> Result<Self, String> {
+        NESTED_EXEC_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= NESTED_EXEC_MAX_DEPTH {
+                return Err(format!(
+                    "nested-exec: max nesting depth {NESTED_EXEC_MAX_DEPTH} exceeded"
+                ));
+            }
+            d.set(cur + 1);
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for NestedExecDepthGuard {
+    fn drop(&mut self) {
+        NESTED_EXEC_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Services a loaded component requests from the running database: reading
 /// configuration and emitting logs. Implemented per direction (the host routes
 /// to DuckDB-compiled-to-wasm; the native extension to native DuckDB).
@@ -89,6 +139,18 @@ pub trait ExtensionServices: Send {
     /// live connection (e.g. tests) still compile.
     fn query(&mut self, _sql: &str) -> Result<Vec<Vec<String>>, String> {
         Err("live query not available in this host".to_string())
+    }
+
+    /// EXECUTE-capable counterpart to [`query`](Self::query). Run `sql` on a
+    /// SIBLING connection to the same database — a fresh, autocommitted
+    /// transaction that sidesteps the outer statement's core-mutex + wasm-store
+    /// re-entrancy. Callable from inside a scalar/table callback.
+    ///
+    /// The Direction-2 (native DuckDB) impl opens a fresh `duckdb_connect` on
+    /// the shared db handle. The default returns Err so directions without
+    /// exec plumbing still compile.
+    fn nested_exec(&mut self, _sql: &str) -> Result<NestedExecResult, String> {
+        Err("nested-exec not available in this host".to_string())
     }
 }
 
@@ -1197,6 +1259,39 @@ impl extension_query::Host for ExtensionStoreState {
                     .collect::<BindgenVec<String>>()
             })
             .collect())
+    }
+}
+
+// The `nested-exec` interface: an EXECUTE-capable counterpart to `query` that
+// runs SQL on a SIBLING connection to the same database. Guarded by a
+// per-OS-thread nesting-depth counter so a fieldbook entry that recursively
+// invokes `fieldbook_run` cannot spiral out of control.
+impl extension_nested_exec::Host for ExtensionStoreState {
+    fn nested_exec(
+        &mut self,
+        sql: String,
+    ) -> Result<extension_nested_exec::Execresult, String> {
+        let _depth = NestedExecDepthGuard::enter()?;
+        let result = self.services.nested_exec(&sql)?;
+        Ok(neutral_nestedresult_to_wit(result))
+    }
+}
+
+fn neutral_nestedresult_to_wit(
+    r: NestedExecResult,
+) -> extension_nested_exec::Execresult {
+    let rows: Option<BindgenVec<BindgenVec<String>>> = r.rows.map(|rs| {
+        rs.into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(Into::into)
+                    .collect::<BindgenVec<String>>()
+            })
+            .collect()
+    });
+    extension_nested_exec::Execresult {
+        rows,
+        rows_affected: r.rows_affected,
     }
 }
 
@@ -2636,6 +2731,13 @@ pub fn add_extension_interfaces_to_linker(
     extension_collation::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
     extension_files_reg::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
     extension_query::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(linker, |s| s)?;
+    // EXECUTE-capable counterpart to `query`. The host always PROVIDES it; only
+    // exec-capable components (fieldbook) import it. Uses a sibling connection
+    // and a per-thread depth cap; see `NestedExecDepthGuard`.
+    extension_nested_exec::add_to_linker::<ExtensionStoreState, ExtensionStoreState>(
+        linker,
+        |s| s,
+    )?;
     Ok(())
 }
 

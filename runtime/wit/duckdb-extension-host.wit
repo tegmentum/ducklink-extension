@@ -15,6 +15,7 @@ use duckdb:extension/collation@2.0.0;
 use duckdb:extension/files-reg@2.0.0;
 use duckdb:extension/file-dispatch@2.0.0;
 use duckdb:extension/query@2.0.0;
+use duckdb:extension/nested-exec@2.0.0;
 use duckdb:extension/guest@2.0.0;
 
 // Base extension world: every loadable extension exports these. storage-dispatch
@@ -39,6 +40,11 @@ world duckdb-extension {
   // others don't. Listed here so the host bindings generate the `query::Host`
   // trait + `add_to_linker`.
   import duckdb:extension/query@2.0.0;
+  // A host-provided EXECUTE-capable counterpart to `query`. Runs SQL on a
+  // sibling connection to the same database, sidestepping the outer statement's
+  // re-entrancy that blocks `query` inside a callback. The host always PROVIDES
+  // it; only exec-capable components (fieldbook) import it.
+  import duckdb:extension/nested-exec@2.0.0;
   export duckdb:extension/guest@2.0.0;
   export callback-dispatch;
 }
