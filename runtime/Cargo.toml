@@ -2,6 +2,7 @@
 name = "ducklink-runtime"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 description = "Reusable wasm-component-loading engine shared by the ducklink host and the native-DuckDB ducklink extension"
 license = "MIT"
 publish = false
@@ -11,10 +12,10 @@ publish = false
 # bindings are ABI-identical across both directions, and so this matches the
 # sqlink host + the webassembly-component-orchestration framework (which is on
 # 45.0.1), letting ducklink later reuse the framework's compose:dynlink host.
-wasmtime = { version = "46.0.1", features = ["component-model", "cache"] }
+wasmtime = { version = "47.0.2", features = ["component-model", "cache"] }
 # The extension store-state holds a WasiCtx and implements WasiView (components
 # target wasip2). Same version as wasmtime.
-wasmtime-wasi = "46.0.1"
+wasmtime-wasi = "47.0.2"
 # The witcanon contract-digest scheme: sha256("witcanon:1" || canonical WIT
 # bytes), byte-identical to compose-core::blobs::compute_wit_digest in
 # ~/git/webassembly-component-orchestration so digests interoperate. build.rs
@@ -24,12 +25,12 @@ hex = "0.4"
 # former inline `component_contract_major`/`check_component_contract` so the
 # same guard backs both the ducklink and sqlink hosts (datalink is public).
 # The witcanon CONTRACT_DIGEST (above) stays per-repo; this is the @MAJOR proxy.
-datalink-contract = { git = "https://github.com/tegmentum/datalink.git", rev = "80010adf7c9ec3d07674bba12585c787328217f5" }
+datalink-contract = { git = "https://github.com/tegmentum/datalink.git", rev = "55289c8798441c7c28e69e136a7ecc1c2ea542cb" }
 # The shared store-generic compose:dynlink/linker host machinery + the
 # ResidentBackend (instantiate-once-and-reuse provider lifecycle). ducklink's
 # compose_dynlink module is now a thin adapter over this; the resolve/invoke
 # bridge + bindings live here, shared with the other wasm-component hosts.
-datalink-dynlink = { git = "https://github.com/tegmentum/datalink.git", rev = "80010adf7c9ec3d07674bba12585c787328217f5" }
+datalink-dynlink = { git = "https://github.com/tegmentum/datalink.git", rev = "55289c8798441c7c28e69e136a7ecc1c2ea542cb" }
 
 [build-dependencies]
 # Same witcanon scheme, used in build.rs to hash the canonical WIT into a const.

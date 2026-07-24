@@ -89,7 +89,19 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
         T_DOUBLE => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
         T_VARCHAR => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
         T_BLOB => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
-        _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        // Sweep-9 Item 2: fail-loud catch-all. Mirrors the sweep-7 F2 shape at
+        // `reg_duckdb::wit_logicaltype_from_code`. Any code the delegating
+        // aggregate is registered with that isn't wired here used to silently
+        // degrade to VARCHAR — log the code so the gap is visible. Still
+        // return VARCHAR so registration doesn't panic; the peer arms in
+        // `extract_value` also fail-loud on the same code.
+        unhandled => {
+            eprintln!(
+                "ducklink: duckdb_type_of (delegating_agg): unknown type code \
+                 '{unhandled}' — returning VARCHAR as fallback"
+            );
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR
+        }
     }
 }
 

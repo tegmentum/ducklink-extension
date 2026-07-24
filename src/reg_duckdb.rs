@@ -432,6 +432,15 @@ unsafe fn read_col_to_colvec(
             ColvecColumn::Interval(out)
         }
         T_DECIMAL => {
+            // Sweep-9 Item 4: read the real (width, scale) from the vector's
+            // own LogicalTypeHandle via `FlatVector::logical_type()` — no
+            // signature change required since `vec: &FlatVector` is already
+            // in scope. Closes the Gap 2 continuation for the read side of
+            // the scalar / aggregate colvec path (peer to sweep-6's
+            // `wit_logicaltype_from_code` FIX 3 for the COPY-TO path).
+            let handle = vec.logical_type();
+            let width = handle.decimal_width();
+            let scale = handle.decimal_scale();
             let s = vec.as_slice_with_len::<i128>(len);
             let out: Vec<ColvecDecimal> = s
                 .iter()
@@ -440,10 +449,8 @@ unsafe fn read_col_to_colvec(
                     ColvecDecimal {
                         lower: u as u64,
                         upper: (u >> 64) as u64,
-                        // The value's width/scale is not available from the flat
-                        // vector here; the registration declared DECIMAL(18, 3).
-                        width: 18,
-                        scale: 3,
+                        width,
+                        scale,
                     }
                 })
                 .collect();
@@ -1200,8 +1207,26 @@ fn write_ret(
             };
         }
         (T_DECIMAL, WitVal::Decimal(d)) => {
-            // HUGEINT-backed. The declared column is DECIMAL(18, 3); a value whose
-            // width/scale differ would be misinterpreted (known limitation).
+            // HUGEINT-backed. Storage is the raw unscaled i128 — the column's
+            // declared LogicalType supplies the (width, scale) DuckDB uses to
+            // interpret it. Sweep-9 Item 4: fail-loud when the guest returns
+            // a value whose (width, scale) does not match the target column's
+            // declared shape (previously "known limitation"). Read the real
+            // shape from the vector's own LogicalTypeHandle
+            // (`FlatVector::logical_type()`) so callers don't need to thread
+            // an lt parameter; the mismatch surfaces as an eprintln (the raw
+            // i128 is still written — DuckDB will apply its own scale).
+            let handle = vec.logical_type();
+            let col_w = handle.decimal_width();
+            let col_s = handle.decimal_scale();
+            if d.width != col_w || d.scale != col_s {
+                eprintln!(
+                    "ducklink: write_ret DECIMAL guest returned value with shape ({}, {}) \
+                     but column declared DECIMAL({}, {}) — value will be misinterpreted; \
+                     writing raw i128 anyway",
+                    d.width, d.scale, col_w, col_s
+                );
+            }
             let s = unsafe { vec.as_mut_slice_with_len::<i128>(len) };
             s[i] = (((d.upper as u128) << 64) | d.lower as u128) as i128;
         }
@@ -1494,115 +1519,183 @@ impl VScalar for WasmScalar {
 /// Register every component scalar on `con`. Returns the count registered. All
 /// `reg` logical types are supported across any arity.
 ///
-/// T2-6 (major-5): the base-scalar overload-set migration was ATTEMPTED-AND-
-/// DEFERRED. The stable C API `duckdb_create_scalar_function_set` +
+/// T2-6 (major-5, PARTIAL): the full base-scalar `VScalar` -> raw-C-API
+/// invoke-ABI migration is still deferred (see the risk-analysis block
+/// below). What DID land: multi-overload groups within a single load now
+/// install through the C API `duckdb_scalar_function_set` +
 /// `duckdb_add_scalar_function_to_set` + `duckdb_register_scalar_function_set`
-/// path is used successfully for the `register_scalar_ex` sibling (varargs /
-/// special-null / VOLATILE overloads land as a shared set). Migrating the
-/// BASE scalar path off `VScalar` to match would require:
+/// path when a raw connection is available, reusing the row-major
+/// `ducklink_scalar_ex_invoke` machinery (their `ScalarExExtra` fields are
+/// identical to what base scalars need — `callback_handle`, `engine`,
+/// `arg_codes`, `ret_code`). Singletons continue to use the safe
+/// `VScalar` `register_scalar_function_with_state` installer so the
+/// column-major fast path (`refill_colvec` / `write_colvec` / the
+/// SCALAR_ARGS_SCRATCH thread-locals) is preserved for the common case.
+/// Multi-overload groups therefore pay the row-major penalty (matching
+/// scalar_ex's tradeoff).
+///
+/// SAFETY of the mixed installer: VScalar and raw C API are never used
+/// under the SAME name — a name is either a singleton (VScalar) or a
+/// multi-overload group (raw C API). Names are disjoint by construction.
+///
+/// If `raw_con` is `None`, multi-overload groups fall back to the pre-T2-6
+/// behavior: first overload registers via VScalar, subsequent overloads
+/// are logged and skipped. Loadable entry points that call this without a
+/// raw connection lose overload-set support.
+///
+/// ---- WHY THE FULL VScalar -> raw-C-API MIGRATION IS STILL DEFERRED ----
+/// Migrating the SINGLETON path off `VScalar` to match `register_scalar_ex`
+/// would require:
 ///
 ///   * Rewriting `WasmScalar::invoke` — currently a safe
 ///     `fn(&State, &mut DataChunkHandle, &mut dyn WritableVector) -> Result`
 ///     that duckdb-rs boxes into a C ABI callback — as a raw
-///     `unsafe extern "C" fn(info, input_chunk, output_vec)` (matching
-///     `ducklink_scalar_ex_invoke`). Every downstream helper the safe path
-///     depends on (`FlatVector`, `refill_colvec` on a scratch borrow,
-///     `write_colvec`'s `WritableVector`, the SCALAR_ARGS_SCRATCH /
-///     SCALAR_NULL_MASK_SCRATCH thread-locals, the `guard()` panic
-///     firewall, the `QueryReentrancyGuard` re-entrancy check) has to be
-///     re-plumbed against the raw `duckdb_data_chunk` + `duckdb_vector`
-///     handles rather than the duckdb-rs wrappers.
+///     `unsafe extern "C" fn(info, input_chunk, output_vec)`. Every
+///     downstream helper the safe path depends on (`FlatVector`,
+///     `refill_colvec` on a scratch borrow, `write_colvec`'s
+///     `WritableVector`, the SCALAR_ARGS_SCRATCH / SCALAR_NULL_MASK_SCRATCH
+///     thread-locals, the `guard()` panic firewall, the
+///     `QueryReentrancyGuard` re-entrancy check) has to be re-plumbed
+///     against the raw `duckdb_data_chunk` + `duckdb_vector` handles.
 ///   * Deleting the `PENDING_SIGNATURE` thread-local (raw C API takes
 ///     arg types explicitly via `duckdb_scalar_function_add_parameter`).
-///   * A new `build_wasm_scalar_function` mirroring `build_scalar_ex_function`
-///     that installs the WasmScalarState via `duckdb_scalar_function_set_extra_info`
-///     and threads the invoke callback + extra-info destroy path.
-///   * The set installer then groups by (extension, name) and mirrors
-///     `register_scalar_ex`'s set + singleton branches (same ownership
-///     argument: the C API copies each per-overload handle into the set,
-///     so the per-overload handle is destroyed immediately after add).
+///   * A new columnar `build_wasm_scalar_function` mirroring
+///     `build_base_scalar_function` above but preserving the column-major
+///     dispatch (`dispatch_scalar_batch_col`, not `dispatch_scalar`).
 ///
-/// That migration is materially larger than the T2-6 slice budget and
-/// touches every hot-path scratch + guard site. Landing it partial (raw
-/// invoke but preserving `VScalar` sig plumbing) is worse than not landing
-/// it at all — the invoke ABI must match the C API's `duckdb_scalar_function`
-/// contract exactly or DuckDB will call into freed memory. Chose the
-/// **fail-loud DOCUMENTED DEFERRAL** per the "prefer partial with clear
-/// reason over broken" guidance.
-///
-/// Interim state: this path stays on duckdb-rs' safe
-/// `register_scalar_function_with_state`, which underneath calls
-/// `duckdb_register_scalar_function` (single-overload). Registering
-/// `my_add(INT, INT)` and then `my_add(DOUBLE, DOUBLE)` from the same load
-/// still fails on the SECOND registration — the duplicate-name loud-log
-/// below flags the shortfall explicitly instead of the generic "already
-/// present?" message. Callers that need overload sets today must route
-/// through `register-scalar-ex` (whose overloaded path IS wired) and pay
-/// the ex-flag row-major invoke penalty for now.
+/// That singleton-path rewrite is orthogonal to the overload-set goal —
+/// the goal was unblocked by the partial above without touching the hot
+/// column-major dispatch. Landing the singleton rewrite partial (raw
+/// invoke but preserving `VScalar` sig plumbing) would be worse than not
+/// landing it at all — the invoke ABI must match the C API's
+/// `duckdb_scalar_function` contract exactly or DuckDB will call into
+/// freed memory. Chose the fail-loud DOCUMENTED DEFERRAL for that slice.
 pub fn register_scalars(
     con: &Connection,
     engine: Arc<Engine2>,
     scalars: &[ScalarFunc],
 ) -> duckdb::Result<usize> {
+    register_scalars_impl(con, None, engine, scalars)
+}
+
+/// Variant of `register_scalars` that also accepts a raw connection so
+/// multi-overload groups can install via `duckdb_scalar_function_set`.
+///
+/// # Safety
+/// When `Some`, `raw_con` must be a valid `duckdb_connection` sharing the
+/// database with `con`.
+pub unsafe fn register_scalars_with_raw(
+    con: &Connection,
+    raw_con: ffi::duckdb_connection,
+    engine: Arc<Engine2>,
+    scalars: &[ScalarFunc],
+) -> duckdb::Result<usize> {
+    let raw = if raw_con.is_null() { None } else { Some(raw_con) };
+    register_scalars_impl(con, raw, engine, scalars)
+}
+
+fn register_scalars_impl(
+    con: &Connection,
+    raw_con: Option<ffi::duckdb_connection>,
+    engine: Arc<Engine2>,
+    scalars: &[ScalarFunc],
+) -> duckdb::Result<usize> {
     use std::collections::HashMap;
-    let mut per_name: HashMap<&str, usize> = HashMap::new();
-    for f in scalars {
-        *per_name.entry(f.name.as_str()).or_insert(0) += 1;
-    }
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    let mut registered = 0usize;
-    for f in scalars {
-        let count = per_name.get(f.name.as_str()).copied().unwrap_or(1);
-        let n_so_far = seen.entry(f.name.as_str()).or_insert(0);
-        *n_so_far += 1;
-        if count > 1 && *n_so_far > 1 {
-            // Overload set: >1 signature for the same name in this load.
-            eprintln!(
-                "[ducklink] scalar function '{}' already registered on this load — \
-                 duckdb overloads under one name require \
-                 `duckdb_scalar_function_set` support, which this path does not \
-                 yet use (T2-6). Skipping overload #{} of {}.",
-                f.name, n_so_far, count
-            );
-            continue;
+    // Group by name to detect multi-overload sets. Order preserved by insertion.
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (i, f) in scalars.iter().enumerate() {
+        match index.get(&f.name) {
+            Some(&g) => groups[g].1.push(i),
+            None => {
+                index.insert(f.name.clone(), groups.len());
+                groups.push((f.name.clone(), vec![i]));
+            }
         }
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
-        // T2-7: capture the declared complex type-expression per arg so
-        // `read_col_to_colvec` can emit it on every `ColvecComplex` rather
-        // than erasing to `""`. Non-complex args carry `None`.
-        let arg_type_exprs: Vec<Option<String>> = f
-            .arguments
-            .iter()
-            .map(|a| match &a.logical {
-                reg::LogicalType::Complex(e) => Some(e.clone()),
-                _ => None,
-            })
-            .collect();
-        let ret_code = type_code(&f.returns);
-        let state = WasmScalarState {
-            callback_handle: f.callback_handle,
-            engine: engine.clone(),
-            arg_codes: arg_codes.clone(),
-            arg_type_exprs,
-            ret_code,
-        };
-        // Hand the signature to `WasmScalar::signatures()` for this one call.
-        PENDING_SIGNATURE.with(|s| *s.borrow_mut() = Some((arg_codes, ret_code)));
-        let result = con.register_scalar_function_with_state::<WasmScalar>(&f.name, &state);
-        PENDING_SIGNATURE.with(|s| *s.borrow_mut() = None);
-        // IDEMPOTENCY: a function of this name already in the catalog (a re-load
-        // of the same component, or a name another component already claimed) is
-        // NOT a hard error — DuckDB rejects the duplicate registration, which we
-        // treat as "already present" and skip, so `ducklink_load` can be called
-        // again without failing.
-        match result {
-            Ok(()) => registered += 1,
-            Err(e) => {
-                eprintln!("[ducklink] scalar '{}' not registered (already present?): {e}", f.name);
+    }
+
+    let mut registered = 0usize;
+    for (name, member_ixs) in &groups {
+        // Multi-overload group: install via C API function-set (T2-6 partial).
+        if member_ixs.len() > 1 {
+            if let Some(rc) = raw_con {
+                let members: Vec<&ScalarFunc> = member_ixs.iter().map(|&i| &scalars[i]).collect();
+                let n = unsafe {
+                    register_scalar_overload_set(rc, engine.clone(), name, &members)
+                };
+                registered += n;
+                continue;
+            }
+            // No raw connection: fall back to the pre-T2-6 behavior — register
+            // the first overload via VScalar, log-and-skip the rest.
+            eprintln!(
+                "[ducklink] scalar function '{name}' has {} overloads but no raw \
+                 connection was supplied to install a `duckdb_scalar_function_set`. \
+                 Registering the first overload only; subsequent overloads will \
+                 be skipped (T2-6 partial).",
+                member_ixs.len()
+            );
+        }
+        // Singleton (or fallback with no raw_con): install via safe VScalar.
+        // Only the first overload is attempted; extras (if any) are logged.
+        let mut first = true;
+        for &i in member_ixs {
+            let f = &scalars[i];
+            if !first {
+                eprintln!(
+                    "[ducklink] scalar function '{}' overload skipped: singleton \
+                     VScalar path can only install one signature per name",
+                    f.name
+                );
+                continue;
+            }
+            first = false;
+            match install_singleton_vscalar(con, engine.clone(), f) {
+                Ok(()) => registered += 1,
+                Err(e) => {
+                    eprintln!("[ducklink] scalar '{}' not registered (already present?): {e}", f.name);
+                }
             }
         }
     }
     Ok(registered)
+}
+
+fn install_singleton_vscalar(
+    con: &Connection,
+    engine: Arc<Engine2>,
+    f: &ScalarFunc,
+) -> duckdb::Result<()> {
+    let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
+    // T2-7: capture the declared complex type-expression per arg so
+    // `read_col_to_colvec` can emit it on every `ColvecComplex` rather
+    // than erasing to `""`. Non-complex args carry `None`.
+    let arg_type_exprs: Vec<Option<String>> = f
+        .arguments
+        .iter()
+        .map(|a| match &a.logical {
+            reg::LogicalType::Complex(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+    let ret_code = type_code(&f.returns);
+    let state = WasmScalarState {
+        callback_handle: f.callback_handle,
+        engine: engine.clone(),
+        arg_codes: arg_codes.clone(),
+        arg_type_exprs,
+        ret_code,
+    };
+    // Hand the signature to `WasmScalar::signatures()` for this one call.
+    PENDING_SIGNATURE.with(|s| *s.borrow_mut() = Some((arg_codes, ret_code)));
+    let result = con.register_scalar_function_with_state::<WasmScalar>(&f.name, &state);
+    PENDING_SIGNATURE.with(|s| *s.borrow_mut() = None);
+    // IDEMPOTENCY: a function of this name already in the catalog (a re-load
+    // of the same component, or a name another component already claimed) is
+    // NOT a hard error — DuckDB rejects the duplicate registration, which we
+    // treat as "already present" and skip, so `ducklink_load` can be called
+    // again without failing.
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -2634,7 +2727,18 @@ unsafe fn logical_type_ffi_from_lt(lt: &reg::LogicalType) -> ffi::duckdb_logical
 }
 
 /// Read row `i` of a raw input vector (type `code`) into a neutral value.
-unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::DuckValue {
+///
+/// Sweep-9 Item 4: `lt` is the vector's `duckdb_logical_type` handle when the
+/// caller has one to hand; it is only consulted for the DECIMAL arm to read
+/// the real `(width, scale)`. `None` keeps the DECIMAL(18, 3) interim shape
+/// (Gap 2 continuation). Mirrors the sweep-6 `wit_logicaltype_from_code`
+/// `Option<lt>` shape. The handle is borrowed — this fn never destroys it.
+unsafe fn read_arg_raw(
+    code: u8,
+    vector: ffi::duckdb_vector,
+    i: usize,
+    lt: Option<ffi::duckdb_logical_type>,
+) -> reg::DuckValue {
     let validity = ffi::duckdb_vector_get_validity(vector);
     if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, i as u64) {
         return reg::DuckValue::Null;
@@ -2680,21 +2784,23 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
             }
         }
         // T1-4: DECIMAL round-trips through the raw aggregate path as an
-        // i128 unscaled value. Scale is defaulted to 3 because Gap 2
-        // (decimal precision/scale plumbing) is not yet landed and
-        // `logical_type(T_DECIMAL)` above declares columns as
-        // DECIMAL(18, 3); read_arg_raw stays in lockstep so the value the
-        // guest sees matches the type the column was declared with.
-        // TODO Gap 2: read the real width/scale from the vector's own
-        // `duckdb_decimal_scale(duckdb_vector_get_column_type(vector))`
-        // once the neutral `reg::LogicalType::Decimal` carries them.
+        // i128 unscaled value.
+        // Sweep-9 Item 4: use the vector's LogicalType (via the `lt` handle)
+        // to read the real (width, scale). Callers that don't have a handle
+        // pass `None` and the DECIMAL(18, 3) interim fallback stands (Gap 2
+        // continuation) — mirrors the peer arm in `wit_logicaltype_from_code`.
         T_DECIMAL => {
             let unscaled = *(data as *const i128).add(i);
+            let (width, scale) = if let Some(handle) = lt {
+                (ffi::duckdb_decimal_width(handle), ffi::duckdb_decimal_scale(handle))
+            } else {
+                (18, 3)
+            };
             reg::DuckValue::Decimal {
                 lower: unscaled as u64,
                 upper: (unscaled >> 64) as u64,
-                width: 18,
-                scale: 3,
+                width,
+                scale,
             }
         }
         // T2-1 residual (major-5): HUGEINT is DuckDB's 128-bit signed integer.
@@ -2762,12 +2868,22 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
 /// Write a neutral value into row `i` of a raw result vector (type `code`). Takes
 /// the value by reference so the caller can walk its `Vec<Vec<DuckValue>>`
 /// without cloning each cell.
+///
+/// Sweep-9 Item 4: `lt` is the target vector's `duckdb_logical_type` handle
+/// when the caller has one to hand. Currently informational only — DECIMAL
+/// storage is the raw i128 (the target column's declared (width, scale) is
+/// authoritative, and the guest value's width/scale are informational per
+/// the existing arm's comment). Threaded through for symmetry with
+/// `read_arg_raw` and to unblock future arms that need per-cell type
+/// introspection. The handle is borrowed — this fn never destroys it.
 pub(crate) unsafe fn write_ret_raw(
     code: u8,
     vector: ffi::duckdb_vector,
     i: usize,
     v: &reg::DuckValue,
+    lt: Option<ffi::duckdb_logical_type>,
 ) -> Result<(), String> {
+    let _ = lt; // reserved for future arms; DECIMAL storage is width/scale-agnostic on the write side.
     if matches!(v, reg::DuckValue::Null) {
         ffi::duckdb_vector_ensure_validity_writable(vector);
         let validity = ffi::duckdb_vector_get_validity(vector);
@@ -2926,6 +3042,13 @@ unsafe extern "C" fn agg_update(
             .iter()
             .map(|&v| ffi::duckdb_vector_get_validity(v) as *const u64)
             .collect();
+        // Sweep-9 Item 4: per-column LogicalType handles, hoisted ONCE per
+        // chunk so `read_arg_raw` can extract DECIMAL (width, scale) without
+        // an FFI per row. These handles are owned — destroy after the chunk.
+        let col_lts: Vec<ffi::duckdb_logical_type> = vectors
+            .iter()
+            .map(|&v| ffi::duckdb_vector_get_column_type(v))
+            .collect();
         // H1 fast path: when every row in the chunk targets the SAME state
         // pointer (the ungrouped `SELECT agg(f(x)) FROM t` shape — the whole
         // aggregate accumulates into one group), we can bulk-copy the whole
@@ -2955,9 +3078,12 @@ unsafe extern "C" fn agg_update(
             if let AggState::RowMajor(rows) = group {
                 for row in 0..n {
                     let argrow: Vec<reg::DuckValue> = (0..ncols)
-                        .map(|c| read_arg_raw(extra.arg_codes[c], vectors[c], row))
+                        .map(|c| read_arg_raw(extra.arg_codes[c], vectors[c], row, Some(col_lts[c])))
                         .collect();
                     rows.push(argrow);
+                }
+                for mut lt in col_lts {
+                    ffi::duckdb_destroy_logical_type(&mut lt);
                 }
                 return;
             }
@@ -2978,11 +3104,16 @@ unsafe extern "C" fn agg_update(
                 }
                 AggState::RowMajor(rows) => {
                     let argrow: Vec<reg::DuckValue> = (0..ncols)
-                        .map(|c| read_arg_raw(extra.arg_codes[c], vectors[c], row))
+                        .map(|c| read_arg_raw(extra.arg_codes[c], vectors[c], row, Some(col_lts[c])))
                         .collect();
                     rows.push(argrow);
                 }
             }
+        }
+        // Destroy hoisted per-column LogicalType handles now that the chunk
+        // is fully consumed.
+        for mut lt in col_lts {
+            ffi::duckdb_destroy_logical_type(&mut lt);
         }
     });
 }
@@ -3033,6 +3164,9 @@ unsafe extern "C" fn agg_finalize(
         // need a guard.
         let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
         let extra = &*(ffi::duckdb_aggregate_function_get_extra_info(info) as *const AggExtra);
+        // Sweep-9 Item 4: hoist the result vector's LogicalType handle once
+        // per finalize so `write_ret_raw` can thread it through per row.
+        let result_lt = ffi::duckdb_vector_get_column_type(result);
         for i in 0..count as usize {
             let group = &mut **(*source.add(i) as *mut *mut AggState);
             let taken = std::mem::take(group);
@@ -3070,14 +3204,18 @@ unsafe extern "C" fn agg_finalize(
             let out = offset as usize + i;
             let write = dispatched
                 .map_err(|e| e.to_string())
-                .and_then(|v| write_ret_raw(extra.ret_code, result, out, &v));
+                .and_then(|v| write_ret_raw(extra.ret_code, result, out, &v, Some(result_lt)));
             if let Err(msg) = write {
                 if let Ok(c) = CString::new(msg) {
                     ffi::duckdb_aggregate_function_set_error(info, c.as_ptr());
                 }
+                let mut lt = result_lt;
+                ffi::duckdb_destroy_logical_type(&mut lt);
                 return;
             }
         }
+        let mut lt = result_lt;
+        ffi::duckdb_destroy_logical_type(&mut lt);
     });
 }
 
@@ -3847,8 +3985,12 @@ pub unsafe fn load_wasm_into_db(
     // keeps a single registration path for both tiers.)
     let _ = db;
     let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
-    let scalars =
-        register_scalars(&con, rt.engine.clone(), &loaded.scalars).map_err(|e| e.to_string())?;
+    // T2-6 partial: pass raw_con so multi-overload groups can install via
+    // `duckdb_scalar_function_set`. Singletons still route through VScalar.
+    let scalars = unsafe {
+        register_scalars_with_raw(&con, rt.raw_con.0, rt.engine.clone(), &loaded.scalars)
+    }
+    .map_err(|e| e.to_string())?;
     let tables =
         register_tables(&con, rt.engine.clone(), &loaded.tables).map_err(|e| e.to_string())?;
     drop(con);
@@ -4110,8 +4252,12 @@ impl VTab for WasmLoad {
             // statement. The init connection is a SEPARATE connection from the one
             // binding this call, so this is not catalog re-entrancy.
             let con = rt.con.lock().unwrap_or_else(|e| e.into_inner());
-            let scalars = register_scalars(&con, rt.engine.clone(), &loaded.scalars)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            // T2-6 partial: pass raw_con so multi-overload groups install via
+            // `duckdb_scalar_function_set`; singletons stay on VScalar.
+            let scalars = unsafe {
+                register_scalars_with_raw(&con, rt.raw_con.0, rt.engine.clone(), &loaded.scalars)
+            }
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             let tables = register_tables(&con, rt.engine.clone(), &loaded.tables)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             drop(con);
@@ -8889,11 +9035,23 @@ fn config_scope_code(scope: &str) -> ffi::duckdb_config_option_scope {
 }
 
 fn setting_logical_type(ty: &str) -> ffi::duckdb_logical_type {
-    let code = match ty.to_ascii_lowercase().as_str() {
+    let lowered = ty.to_ascii_lowercase();
+    let code = match lowered.as_str() {
         "boolean" | "bool" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
         "bigint" | "int64" | "long" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
         "double" | "float64" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
-        _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        // Sweep-9 Item 2: fail-loud catch-all. Mirrors the sweep-7 F2 shape at
+        // `wit_logicaltype_from_code`. Setting-type strings outside the
+        // known set used to silently degrade to VARCHAR — log the string so
+        // the gap is visible. Still return VARCHAR so registration doesn't
+        // panic.
+        unhandled => {
+            eprintln!(
+                "ducklink: setting_logical_type: unknown type name '{unhandled}' — \
+                 returning VARCHAR as fallback"
+            );
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR
+        }
     };
     unsafe { ffi::duckdb_create_logical_type(code) }
 }
@@ -9518,6 +9676,15 @@ unsafe extern "C" fn ducklink_copy_from_function(
         return;
     }
     let ncols = state.col_codes.len();
+    // Sweep-9 Item 4: hoist per-column output vector + LogicalType handles
+    // once, so `write_ret_raw` can thread the LT without an FFI per cell.
+    let vecs: Vec<ffi::duckdb_vector> = (0..ncols)
+        .map(|c| ffi::duckdb_data_chunk_get_vector(output, c as u64))
+        .collect();
+    let col_lts: Vec<ffi::duckdb_logical_type> = vecs
+        .iter()
+        .map(|&v| ffi::duckdb_vector_get_column_type(v))
+        .collect();
     for (i, row) in rows.iter().enumerate() {
         if row.len() != ncols {
             let msg = CString::new(format!(
@@ -9527,19 +9694,29 @@ unsafe extern "C" fn ducklink_copy_from_function(
             ))
             .unwrap();
             ffi::duckdb_function_set_error(info, msg.as_ptr());
+            for mut lt in col_lts {
+                ffi::duckdb_destroy_logical_type(&mut lt);
+            }
             return;
         }
         for (c, v) in row.iter().enumerate() {
-            let vec = ffi::duckdb_data_chunk_get_vector(output, c as u64);
-            if let Err(e) = write_ret_raw(state.col_codes[c], vec, i, v) {
+            if let Err(e) =
+                write_ret_raw(state.col_codes[c], vecs[c], i, v, Some(col_lts[c]))
+            {
                 let msg = CString::new(format!("copy_from_scan write failed: {e}"))
                     .unwrap();
                 ffi::duckdb_function_set_error(info, msg.as_ptr());
+                for mut lt in col_lts {
+                    ffi::duckdb_destroy_logical_type(&mut lt);
+                }
                 return;
             }
         }
     }
     ffi::duckdb_data_chunk_set_size(output, rows.len() as u64);
+    for mut lt in col_lts {
+        ffi::duckdb_destroy_logical_type(&mut lt);
+    }
 }
 
 /// Build the `duckdb_table_function` that services this COPY handler's FROM
@@ -10079,27 +10256,43 @@ impl VTab for ArrowShim {
             }
             let ncols = bind.col_codes.len();
             let raw_chunk = output.get_ptr();
+            // Sweep-9 Item 4: hoist per-column vector + LogicalType handles
+            // once per batch so `write_ret_raw` can thread the LT without an
+            // FFI per cell.
+            let vecs: Vec<ffi::duckdb_vector> = (0..ncols)
+                .map(|c| unsafe { ffi::duckdb_data_chunk_get_vector(raw_chunk, c as u64) })
+                .collect();
+            let col_lts: Vec<ffi::duckdb_logical_type> = vecs
+                .iter()
+                .map(|&v| unsafe { ffi::duckdb_vector_get_column_type(v) })
+                .collect();
             // Row-major write via write_ret_raw (per-cell). The guest hands
             // us row-major DuckValues from `dispatch_arrow_next`, so a
             // column-major pivot before write would be an extra pass; the
             // per-cell writer is sufficient for the streaming path and
             // reuses the already-tested logical-type-code arms.
-            for (i, row) in rows.iter().enumerate() {
-                if row.len() != ncols {
-                    return Err(format!(
-                        "arrow producer returned {} cols, expected {ncols}",
-                        row.len()
-                    )
-                    .into());
-                }
-                for (c, v) in row.iter().enumerate() {
-                    let vec = unsafe { ffi::duckdb_data_chunk_get_vector(raw_chunk, c as u64) };
-                    unsafe {
-                        write_ret_raw(bind.col_codes[c], vec, i, v)
-                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let write_result: Result<(), Box<dyn std::error::Error>> = (|| {
+                for (i, row) in rows.iter().enumerate() {
+                    if row.len() != ncols {
+                        return Err(format!(
+                            "arrow producer returned {} cols, expected {ncols}",
+                            row.len()
+                        )
+                        .into());
+                    }
+                    for (c, v) in row.iter().enumerate() {
+                        unsafe {
+                            write_ret_raw(bind.col_codes[c], vecs[c], i, v, Some(col_lts[c]))
+                                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        }
                     }
                 }
+                Ok(())
+            })();
+            for mut lt in col_lts {
+                unsafe { ffi::duckdb_destroy_logical_type(&mut lt) };
             }
+            write_result?;
             output.set_len(rows.len());
             Ok(())
         })
@@ -10480,6 +10673,126 @@ unsafe fn build_scalar_ex_function(
     Some(func)
 }
 
+/// Build one `duckdb_scalar_function` for a single base `ScalarFunc`,
+/// wiring only the core signature (no ex-flags) + the row-major invoke
+/// callback + extra-info. The caller owns the returned handle. Returns
+/// `None` on interior NUL in the name (already logged).
+///
+/// T2-6 (partial): used ONLY for multi-overload base-scalar groups. Singletons
+/// keep the safe `VScalar` columnar-fast-path installer. This helper mirrors
+/// `build_scalar_ex_function` minus the ex-flags — the extra-info struct
+/// (`ScalarExExtra`) and the invoke callback (`ducklink_scalar_ex_invoke`)
+/// are shared because their fields and semantics are identical: they both
+/// dispatch through `Engine2::dispatch_scalar` row-by-row. Multi-overload
+/// groups therefore pay the same row-major penalty as scalar_ex — the
+/// column-major path stays on `VScalar` where overload sets aren't needed.
+///
+/// # Safety
+/// FFI: constructs a DuckDB handle via `duckdb_create_scalar_function`.
+unsafe fn build_base_scalar_function(
+    s: &ScalarFunc,
+    engine: Arc<Engine2>,
+) -> Option<ffi::duckdb_scalar_function> {
+    let arg_codes: Vec<u8> = s.arguments.iter().map(|a| type_code(&a.logical)).collect();
+    let ret_code = type_code(&s.returns);
+    let cname = match CString::new(s.name.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[ducklink] scalar '{}' has a NUL byte; skipping", s.name);
+            return None;
+        }
+    };
+    let func = ffi::duckdb_create_scalar_function();
+    ffi::duckdb_scalar_function_set_name(func, cname.as_ptr());
+    for a in &s.arguments {
+        let mut lt = logical_type_ffi_from_lt(&a.logical);
+        ffi::duckdb_scalar_function_add_parameter(func, lt);
+        ffi::duckdb_destroy_logical_type(&mut lt);
+    }
+    let mut rlt = logical_type_ffi_from_lt(&s.returns);
+    ffi::duckdb_scalar_function_set_return_type(func, rlt);
+    ffi::duckdb_destroy_logical_type(&mut rlt);
+    // ---- extra info + invoke callback (shared with scalar_ex) ----
+    let extra = Box::into_raw(Box::new(ScalarExExtra {
+        callback_handle: s.callback_handle,
+        engine,
+        arg_codes,
+        ret_code,
+    })) as *mut c_void;
+    ffi::duckdb_scalar_function_set_extra_info(func, extra, Some(scalar_ex_extra_destroy));
+    ffi::duckdb_scalar_function_set_function(func, Some(ducklink_scalar_ex_invoke));
+    Some(func)
+}
+
+/// Register a multi-overload base-scalar group on `raw_con` via the C API
+/// `duckdb_scalar_function_set` path. Ownership mirrors `register_scalar_ex`:
+/// the set copies each per-overload handle on `duckdb_add_scalar_function_to_set`,
+/// so we destroy each per-overload handle immediately after the add.
+///
+/// Returns the number of overloads registered (0 on any failure). The caller
+/// (`register_scalars`) already logged what would fall through this path via
+/// the singleton counter.
+///
+/// # Safety
+/// `raw_con` must be a valid `duckdb_connection`. `member_scalars` must all
+/// share the same catalog name (checked by the caller when grouping).
+unsafe fn register_scalar_overload_set(
+    raw_con: ffi::duckdb_connection,
+    engine: Arc<Engine2>,
+    name: &str,
+    member_scalars: &[&ScalarFunc],
+) -> usize {
+    let set_name_c = match CString::new(name) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!(
+                "[ducklink] scalar set '{name}' name contains NUL byte; skipping"
+            );
+            return 0;
+        }
+    };
+    let set = ffi::duckdb_create_scalar_function_set(set_name_c.as_ptr());
+    if set.is_null() {
+        eprintln!("[ducklink] scalar set '{name}' could not be created");
+        return 0;
+    }
+    let mut set_ok = true;
+    let mut overloads_added = 0usize;
+    for s in member_scalars {
+        let func = match build_base_scalar_function(s, engine.clone()) {
+            Some(f) => f,
+            None => continue,
+        };
+        let add_rc = ffi::duckdb_add_scalar_function_to_set(set, func);
+        let mut func_mut = func;
+        ffi::duckdb_destroy_scalar_function(&mut func_mut);
+        if add_rc != ffi::DuckDBSuccess {
+            eprintln!(
+                "[ducklink] scalar '{}' overload failed to join set '{name}'",
+                s.name
+            );
+            set_ok = false;
+            break;
+        }
+        overloads_added += 1;
+    }
+    if !set_ok || overloads_added == 0 {
+        let mut set_mut = set;
+        ffi::duckdb_destroy_scalar_function_set(&mut set_mut);
+        return 0;
+    }
+    let rc = ffi::duckdb_register_scalar_function_set(raw_con, set);
+    let mut set_mut = set;
+    ffi::duckdb_destroy_scalar_function_set(&mut set_mut);
+    if rc != ffi::DuckDBSuccess {
+        eprintln!(
+            "[ducklink] scalar set '{name}' not registered (already present?)"
+        );
+        return 0;
+    }
+    overloads_added
+}
+
 /// Register the ex-attributes for every scalar_ex on `raw_con`. Installs a
 /// C API-level scalar sibling with varargs / special-null / VOLATILE flags
 /// wired through the C API. The base scalar registration (name + core
@@ -10700,6 +11013,206 @@ unsafe extern "C" fn ducklink_cast_invoke(
 ///     as an unknown so callers see the shortfall. TODO(T2-1 follow-up):
 ///     add an enum-name -> LogicalType registry populated by
 ///     `register_enum_types` and query it here.
+/// Sweep-9 Item 5: recursive-descent parser for DuckDB type expressions,
+/// producing a full `reg::LogicalType` tree — the structural counterpart to
+/// [`type_code_from_expr`]'s scalar-code return.
+///
+/// Handles four nested shapes on top of every scalar variant
+/// [`type_code_from_expr`] already recognises:
+///   * `T[]`             → `List(T)`
+///   * `T[N]`            → `Array(N, T)` (fixed-size)
+///   * `STRUCT(a T1, b T2, ...)` → `Struct([(a, T1), (b, T2), ...])`
+///   * `MAP(K, V)`       → `Map(K, V)`
+///
+/// Recognises balanced parens / brackets, splits commas only at the outer
+/// nesting level, and recurses on every child type. Field names inside
+/// STRUCT are split on the first ASCII whitespace run (no quoted-identifier
+/// support yet — a follow-up), so `STRUCT("a b" INTEGER)` currently returns
+/// `None` and the caller keeps the code-only stub. Unquoted single-word
+/// identifiers cover the common case.
+///
+/// Returns `None` on any parse error — callers fall back to
+/// [`type_code_from_expr`]'s current code-only pathway (which itself logs).
+///
+/// Split on delimiters is deliberately at ASCII boundaries; DuckDB type
+/// expressions in the wild are ASCII-only.
+fn logical_type_from_expr(expr: &str) -> Option<reg::LogicalType> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Scalar arm first — reuse `type_code_from_expr`'s scalar table for
+    // everything without nesting. `type_code_from_expr` also handles
+    // DECIMAL(w,s) via `parse_decimal_expr`; recognise both here structurally.
+    if let Some((w, sc)) = parse_decimal_expr(trimmed) {
+        return Some(reg::LogicalType::Decimal { width: w, scale: sc });
+    }
+
+    // Nested-suffix bracket forms: `T[]` (LIST) and `T[N]` (ARRAY). Bracket
+    // is a suffix on the WHOLE expression, but the inner `T` can itself be
+    // nested — so check the OUTER-LEVEL bracket, i.e. the last `[` whose
+    // depth (parens + inner brackets) is zero.
+    if let Some((inner_expr, size_opt)) = split_trailing_bracket(trimmed) {
+        let child = logical_type_from_expr(inner_expr)?;
+        return match size_opt {
+            None => Some(reg::LogicalType::List(Box::new(child))),
+            Some(n) => Some(reg::LogicalType::Array(n, Box::new(child))),
+        };
+    }
+
+    // STRUCT(a T1, b T2, ...) / MAP(K, V) prefix arms.
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("STRUCT(") && trimmed.ends_with(')') {
+        // Skip `STRUCT(` (7 bytes ASCII) and the trailing `)`.
+        let inner = &trimmed[7..trimmed.len() - 1];
+        let parts = split_outer_commas(inner)?;
+        let mut fields: Vec<(String, reg::LogicalType)> = Vec::with_capacity(parts.len());
+        for part in parts {
+            let (name, type_expr) = split_struct_field(part)?;
+            let ty = logical_type_from_expr(type_expr)?;
+            fields.push((name.to_string(), ty));
+        }
+        return Some(reg::LogicalType::Struct(fields));
+    }
+    if upper.starts_with("MAP(") && trimmed.ends_with(')') {
+        let inner = &trimmed[4..trimmed.len() - 1];
+        let parts = split_outer_commas(inner)?;
+        if parts.len() != 2 {
+            return None;
+        }
+        let k = logical_type_from_expr(parts[0])?;
+        let v = logical_type_from_expr(parts[1])?;
+        return Some(reg::LogicalType::Map(Box::new(k), Box::new(v)));
+    }
+
+    // Fall back to the scalar code table (via `type_code_from_expr`'s scalar
+    // branch, reproduced here so we don't recurse into the eprintln stubs).
+    let scalar_upper = upper.as_str();
+    let scalar = match scalar_upper {
+        "BOOLEAN" | "BOOL" => reg::LogicalType::Boolean,
+        "BIGINT" | "INT8" | "INT64" => reg::LogicalType::Int64,
+        "UBIGINT" | "UINT64" => reg::LogicalType::Uint64,
+        "DOUBLE" | "FLOAT8" | "FLOAT64" => reg::LogicalType::Float64,
+        "VARCHAR" | "TEXT" | "STRING" => reg::LogicalType::Text,
+        "BLOB" | "BYTEA" | "BINARY" => reg::LogicalType::Blob,
+        "TINYINT" | "INT1" => reg::LogicalType::Int8,
+        "SMALLINT" | "INT2" | "INT16" => reg::LogicalType::Int16,
+        "INTEGER" | "INT" | "INT4" | "INT32" => reg::LogicalType::Int32,
+        "UTINYINT" | "UINT8" => reg::LogicalType::Uint8,
+        "USMALLINT" | "UINT16" => reg::LogicalType::Uint16,
+        "UINTEGER" | "UINT32" => reg::LogicalType::Uint32,
+        "FLOAT" | "FLOAT4" | "FLOAT32" => reg::LogicalType::Float32,
+        "TIMESTAMP" | "TIMESTAMP_NS" | "TIMESTAMP_MS" | "TIMESTAMP_S" => reg::LogicalType::Timestamp,
+        "DATE" => reg::LogicalType::Date,
+        "TIME" => reg::LogicalType::Time,
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => reg::LogicalType::Timestamptz,
+        "DECIMAL" | "NUMERIC" => reg::LogicalType::Decimal { width: 18, scale: 3 },
+        "INTERVAL" => reg::LogicalType::Interval,
+        "UUID" => reg::LogicalType::Uuid,
+        "HUGEINT" | "INT128" => reg::LogicalType::Hugeint,
+        "UHUGEINT" | "UINT128" => reg::LogicalType::UHugeint,
+        _ => return None,
+    };
+    Some(scalar)
+}
+
+/// Split `s` at the trailing `[...]` suffix at OUTER nesting depth. Returns
+/// `Some((inner_type_expr, size_option))` where `size_option` is `None` for
+/// `[]` (LIST) and `Some(n)` for `[N]` (ARRAY). Returns `None` if `s` does
+/// not end in a properly-nested `[...]` at outer depth.
+fn split_trailing_bracket(s: &str) -> Option<(&str, Option<u32>)> {
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b']') {
+        return None;
+    }
+    // Walk backwards to find the matching `[` at depth 0 (skip nested `[`
+    // and `(`/`)`). Note: brackets on DuckDB type expressions do not nest
+    // arbitrarily — only `T[N]` where T may itself carry `[..]` inside.
+    let mut depth: i32 = 0;
+    let mut open_ix: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate().rev() {
+        match b {
+            b']' | b')' => depth += 1,
+            b'[' | b'(' => {
+                depth -= 1;
+                if depth == 0 && b == b'[' {
+                    open_ix = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open_ix = open_ix?;
+    if open_ix == 0 {
+        // Something like "[foo]" — no inner type. Not a valid suffix form.
+        return None;
+    }
+    let inside = &s[open_ix + 1..s.len() - 1];
+    let inner_expr = s[..open_ix].trim();
+    let size = if inside.is_empty() {
+        None
+    } else if inside.chars().all(|c| c.is_ascii_digit()) {
+        Some(inside.parse::<u32>().ok()?)
+    } else {
+        // Bracket carried a non-numeric non-empty payload — not a size arm.
+        return None;
+    };
+    Some((inner_expr, size))
+}
+
+/// Split a `STRUCT(...)` / `MAP(...)` inner list on commas at outer nesting
+/// depth (ignoring commas inside nested `()` / `[]`). Returns `None` on
+/// unbalanced delimiters.
+fn split_outer_commas(s: &str) -> Option<Vec<&str>> {
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut start: usize = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            b',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    out.push(s[start..].trim());
+    Some(out)
+}
+
+/// Split a `STRUCT` field `"name TYPE_EXPR"` on the first ASCII whitespace
+/// run — the boundary between the field name and its type expression.
+/// Quoted identifiers are not supported yet (any leading `"` returns
+/// `None` so the caller falls back to the code-only stub).
+fn split_struct_field(s: &str) -> Option<(&str, &str)> {
+    let trimmed = s.trim();
+    if trimmed.starts_with('"') {
+        return None; // quoted identifier — punt to code-only fallback
+    }
+    let split_ix = trimmed
+        .as_bytes()
+        .iter()
+        .position(|b| b.is_ascii_whitespace())?;
+    let name = trimmed[..split_ix].trim();
+    let type_expr = trimmed[split_ix..].trim();
+    if name.is_empty() || type_expr.is_empty() {
+        return None;
+    }
+    Some((name, type_expr))
+}
+
 fn type_code_from_expr(expr: &str) -> u8 {
     let trimmed = expr.trim();
     let upper = trimmed.to_ascii_uppercase();
@@ -10741,48 +11254,66 @@ fn type_code_from_expr(expr: &str) -> u8 {
     if parse_decimal_expr(trimmed).is_some() {
         return T_DECIMAL;
     }
-    // S1 (major-5): DuckDB nested type-expression prefixes. Full recursive
-    // parsing (recognising the child type-expression inside the parens /
-    // brackets) is FAIL-LOUD-DEFERRED — building a small recursive parser
-    // for `INTEGER[]` / `STRUCT(a INTEGER, ...)` / `MAP(K, V)` / `T[N]`
-    // rippled beyond the scope of this pass. Recognise the KIND from the
-    // prefix so the cast route at least tags the code correctly, then log
-    // that the structural payload is not yet threaded through. Callers that
-    // need the child type MUST plumb a full `reg::LogicalType` through
-    // `logical_type_ffi_from_lt` and skip this expr-based path.
+    // S1 (major-5) / Sweep-9 Item 5: DuckDB nested type-expression prefixes.
+    // Try full recursive parsing via `logical_type_from_expr` first — when it
+    // succeeds, callers that also invoke `logical_type_from_expr` get a real
+    // `reg::LogicalType::{List, Struct, Map, Array}` tree they can hand to
+    // `logical_type_ffi_from_lt` for a structurally-correct handle
+    // (`register_casts` / `register_logical_types` / `register_modified_types`
+    // do exactly this). When parsing fails (quoted STRUCT identifiers, angle
+    // brackets, malformed expressions) the arms below still tag the KIND from
+    // the prefix so the cast route at least routes to the right code.
     let upper_trimmed = trimmed.to_ascii_uppercase();
     if upper_trimmed.starts_with("STRUCT(") || upper_trimmed.starts_with("STRUCT<") {
-        eprintln!(
-            "[ducklink] type_code_from_expr: STRUCT expression '{expr}' — child-type parsing \
-             not yet wired (T2-1 residual continuation); tagging as T_STRUCT with no child shape"
-        );
+        if upper_trimmed.starts_with("STRUCT(") && logical_type_from_expr(trimmed).is_some() {
+            // Recognised structurally; no eprintln — the callers that want the
+            // structural handle will also succeed on `logical_type_from_expr`.
+        } else {
+            eprintln!(
+                "[ducklink] type_code_from_expr: STRUCT expression '{expr}' — structural \
+                 parse failed (quoted identifiers, angle brackets, or malformed field list \
+                 not yet supported); tagging as T_STRUCT with no child shape"
+            );
+        }
         return T_STRUCT;
     }
     if upper_trimmed.starts_with("MAP(") || upper_trimmed.starts_with("MAP<") {
-        eprintln!(
-            "[ducklink] type_code_from_expr: MAP expression '{expr}' — child-type parsing \
-             not yet wired (T2-1 residual continuation); tagging as T_MAP with no child shape"
-        );
+        if upper_trimmed.starts_with("MAP(") && logical_type_from_expr(trimmed).is_some() {
+            // Recognised structurally; callers use `logical_type_from_expr`.
+        } else {
+            eprintln!(
+                "[ducklink] type_code_from_expr: MAP expression '{expr}' — structural parse \
+                 failed (angle brackets or malformed K,V not yet supported); tagging as \
+                 T_MAP with no child shape"
+            );
+        }
         return T_MAP;
     }
-    // LIST: DuckDB uses `<TYPE>[]` (no fixed size) for LIST and `<TYPE>[N]`
-    // (fixed size N) for ARRAY. Detect the bracket suffix and count digits
-    // to distinguish. This is fail-loud in the same "kind-tag only" sense.
-    if let Some(stripped) = upper_trimmed.strip_suffix(']') {
-        if let Some(open_ix) = stripped.rfind('[') {
-            let inside = &stripped[open_ix + 1..];
-            if inside.is_empty() {
-                eprintln!(
-                    "[ducklink] type_code_from_expr: LIST expression '{expr}' — child-type \
-                     parsing not yet wired (T2-1 residual continuation); tagging as T_LIST"
-                );
+    // LIST / ARRAY: DuckDB uses `<TYPE>[]` (no fixed size) for LIST and
+    // `<TYPE>[N]` (fixed size N) for ARRAY. Attempt structural parse first;
+    // fall back to the KIND-only stub for the outer-bracket shape when
+    // recursion fails on the inner type expression.
+    if let Some((inner_expr, size_opt)) = split_trailing_bracket(trimmed) {
+        let structural = logical_type_from_expr(inner_expr).is_some();
+        match size_opt {
+            None => {
+                if !structural {
+                    eprintln!(
+                        "[ducklink] type_code_from_expr: LIST expression '{expr}' — inner type \
+                         '{inner_expr}' failed to parse structurally; tagging as T_LIST with \
+                         no child shape"
+                    );
+                }
                 return T_LIST;
             }
-            if inside.chars().all(|c| c.is_ascii_digit()) {
-                eprintln!(
-                    "[ducklink] type_code_from_expr: ARRAY expression '{expr}' — child-type \
-                     parsing not yet wired (T2-1 residual continuation); tagging as T_ARRAY"
-                );
+            Some(_) => {
+                if !structural {
+                    eprintln!(
+                        "[ducklink] type_code_from_expr: ARRAY expression '{expr}' — inner type \
+                         '{inner_expr}' failed to parse structurally; tagging as T_ARRAY with \
+                         no child shape"
+                    );
+                }
                 return T_ARRAY;
             }
         }
@@ -10810,9 +11341,21 @@ pub unsafe fn register_casts(
         let src_code = type_code_from_expr(&c.source);
         let tgt_code = type_code_from_expr(&c.target);
         let cf = ffi::duckdb_create_cast_function();
-        // T1-4: `logical_type_ffi` routes DECIMAL correctly.
-        let mut src_lt = logical_type_ffi(src_code);
-        let mut tgt_lt = logical_type_ffi(tgt_code);
+        // Sweep-9 Item 5: prefer the structural handle for nested types.
+        // `logical_type_from_expr` recursive-descent parses STRUCT / MAP /
+        // LIST / ARRAY into a full `reg::LogicalType`, which
+        // `logical_type_ffi_from_lt` lowers into a properly-shaped
+        // `duckdb_create_{list,struct,map,array}_type` — vs. the code-only
+        // `logical_type_ffi` fallback that returns VARCHAR + eprintln for
+        // nested kinds. T1-4: DECIMAL routes correctly through both paths.
+        let mut src_lt = match logical_type_from_expr(&c.source) {
+            Some(lt) => logical_type_ffi_from_lt(&lt),
+            None => logical_type_ffi(src_code),
+        };
+        let mut tgt_lt = match logical_type_from_expr(&c.target) {
+            Some(lt) => logical_type_ffi_from_lt(&lt),
+            None => logical_type_ffi(tgt_code),
+        };
         ffi::duckdb_cast_function_set_source_type(cf, src_lt);
         ffi::duckdb_cast_function_set_target_type(cf, tgt_lt);
         ffi::duckdb_destroy_logical_type(&mut src_lt);
@@ -10889,8 +11432,13 @@ pub unsafe fn register_logical_types(
     let mut registered = 0usize;
     for t in types {
         let code = type_code_from_expr(&t.physical);
-        // T1-4: `logical_type_ffi` routes DECIMAL correctly.
-        let mut lt = logical_type_ffi(code);
+        // Sweep-9 Item 5: structural handle for nested types via
+        // `logical_type_from_expr` — falls back to the code-only path (which
+        // T1-4 routes DECIMAL correctly for) when parsing fails.
+        let mut lt = match logical_type_from_expr(&t.physical) {
+            Some(structural) => logical_type_ffi_from_lt(&structural),
+            None => logical_type_ffi(code),
+        };
         let name_c = match CString::new(t.name.as_str()) {
             Ok(c) => c,
             Err(_) => {
@@ -10951,8 +11499,13 @@ pub unsafe fn register_modified_types(
     let mut registered = 0usize;
     for t in types {
         // Decimal path: honour the (width,scale) shape.
+        // Sweep-9 Item 5: try structural nested-type parsing before the
+        // code-only fallback so STRUCT / MAP / LIST / ARRAY type expressions
+        // register with a properly-shaped handle instead of VARCHAR.
         let mut lt = if let Some((w, sc)) = parse_decimal_expr(&t.type_expr) {
             ffi::duckdb_create_decimal_type(w, sc)
+        } else if let Some(structural) = logical_type_from_expr(&t.type_expr) {
+            logical_type_ffi_from_lt(&structural)
         } else {
             let code = type_code_from_expr(&t.type_expr);
             // T1-4: `logical_type_ffi` routes DECIMAL correctly (for the
