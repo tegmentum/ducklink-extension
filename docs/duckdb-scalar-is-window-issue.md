@@ -32,4 +32,4 @@ Narrow: only extensions that specialize behavior on window context are affected.
 
 ## References
 
-Surfaced during a DuckLink wasm-extension audit while wiring WIT interfaces that already carry an `invokeinfo.is_window` field through every scalar dispatch call site. Verified against `libduckdb-sys` **1.10504.0** bindgen output: zero `window` occurrences at the scalar-function-info level. The DuckLink dispatch layer currently hardcodes `is_window: false` with a `TODO` in `ducklink-extension/src/engine.rs` pending an upstream accessor.
+Surfaced during a DuckLink wasm-extension audit while wiring WIT interfaces that already carry an `invokeinfo.is_window` field through every scalar dispatch call site. Verified against `libduckdb-sys` **1.10505.0** bindgen output: zero `window` occurrences anywhere in the bindings (no `duckdb_*_is_window` symbol on `duckdb_function_info`, no `is_window` flag on the extra-info struct). The DuckLink dispatch layer currently hardcodes `is_window: false` with a `TODO` in `ducklink-extension/src/engine.rs` pending an upstream accessor.

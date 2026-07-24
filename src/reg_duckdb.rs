@@ -11382,15 +11382,21 @@ unsafe extern "C" fn ducklink_cast_invoke(
 /// [`type_code_from_expr`] already recognises:
 ///   * `T[]`             → `List(T)`
 ///   * `T[N]`            → `Array(N, T)` (fixed-size)
-///   * `STRUCT(a T1, b T2, ...)` → `Struct([(a, T1), (b, T2), ...])`
-///   * `MAP(K, V)`       → `Map(K, V)`
+///   * `STRUCT(a T1, b T2, ...)` / `STRUCT<a T1, b T2, ...>`
+///                       → `Struct([(a, T1), (b, T2), ...])`
+///   * `MAP(K, V)` / `MAP<K, V>` → `Map(K, V)`
 ///
-/// Recognises balanced parens / brackets, splits commas only at the outer
-/// nesting level, and recurses on every child type. Field names inside
-/// STRUCT are split on the first ASCII whitespace run (no quoted-identifier
-/// support yet — a follow-up), so `STRUCT("a b" INTEGER)` currently returns
-/// `None` and the caller keeps the code-only stub. Unquoted single-word
-/// identifiers cover the common case.
+/// Both paren-delimited (`STRUCT(...)`, `MAP(...)`) and angle-bracket
+/// (`STRUCT<...>`, `MAP<...>`) syntaxes are accepted — DuckDB emits the
+/// former from `information_schema.columns` but user-supplied type
+/// expressions frequently use the latter (matches the DESCRIBE surface).
+///
+/// Recognises balanced parens / brackets / angle brackets, splits commas
+/// only at the outer nesting level, and recurses on every child type.
+/// Field names inside STRUCT are split on the first ASCII whitespace run;
+/// double-quoted identifiers (`STRUCT(a "long name" INTEGER)`) are also
+/// recognised via [`split_struct_field`] (SQL `""` escape not supported —
+/// falls back to the code-only stub).
 ///
 /// Returns `None` on any parse error — callers fall back to
 /// [`type_code_from_expr`]'s current code-only pathway (which itself logs).
@@ -11421,11 +11427,19 @@ fn logical_type_from_expr(expr: &str) -> Option<reg::LogicalType> {
         };
     }
 
-    // STRUCT(a T1, b T2, ...) / MAP(K, V) prefix arms.
+    // STRUCT(...) / STRUCT<...> / MAP(...) / MAP<...> prefix arms. The
+    // paren and angle-bracket forms share their inner grammar; only the
+    // opening/closing delimiter changes. `STRUCT(` / `STRUCT<` are 7 ASCII
+    // bytes, `MAP(` / `MAP<` are 4 ASCII bytes.
     let upper = trimmed.to_ascii_uppercase();
-    if upper.starts_with("STRUCT(") && trimmed.ends_with(')') {
-        // Skip `STRUCT(` (7 bytes ASCII) and the trailing `)`.
-        let inner = &trimmed[7..trimmed.len() - 1];
+    let struct_inner = if upper.starts_with("STRUCT(") && trimmed.ends_with(')') {
+        Some(&trimmed[7..trimmed.len() - 1])
+    } else if upper.starts_with("STRUCT<") && trimmed.ends_with('>') {
+        Some(&trimmed[7..trimmed.len() - 1])
+    } else {
+        None
+    };
+    if let Some(inner) = struct_inner {
         let parts = split_outer_commas(inner)?;
         let mut fields: Vec<(String, reg::LogicalType)> = Vec::with_capacity(parts.len());
         for part in parts {
@@ -11435,8 +11449,14 @@ fn logical_type_from_expr(expr: &str) -> Option<reg::LogicalType> {
         }
         return Some(reg::LogicalType::Struct(fields));
     }
-    if upper.starts_with("MAP(") && trimmed.ends_with(')') {
-        let inner = &trimmed[4..trimmed.len() - 1];
+    let map_inner = if upper.starts_with("MAP(") && trimmed.ends_with(')') {
+        Some(&trimmed[4..trimmed.len() - 1])
+    } else if upper.starts_with("MAP<") && trimmed.ends_with('>') {
+        Some(&trimmed[4..trimmed.len() - 1])
+    } else {
+        None
+    };
+    if let Some(inner) = map_inner {
         let parts = split_outer_commas(inner)?;
         if parts.len() != 2 {
             return None;
@@ -11522,8 +11542,12 @@ fn split_trailing_bracket(s: &str) -> Option<(&str, Option<u32>)> {
     Some((inner_expr, size))
 }
 
-/// Split a `STRUCT(...)` / `MAP(...)` inner list on commas at outer nesting
-/// depth (ignoring commas inside nested `()` / `[]`). Returns `None` on
+/// Split a `STRUCT(...)` / `MAP(...)` (or their `<...>` angle-bracket
+/// twins) inner list on commas at outer nesting depth, ignoring commas
+/// inside nested `()`, `[]`, and `<>`. Angle brackets are tracked because
+/// STRUCT/MAP fields may themselves be `STRUCT<...>` or `MAP<K, V>`; DuckDB
+/// type expressions do not use `<`/`>` as comparison operators in this
+/// grammar, so treating them as bracket pairs is safe. Returns `None` on
 /// unbalanced delimiters.
 fn split_outer_commas(s: &str) -> Option<Vec<&str>> {
     let mut out: Vec<&str> = Vec::new();
@@ -11532,8 +11556,8 @@ fn split_outer_commas(s: &str) -> Option<Vec<&str>> {
     let mut start: usize = 0;
     for (i, &b) in bytes.iter().enumerate() {
         match b {
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => {
+            b'(' | b'[' | b'<' => depth += 1,
+            b')' | b']' | b'>' => {
                 depth -= 1;
                 if depth < 0 {
                     return None;
@@ -11553,14 +11577,38 @@ fn split_outer_commas(s: &str) -> Option<Vec<&str>> {
     Some(out)
 }
 
-/// Split a `STRUCT` field `"name TYPE_EXPR"` on the first ASCII whitespace
-/// run — the boundary between the field name and its type expression.
-/// Quoted identifiers are not supported yet (any leading `"` returns
-/// `None` so the caller falls back to the code-only stub).
+/// Split a `STRUCT` field `name TYPE_EXPR` on the boundary between the
+/// field name and its type expression.
+///
+/// Two identifier shapes are accepted:
+///   * bare identifier — split on the first ASCII whitespace run
+///     (`a INTEGER` → `("a", "INTEGER")`);
+///   * double-quoted identifier — the name is the byte run between the
+///     opening `"` and the next `"` (`"long name" INTEGER` →
+///     `("long name", "INTEGER")`).
+///
+/// The SQL `""` escape sequence for a literal `"` inside a quoted
+/// identifier is NOT supported: returns `None` on an escape run and the
+/// caller falls back to the code-only stub. Bare-identifier field names
+/// cover the overwhelming common case; the quoted arm handles the
+/// spaces-in-names case that used to punt.
 fn split_struct_field(s: &str) -> Option<(&str, &str)> {
     let trimmed = s.trim();
-    if trimmed.starts_with('"') {
-        return None; // quoted identifier — punt to code-only fallback
+    if let Some(after_open) = trimmed.strip_prefix('"') {
+        // First `"` closes the identifier — reject an escape run `""`
+        // (unsupported: allocating an unescaped `String` would break the
+        // `&str` return contract).
+        let close_ix = after_open.find('"')?;
+        let name = &after_open[..close_ix];
+        let after_close = &after_open[close_ix + 1..];
+        if after_close.starts_with('"') {
+            return None;
+        }
+        let type_expr = after_close.trim();
+        if name.is_empty() || type_expr.is_empty() {
+            return None;
+        }
+        return Some((name, type_expr));
     }
     let split_ix = trimmed
         .as_bytes()
@@ -11621,31 +11669,28 @@ fn type_code_from_expr(expr: &str) -> u8 {
     // `reg::LogicalType::{List, Struct, Map, Array}` tree they can hand to
     // `logical_type_ffi_from_lt` for a structurally-correct handle
     // (`register_casts` / `register_logical_types` / `register_modified_types`
-    // do exactly this). When parsing fails (quoted STRUCT identifiers, angle
-    // brackets, malformed expressions) the arms below still tag the KIND from
-    // the prefix so the cast route at least routes to the right code.
+    // do exactly this). Both paren and angle-bracket delimiter forms, plus
+    // double-quoted STRUCT field identifiers, parse structurally. When the
+    // parse still fails (SQL `""` escape inside an identifier, or otherwise
+    // malformed expression) the arms below tag the KIND from the prefix so
+    // the cast route at least routes to the right code.
     let upper_trimmed = trimmed.to_ascii_uppercase();
     if upper_trimmed.starts_with("STRUCT(") || upper_trimmed.starts_with("STRUCT<") {
-        if upper_trimmed.starts_with("STRUCT(") && logical_type_from_expr(trimmed).is_some() {
-            // Recognised structurally; no eprintln — the callers that want the
-            // structural handle will also succeed on `logical_type_from_expr`.
-        } else {
+        if logical_type_from_expr(trimmed).is_none() {
             eprintln!(
                 "[ducklink] type_code_from_expr: STRUCT expression '{expr}' — structural \
-                 parse failed (quoted identifiers, angle brackets, or malformed field list \
-                 not yet supported); tagging as T_STRUCT with no child shape"
+                 parse failed (malformed field list or `\"\"`-escaped quoted identifier not \
+                 supported); tagging as T_STRUCT with no child shape"
             );
         }
         return T_STRUCT;
     }
     if upper_trimmed.starts_with("MAP(") || upper_trimmed.starts_with("MAP<") {
-        if upper_trimmed.starts_with("MAP(") && logical_type_from_expr(trimmed).is_some() {
-            // Recognised structurally; callers use `logical_type_from_expr`.
-        } else {
+        if logical_type_from_expr(trimmed).is_none() {
             eprintln!(
                 "[ducklink] type_code_from_expr: MAP expression '{expr}' — structural parse \
-                 failed (angle brackets or malformed K,V not yet supported); tagging as \
-                 T_MAP with no child shape"
+                 failed (malformed K,V or unsupported nested shape); tagging as T_MAP with \
+                 no child shape"
             );
         }
         return T_MAP;
@@ -12376,4 +12421,134 @@ pub unsafe fn register_coordinate_systems(
         );
     }
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the recursive-descent DuckDB type-expression parser
+// (`logical_type_from_expr` and its `split_*` helpers). No DuckDB runtime
+// state is required — pure string-in / `reg::LogicalType`-out.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod logical_type_from_expr_tests {
+    use super::{logical_type_from_expr, split_outer_commas, split_struct_field};
+    use ducklink_runtime::reg;
+
+    fn lt_int32() -> reg::LogicalType {
+        reg::LogicalType::Int32
+    }
+    fn lt_text() -> reg::LogicalType {
+        reg::LogicalType::Text
+    }
+
+    // --- STRUCT<...> angle-bracket parse ------------------------------------
+    #[test]
+    fn struct_angle_brackets_parses_like_parens() {
+        let paren = logical_type_from_expr("STRUCT(a INTEGER, b VARCHAR)").expect("paren parse");
+        let angle = logical_type_from_expr("STRUCT<a INTEGER, b VARCHAR>").expect("angle parse");
+        assert_eq!(paren, angle);
+        assert_eq!(
+            angle,
+            reg::LogicalType::Struct(vec![
+                ("a".to_string(), lt_int32()),
+                ("b".to_string(), lt_text()),
+            ])
+        );
+    }
+
+    #[test]
+    fn struct_angle_brackets_with_nested_map() {
+        // A MAP<K, V> child inside a STRUCT<> — split_outer_commas MUST
+        // track angle-bracket depth to keep the inner `,` from splitting
+        // the outer field list.
+        let lt = logical_type_from_expr("STRUCT<id INTEGER, kv MAP<VARCHAR, INTEGER>>")
+            .expect("nested angle parse");
+        assert_eq!(
+            lt,
+            reg::LogicalType::Struct(vec![
+                ("id".to_string(), lt_int32()),
+                (
+                    "kv".to_string(),
+                    reg::LogicalType::Map(Box::new(lt_text()), Box::new(lt_int32())),
+                ),
+            ])
+        );
+    }
+
+    // --- MAP<K, V> angle-bracket parse --------------------------------------
+    #[test]
+    fn map_angle_brackets_parses_like_parens() {
+        let paren = logical_type_from_expr("MAP(VARCHAR, INTEGER)").expect("paren parse");
+        let angle = logical_type_from_expr("MAP<VARCHAR, INTEGER>").expect("angle parse");
+        assert_eq!(paren, angle);
+        assert_eq!(
+            angle,
+            reg::LogicalType::Map(Box::new(lt_text()), Box::new(lt_int32()))
+        );
+    }
+
+    // --- Quoted STRUCT field identifier -------------------------------------
+    #[test]
+    fn struct_paren_quoted_field_identifier() {
+        // Previously stub-returned via the eprintln arm because the leading
+        // `"` caused split_struct_field to punt.
+        let lt = logical_type_from_expr("STRUCT(\"long name\" INTEGER, plain VARCHAR)")
+            .expect("quoted-ident parse");
+        assert_eq!(
+            lt,
+            reg::LogicalType::Struct(vec![
+                ("long name".to_string(), lt_int32()),
+                ("plain".to_string(), lt_text()),
+            ])
+        );
+    }
+
+    #[test]
+    fn struct_angle_quoted_field_identifier() {
+        // Same shape via the angle-bracket variant.
+        let lt = logical_type_from_expr("STRUCT<\"a b\" INTEGER, c VARCHAR>")
+            .expect("angle + quoted-ident parse");
+        assert_eq!(
+            lt,
+            reg::LogicalType::Struct(vec![
+                ("a b".to_string(), lt_int32()),
+                ("c".to_string(), lt_text()),
+            ])
+        );
+    }
+
+    #[test]
+    fn split_struct_field_bare_and_quoted() {
+        assert_eq!(split_struct_field("a INTEGER"), Some(("a", "INTEGER")));
+        assert_eq!(
+            split_struct_field("\"long name\" INTEGER"),
+            Some(("long name", "INTEGER"))
+        );
+        // Unterminated quote → None (fall back to code-only stub).
+        assert_eq!(split_struct_field("\"oops INTEGER"), None);
+        // SQL `""` escape run is not supported — return None.
+        assert_eq!(split_struct_field("\"a\"\"b\" INTEGER"), None);
+    }
+
+    #[test]
+    fn split_outer_commas_tracks_angle_depth() {
+        // Comma inside a MAP<K, V> must NOT split the outer field list.
+        let parts = split_outer_commas("id INTEGER, kv MAP<VARCHAR, INTEGER>").expect("split");
+        assert_eq!(parts, vec!["id INTEGER", "kv MAP<VARCHAR, INTEGER>"]);
+    }
+
+    // --- Regression: paren form still works with quoted idents & nested [] --
+    #[test]
+    fn struct_array_child_still_parses() {
+        // Established shape from sweep-8 — asserts the refactor didn't
+        // regress `T[N]` / `T[]` handling inside STRUCT(...).
+        let lt = logical_type_from_expr("STRUCT(a INTEGER[3], b VARCHAR[])")
+            .expect("struct with array/list children");
+        assert_eq!(
+            lt,
+            reg::LogicalType::Struct(vec![
+                ("a".to_string(), reg::LogicalType::Array(3, Box::new(lt_int32()))),
+                ("b".to_string(), reg::LogicalType::List(Box::new(lt_text()))),
+            ])
+        );
+    }
 }
