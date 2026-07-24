@@ -1519,57 +1519,48 @@ impl VScalar for WasmScalar {
 /// Register every component scalar on `con`. Returns the count registered. All
 /// `reg` logical types are supported across any arity.
 ///
-/// T2-6 (major-5, PARTIAL): the full base-scalar `VScalar` -> raw-C-API
-/// invoke-ABI migration is still deferred (see the risk-analysis block
-/// below). What DID land: multi-overload groups within a single load now
-/// install through the C API `duckdb_scalar_function_set` +
-/// `duckdb_add_scalar_function_to_set` + `duckdb_register_scalar_function_set`
-/// path when a raw connection is available, reusing the row-major
-/// `ducklink_scalar_ex_invoke` machinery (their `ScalarExExtra` fields are
-/// identical to what base scalars need — `callback_handle`, `engine`,
-/// `arg_codes`, `ret_code`). Singletons continue to use the safe
-/// `VScalar` `register_scalar_function_with_state` installer so the
-/// column-major fast path (`refill_colvec` / `write_colvec` / the
-/// SCALAR_ARGS_SCRATCH thread-locals) is preserved for the common case.
-/// Multi-overload groups therefore pay the row-major penalty (matching
-/// scalar_ex's tradeoff).
+/// T2-6 (major-5, COMPLETE for production): singletons now install
+/// through the raw C API column-major invoke path
+/// (`ducklink_scalar_batch_col_invoke` + `ScalarBaseColExtra` + the
+/// `build_base_scalar_col_function` helper) whenever a raw connection is
+/// available. That invoke preserves the hot COLUMN-MAJOR dispatch
+/// (`refill_colvec` per input, `dispatch_scalar_batch_col`, then
+/// `write_colvec` — one memcpy per primitive column on the all-valid
+/// fast path) — the same shape the previous `VScalar` installer produced,
+/// with the SCALAR_ARGS_SCRATCH / SCALAR_NULL_MASK_SCRATCH thread-locals
+/// still owning steady-state allocation reuse.
 ///
-/// SAFETY of the mixed installer: VScalar and raw C API are never used
-/// under the SAME name — a name is either a singleton (VScalar) or a
-/// multi-overload group (raw C API). Names are disjoint by construction.
+/// Multi-overload groups within a single load install through the C API
+/// `duckdb_scalar_function_set` + `duckdb_add_scalar_function_to_set` +
+/// `duckdb_register_scalar_function_set` path, reusing the row-major
+/// `ducklink_scalar_ex_invoke` machinery (their `ScalarExExtra` fields
+/// are identical to what a row-major base scalar needs). Multi-overload
+/// groups therefore still pay the row-major penalty (matching scalar_ex's
+/// tradeoff — `dispatch_scalar_batch_col` is single-signature per
+/// callback, so overload dispatch has to happen one row at a time
+/// through the C API function-set layer).
 ///
-/// If `raw_con` is `None`, multi-overload groups fall back to the pre-T2-6
-/// behavior: first overload registers via VScalar, subsequent overloads
-/// are logged and skipped. Loadable entry points that call this without a
-/// raw connection lose overload-set support.
+/// SAFETY of the mixed installer: the raw invoke and VScalar path are
+/// never used under the SAME name — a name is either a singleton (raw
+/// column-major when raw_con is available; VScalar as fallback otherwise)
+/// or a multi-overload group (raw C API row-major set). Names are
+/// disjoint by construction.
 ///
-/// ---- WHY THE FULL VScalar -> raw-C-API MIGRATION IS STILL DEFERRED ----
-/// Migrating the SINGLETON path off `VScalar` to match `register_scalar_ex`
-/// would require:
+/// VSCALAR FALLBACK (kept alive intentionally): when `raw_con` is `None`,
+/// singletons install via the safe VScalar wrapper
+/// (`install_singleton_vscalar` → `register_scalar_function_with_state`).
+/// The fallback covers test entry points that call `register_scalars`
+/// with only a duckdb-rs `Connection` — that wrapper hides its raw
+/// handle behind private fields, so tests cannot construct a raw sibling
+/// connection without opening the database from raw C API themselves.
+/// Production paths (`register_load_function` →
+/// `register_scalars_with_raw`) always supply a raw connection and hit
+/// the new column-major raw invoke.
 ///
-///   * Rewriting `WasmScalar::invoke` — currently a safe
-///     `fn(&State, &mut DataChunkHandle, &mut dyn WritableVector) -> Result`
-///     that duckdb-rs boxes into a C ABI callback — as a raw
-///     `unsafe extern "C" fn(info, input_chunk, output_vec)`. Every
-///     downstream helper the safe path depends on (`FlatVector`,
-///     `refill_colvec` on a scratch borrow, `write_colvec`'s
-///     `WritableVector`, the SCALAR_ARGS_SCRATCH / SCALAR_NULL_MASK_SCRATCH
-///     thread-locals, the `guard()` panic firewall, the
-///     `QueryReentrancyGuard` re-entrancy check) has to be re-plumbed
-///     against the raw `duckdb_data_chunk` + `duckdb_vector` handles.
-///   * Deleting the `PENDING_SIGNATURE` thread-local (raw C API takes
-///     arg types explicitly via `duckdb_scalar_function_add_parameter`).
-///   * A new columnar `build_wasm_scalar_function` mirroring
-///     `build_base_scalar_function` above but preserving the column-major
-///     dispatch (`dispatch_scalar_batch_col`, not `dispatch_scalar`).
-///
-/// That singleton-path rewrite is orthogonal to the overload-set goal —
-/// the goal was unblocked by the partial above without touching the hot
-/// column-major dispatch. Landing the singleton rewrite partial (raw
-/// invoke but preserving `VScalar` sig plumbing) would be worse than not
-/// landing it at all — the invoke ABI must match the C API's
-/// `duckdb_scalar_function` contract exactly or DuckDB will call into
-/// freed memory. Chose the fail-loud DOCUMENTED DEFERRAL for that slice.
+/// Multi-overload fallback for no-raw-con is unchanged from the
+/// pre-T2-6 behavior: first overload registers via VScalar, subsequent
+/// overloads are logged and skipped. Loadable entry points that call
+/// this without a raw connection lose overload-set support.
 pub fn register_scalars(
     con: &Connection,
     engine: Arc<Engine2>,
@@ -1636,21 +1627,34 @@ fn register_scalars_impl(
                 member_ixs.len()
             );
         }
-        // Singleton (or fallback with no raw_con): install via safe VScalar.
-        // Only the first overload is attempted; extras (if any) are logged.
+        // Singleton (or fallback with no raw_con): install via the raw C
+        // API column-major path when a raw connection is available (the
+        // T2-6 major-5 install path: `ducklink_scalar_batch_col_invoke` +
+        // `ScalarBaseColExtra`, preserving the primitive-column memcpy
+        // fast path). Fall back to the safe VScalar installer only when
+        // `raw_con` is None — the duckdb-rs `Connection` wrapper hides its
+        // raw handle behind private fields, so test entry points calling
+        // `register_scalars` without a raw sibling still install through
+        // the VScalar path. Only the first overload is attempted; extras
+        // (if any) are logged.
         let mut first = true;
         for &i in member_ixs {
             let f = &scalars[i];
             if !first {
                 eprintln!(
                     "[ducklink] scalar function '{}' overload skipped: singleton \
-                     VScalar path can only install one signature per name",
+                     install path can only install one signature per name",
                     f.name
                 );
                 continue;
             }
             first = false;
-            match install_singleton_vscalar(con, engine.clone(), f) {
+            let result: Result<(), String> = match raw_con {
+                Some(rc) => unsafe { install_singleton_raw(rc, engine.clone(), f) },
+                None => install_singleton_vscalar(con, engine.clone(), f)
+                    .map_err(|e| e.to_string()),
+            };
+            match result {
                 Ok(()) => registered += 1,
                 Err(e) => {
                     eprintln!("[ducklink] scalar '{}' not registered (already present?): {e}", f.name);
@@ -1659,6 +1663,41 @@ fn register_scalars_impl(
         }
     }
     Ok(registered)
+}
+
+/// Install a singleton base scalar through the raw C API column-major
+/// invoke path (`ducklink_scalar_batch_col_invoke`). Used when a raw
+/// connection is available; the safe `install_singleton_vscalar` remains
+/// as fallback for entry points without one (test-only paths reachable
+/// through `duckdb::Connection::open_in_memory`; the duckdb-rs Connection
+/// wrapper does not expose its raw handle publicly).
+///
+/// Returns a stringified error on registration failure so the call site's
+/// existing `Ok / Err(eprintln)` pattern (mirrored from `install_singleton_vscalar`
+/// and `register_scalar_ex`) applies uniformly.
+///
+/// # Safety
+/// `raw_con` must be a valid `duckdb_connection` sharing the same database
+/// with the `Connection` the caller used for other registrations.
+unsafe fn install_singleton_raw(
+    raw_con: ffi::duckdb_connection,
+    engine: Arc<Engine2>,
+    f: &ScalarFunc,
+) -> Result<(), String> {
+    let func = match build_base_scalar_col_function(f, engine) {
+        Some(func) => func,
+        None => return Err("build_base_scalar_col_function failed".to_string()),
+    };
+    let rc = ffi::duckdb_register_scalar_function(raw_con, func);
+    let mut func_mut = func;
+    ffi::duckdb_destroy_scalar_function(&mut func_mut);
+    if rc != ffi::DuckDBSuccess {
+        return Err(format!(
+            "duckdb_register_scalar_function('{}') returned failure (already present?)",
+            f.name
+        ));
+    }
+    Ok(())
 }
 
 fn install_singleton_vscalar(
@@ -7044,6 +7083,73 @@ mod tests {
         assert_eq!(sum, 1 + 2 + 3 + 4 + 5, "sum of (i+1) for i in 0..5");
     }
 
+    /// T2-6 (major-5, singleton path): verify the raw-C-API COLUMN-MAJOR
+    /// invoke (`ducklink_scalar_batch_col_invoke` + `ScalarBaseColExtra`)
+    /// dispatches correctly through the register-scalars-with-raw entry
+    /// point — the same path `register_load_function` uses in production
+    /// (`register_scalars_with_raw` line ~4039). Opens DuckDB via the raw
+    /// C API so we own a `duckdb_database` handle from which we can
+    /// `duckdb_connect` a raw sibling connection — the duckdb-rs
+    /// `Connection` wrapper hides its raw handle behind private fields,
+    /// so tests calling `register_scalars` (no raw_con) exercise only the
+    /// VScalar fallback; this test is the one that actually runs the new
+    /// column-major raw path end-to-end.
+    ///
+    /// Corpus-gated: skips when `sample_extension.wasm` is not on disk
+    /// (standalone repo checkout, community-extensions CI). The
+    /// monorepo default and any set `DUCKLINK_CORPUS_DIR` will run it.
+    #[test]
+    fn raw_columnar_scalar_dispatches_into_wasm() {
+        let path = require_sample_component!("raw_columnar_scalar_dispatches_into_wasm");
+        let mut engine_inner = Engine2::new().expect("engine");
+        let loaded = engine_inner
+            .load("sample_extension", &path)
+            .expect("load component");
+        let engine = Arc::new(engine_inner);
+
+        // Own the raw database so we can open a raw sibling connection.
+        let (con, raw_con) = unsafe {
+            let mut db: ffi::duckdb_database = std::ptr::null_mut();
+            let rc = ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
+            assert_eq!(rc, ffi::DuckDBSuccess, "duckdb_open");
+            let con = Connection::open_from_raw(db.cast()).expect("open_from_raw");
+            let mut raw: ffi::duckdb_connection = std::ptr::null_mut();
+            let rc = ffi::duckdb_connect(db, &mut raw);
+            assert_eq!(rc, ffi::DuckDBSuccess, "duckdb_connect sibling");
+            assert!(!raw.is_null(), "raw sibling con must not be null");
+            (con, raw)
+        };
+
+        // Register via the raw-C-API path — this drives
+        // ducklink_scalar_batch_col_invoke on every subsequent SELECT.
+        let n = unsafe {
+            register_scalars_with_raw(&con, raw_con, engine.clone(), &loaded.scalars)
+                .expect("register_scalars_with_raw")
+        };
+        assert!(n >= 1, "expected at least one scalar registered, got {n}");
+
+        // Single-row: proves the invoke reaches the guest and the +1
+        // computed inside wasm surfaces back through the column-major
+        // write path.
+        let v: i64 = con
+            .query_row("SELECT sample_plus_one(41)", [], |r| r.get(0))
+            .expect("query single row");
+        assert_eq!(v, 42, "raw-path sample_plus_one(41) should be 42");
+
+        // Wide batch: exercises refill_colvec's steady-state reuse fast
+        // path (many chunks past warmup) + write_colvec's copy_from_slice
+        // primitive memcpy. 20k rows spans multiple DuckDB chunks.
+        let sum: i64 = con
+            .query_row(
+                "SELECT sum(sample_plus_one(i)) FROM range(0, 20000) t(i)",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query batch");
+        // sum_{i=0..N-1}(i + 1) = N*(N+1)/2 with N = 20000
+        assert_eq!(sum, 20000 * 20001 / 2, "raw-path batch sum mismatch");
+    }
+
     /// `register_components` — the path the loadable entry point takes — loads a
     /// component by spec and registers its scalars.
     #[test]
@@ -10721,6 +10827,261 @@ unsafe fn build_base_scalar_function(
     })) as *mut c_void;
     ffi::duckdb_scalar_function_set_extra_info(func, extra, Some(scalar_ex_extra_destroy));
     ffi::duckdb_scalar_function_set_function(func, Some(ducklink_scalar_ex_invoke));
+    Some(func)
+}
+
+// ---------------------------------------------------------------------------
+// T2-6 (major-5, singleton path): raw-C-API COLUMN-MAJOR scalar invoke.
+//
+// Mirrors `WasmScalar::invoke`'s hot column-major dispatch — refill_colvec
+// per input, `dispatch_scalar_batch_col`, `write_colvec` for the output —
+// but plumbed against raw `duckdb_data_chunk` / `duckdb_vector` handles so
+// the singleton install path can flow through the C API alongside the
+// multi-overload group path. Sits alongside `ducklink_scalar_ex_invoke`
+// (row-major) because the two invokes solve different problems: `_ex`
+// serves varargs / special-null / volatile (row-major dispatch is the
+// correctness fallback); `_batch_col` preserves the primitive-column
+// memcpy fast path for plain base scalars.
+//
+// Extra-info struct is distinct from `ScalarExExtra` — the columnar path
+// additionally needs `arg_type_exprs` (the T2-7 declared complex type-
+// expressions each `ColvecComplex.type_expr` carries to the guest).
+// ---------------------------------------------------------------------------
+
+/// Per-function state stashed via `duckdb_scalar_function_set_extra_info`
+/// on a singleton base scalar installed through the raw C API. Read from
+/// `ducklink_scalar_batch_col_invoke` to dispatch back into the engine.
+///
+/// Fields mirror `WasmScalarState` (VScalar path): callback handle, engine,
+/// per-arg bridge codes, per-arg declared complex type-expressions
+/// (T2-7 — `None` for non-complex args), and the return-type bridge code.
+#[allow(dead_code)]
+struct ScalarBaseColExtra {
+    callback_handle: u32,
+    engine: Arc<Engine2>,
+    arg_codes: Vec<u8>,
+    arg_type_exprs: Vec<Option<String>>,
+    ret_code: u8,
+}
+
+unsafe extern "C" fn scalar_base_col_extra_destroy(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut ScalarBaseColExtra));
+    }
+}
+
+/// Column-major raw-C-API invoke callback for singleton base scalars.
+/// Reads each input column via `refill_colvec` (memcpy-per-primitive-column
+/// on the steady state), dispatches through `Engine2::dispatch_scalar_batch_col`,
+/// lowers the returned `Colvec` back to the output vector via `write_colvec`
+/// (one memcpy per primitive column on the all-valid fast path).
+///
+/// Panic firewall + reentrancy guard mirror `WasmScalar::invoke`.
+///
+/// # Safety
+/// Called by DuckDB with a valid `duckdb_function_info`, a valid input
+/// `duckdb_data_chunk`, and a valid output `duckdb_vector`. Extra-info
+/// pointer is set at registration time to a leaked `Box<ScalarBaseColExtra>`.
+unsafe extern "C" fn ducklink_scalar_batch_col_invoke(
+    info: ffi::duckdb_function_info,
+    input: ffi::duckdb_data_chunk,
+    mut output: ffi::duckdb_vector,
+) {
+    let extra = ffi::duckdb_scalar_function_get_extra_info(info) as *const ScalarBaseColExtra;
+    if extra.is_null() {
+        let msg = CString::new("scalar_batch_col_invoke: missing extra info").unwrap();
+        ffi::duckdb_scalar_function_set_error(info, msg.as_ptr());
+        return;
+    }
+    let extra_ref = &*extra;
+
+    // Panic firewall: catch every panic before it unwinds across the
+    // extern "C" boundary (would abort the DuckDB host process).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        do_scalar_batch_col(extra_ref, input, &mut output)
+    }));
+    match outcome {
+        Ok(Ok(())) => (),
+        Ok(Err(e)) => {
+            let msg_s = e.to_string();
+            let msg = CString::new(msg_s)
+                .unwrap_or_else(|_| CString::new("scalar batch col dispatch error").unwrap());
+            ffi::duckdb_scalar_function_set_error(info, msg.as_ptr());
+        }
+        Err(p) => {
+            let msg_s = panic_msg(p, "scalar batch col dispatch");
+            let msg = CString::new(msg_s)
+                .unwrap_or_else(|_| CString::new("scalar batch col dispatch panic").unwrap());
+            ffi::duckdb_scalar_function_set_error(info, msg.as_ptr());
+        }
+    }
+}
+
+/// Body of `ducklink_scalar_batch_col_invoke`, split out so the panic-catch
+/// wrapper can `?`-thread the fallible dispatch and marshal errors uniformly.
+///
+/// # Safety
+/// `input` is a valid `duckdb_data_chunk` and `output` is a valid
+/// `duckdb_vector`. `extra.arg_codes` / `arg_type_exprs` describe the
+/// declared signature the caller (DuckDB) is passing chunks for.
+unsafe fn do_scalar_batch_col(
+    extra: &ScalarBaseColExtra,
+    input: ffi::duckdb_data_chunk,
+    output: &mut ffi::duckdb_vector,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // T1-3: mark this thread as inside a guest dispatch so a reentrant
+    // `NativeServices::query()` from the guest refuses instead of
+    // deadlocking the DuckDB executor lock.
+    let _reentrancy_guard = crate::engine::QueryReentrancyGuard::new();
+
+    let len = ffi::duckdb_data_chunk_get_size(input) as usize;
+    let arity = extra.arg_codes.len();
+
+    // Collect raw input vector handles + validity pointers up front. Both
+    // reads share the SAME underlying DuckDB vector storage per column
+    // (get_vector is idempotent), so precomputing avoids an extra call in
+    // the per-column loop below and lets us keep the `raw_vecs_mut` copy
+    // separate from `validities` — the FlatVector wrap needs a mutable
+    // binding, and `duckdb_vector` is a Copy raw-pointer typedef, so the
+    // copy is a bitwise pointer duplication (not a semantic clone).
+    let mut raw_vecs_mut: Vec<ffi::duckdb_vector> = (0..arity)
+        .map(|j| ffi::duckdb_data_chunk_get_vector(input, j as u64))
+        .collect();
+    let validities: Vec<*const u64> = raw_vecs_mut
+        .iter()
+        .map(|&v| ffi::duckdb_vector_get_validity(v) as *const u64)
+        .collect();
+    // Wrap each raw input handle in a FlatVector. `WritableVector::flat_vector`
+    // takes `&mut self` on `duckdb_vector` (the trait's raw-pointer impl in
+    // duckdb-rs's arrow module), and `iter_mut()` yields disjoint mutable
+    // borrows to each element — safe because the pointers themselves live
+    // in `raw_vecs_mut`'s own storage and the wrap is a phantom borrow
+    // (FlatVector's `_phantom: PhantomData<&'a ()>` — no runtime aliasing).
+    let cols: Vec<FlatVector<'_>> =
+        raw_vecs_mut.iter_mut().map(|v| v.flat_vector()).collect();
+    // Same wrap for the output — one FlatVector, held mutably for
+    // `write_colvec`'s typed slice + set_null path.
+    let mut out = output.flat_vector();
+
+    // Steady-state scratch reuse (per-thread) — identical shape to
+    // `WasmScalar::invoke`. `SCALAR_ARGS_SCRATCH` amortizes per-column
+    // Vec<T> allocations to zero after warmup; `SCALAR_NULL_MASK_SCRATCH`
+    // keeps the input-null mask's ~2 KB buffer alive across chunks so a
+    // NULL-bearing chunk pays no allocation past the first one.
+    let (result, has_input_null) = SCALAR_ARGS_SCRATCH.with(
+        |cell| -> Result<(Colvec, bool), Box<dyn std::error::Error>> {
+            let mut args = cell.borrow_mut();
+            if args.len() < arity {
+                args.resize_with(arity, || Colvec {
+                    data: ColvecColumn::Int64(Vec::new()),
+                    validity: Vec::new(),
+                    rows: 0,
+                });
+            } else if args.len() > arity {
+                args.truncate(arity);
+            }
+            let has_null = SCALAR_NULL_MASK_SCRATCH.with(|nm_cell| -> bool {
+                let mut nm_guard = nm_cell.borrow_mut();
+                nm_guard.clear();
+                for (j, &code) in extra.arg_codes.iter().enumerate() {
+                    let validity = validities[j];
+                    refill_colvec(
+                        &mut args[j],
+                        code,
+                        &cols[j],
+                        validity,
+                        len,
+                        extra.arg_type_exprs[j].as_deref(),
+                    );
+                    if !validity.is_null()
+                        && validity_has_any_null(validity, len)
+                    {
+                        if nm_guard.is_empty() {
+                            nm_guard.resize(len, false);
+                        }
+                        for i in 0..len {
+                            if !row_valid(validity, i) {
+                                nm_guard[i] = true;
+                            }
+                        }
+                    }
+                }
+                !nm_guard.is_empty()
+            });
+            let engine = &extra.engine;
+            let result = engine
+                .dispatch_scalar_batch_col(extra.callback_handle, 0, &args)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            Ok((result, has_null))
+        },
+    )?;
+
+    if has_input_null {
+        SCALAR_NULL_MASK_SCRATCH.with(
+            |nm_cell| -> Result<_, Box<dyn std::error::Error>> {
+                let nm_guard = nm_cell.borrow();
+                write_colvec(extra.ret_code, &mut out, result, Some(&nm_guard[..]), len)
+            },
+        )?;
+    } else {
+        write_colvec(extra.ret_code, &mut out, result, None, len)?;
+    }
+    Ok(())
+}
+
+/// Build a single `duckdb_scalar_function` for a base singleton scalar,
+/// wired to the column-major invoke callback (`ducklink_scalar_batch_col_invoke`)
+/// and its `ScalarBaseColExtra` extra-info. The caller owns the returned
+/// handle. Returns `None` on interior NUL in the name (already logged).
+///
+/// T2-6 (major-5, singleton path): mirrors `build_base_scalar_function`
+/// but with the columnar invoke + col-extra. Multi-overload groups keep
+/// the row-major `build_base_scalar_function` because
+/// `dispatch_scalar_batch_col` is single-signature per callback; overload
+/// dispatch happens at the C API function-set layer, not per-call.
+///
+/// # Safety
+/// FFI: constructs a DuckDB handle via `duckdb_create_scalar_function`.
+unsafe fn build_base_scalar_col_function(
+    s: &ScalarFunc,
+    engine: Arc<Engine2>,
+) -> Option<ffi::duckdb_scalar_function> {
+    let arg_codes: Vec<u8> = s.arguments.iter().map(|a| type_code(&a.logical)).collect();
+    let arg_type_exprs: Vec<Option<String>> = s
+        .arguments
+        .iter()
+        .map(|a| match &a.logical {
+            reg::LogicalType::Complex(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+    let ret_code = type_code(&s.returns);
+    let cname = match CString::new(s.name.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[ducklink] scalar '{}' has a NUL byte; skipping", s.name);
+            return None;
+        }
+    };
+    let func = ffi::duckdb_create_scalar_function();
+    ffi::duckdb_scalar_function_set_name(func, cname.as_ptr());
+    for a in &s.arguments {
+        let mut lt = logical_type_ffi_from_lt(&a.logical);
+        ffi::duckdb_scalar_function_add_parameter(func, lt);
+        ffi::duckdb_destroy_logical_type(&mut lt);
+    }
+    let mut rlt = logical_type_ffi_from_lt(&s.returns);
+    ffi::duckdb_scalar_function_set_return_type(func, rlt);
+    ffi::duckdb_destroy_logical_type(&mut rlt);
+    let extra = Box::into_raw(Box::new(ScalarBaseColExtra {
+        callback_handle: s.callback_handle,
+        engine,
+        arg_codes,
+        arg_type_exprs,
+        ret_code,
+    })) as *mut c_void;
+    ffi::duckdb_scalar_function_set_extra_info(func, extra, Some(scalar_base_col_extra_destroy));
+    ffi::duckdb_scalar_function_set_function(func, Some(ducklink_scalar_batch_col_invoke));
     Some(func)
 }
 
