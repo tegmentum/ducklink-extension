@@ -149,8 +149,10 @@ mod loadable {
         // duckdb-rs Connection for the safe scalar / table registration paths.
         let con = Connection::open_from_raw(db.cast())?;
         // A raw sibling connection on the SAME database for aggregates (no safe
-        // duckdb-rs wrapper exists). Registrations are catalog-wide, so it only
-        // needs to outlive the registration call.
+        // duckdb-rs wrapper exists). Also LIVES BEYOND registration -- kept for
+        // nested-exec's use, because DuckDB refuses `duckdb_connect` from
+        // inside a scalar callback (returns DuckDBError rc=1). Caching one
+        // sibling here (open at load, when the DB is idle) sidesteps that.
         let mut raw_con: ffi::duckdb_connection = std::ptr::null_mut();
         let have_raw =
             ffi::duckdb_connect(db, &mut raw_con) == ffi::DuckDBSuccess && !raw_con.is_null();
@@ -159,21 +161,20 @@ mod loadable {
         // even before any component is configured.
         con.register_scalar_function::<DucklinkVersion>("ducklink_version")
             .map_err(stringify)?;
-        // Give the engine the shared database handle so components can invoke
-        // `nested-exec` on a sibling connection. SAFETY: `db` is the raw
-        // handle DuckDB just handed us; DuckDB owns it for the process lifetime.
+        // Give the engine the shared database handle + the cached sibling
+        // connection. SAFETY: both are raw handles DuckDB just gave us; DuckDB
+        // owns the DB for the process lifetime, and the sibling connection
+        // stays alive until process exit (never disconnected here).
         let engine = Arc::new(Mutex::new(
-            unsafe { Engine2::with_database(db) }.map_err(stringify)?,
+            unsafe { Engine2::with_database_and_sibling(db, raw_con) }.map_err(stringify)?,
         ));
         let specs = component_specs_from_env();
         let registered = register_components(&con, have_raw.then_some(raw_con), engine, &specs)
             .map_err(stringify)?;
 
-        // The aggregate functions are now in the database catalog; the sibling
-        // connection has served its purpose.
-        if !raw_con.is_null() {
-            ffi::duckdb_disconnect(&mut raw_con);
-        }
+        // Aggregates registered; the sibling connection stays open for
+        // nested-exec use. It will be disconnected at process exit by DuckDB's
+        // own cleanup path.
         eprintln!(
             "[ducklink] loaded {} component(s); registered {registered} function(s){}",
             specs.len(),
