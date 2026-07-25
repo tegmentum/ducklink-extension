@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use wasmtime::component::Component;
@@ -340,7 +340,7 @@ pub struct LoadedComponent {
 /// invocations into them. A DuckDB extension holds one of these.
 pub struct Engine2 {
     engine: Engine,
-    callbacks: Arc<Mutex<CallbackRegistry>>,
+    callbacks: Arc<RwLock<CallbackRegistry>>,
     instances: HashMap<String, ExtensionInstance>,
     /// Captured `duckdb_database` handle for the nested-exec sibling-connection
     /// path. `Some` when the extension was loaded from a live DuckDB (the
@@ -355,7 +355,7 @@ impl Engine2 {
     pub fn new() -> Result<Self> {
         Ok(Self {
             engine: build_engine()?,
-            callbacks: Arc::new(Mutex::new(CallbackRegistry::new())),
+            callbacks: Arc::new(RwLock::new(CallbackRegistry::new())),
             instances: HashMap::new(),
             #[cfg(feature = "duckdb-api")]
             database: None,
@@ -374,7 +374,7 @@ impl Engine2 {
     pub unsafe fn with_database(db: duckdb::ffi::duckdb_database) -> Result<Self> {
         Ok(Self {
             engine: build_engine()?,
-            callbacks: Arc::new(Mutex::new(CallbackRegistry::new())),
+            callbacks: Arc::new(RwLock::new(CallbackRegistry::new())),
             instances: HashMap::new(),
             database: Some(SharedDatabase(db)),
         })
@@ -488,7 +488,7 @@ impl Engine2 {
         args: Vec<reg::DuckValue>,
     ) -> Result<reg::DuckValue> {
         let entry = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             registry
                 .get(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
@@ -527,7 +527,7 @@ impl Engine2 {
         // straight into the guest; the result comes back in the WIT type too, so
         // nothing on this path rebuilds or converts the value vectors.
         let entry = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             registry
                 .get(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
@@ -554,7 +554,7 @@ impl Engine2 {
         args: Vec<reg::DuckValue>,
     ) -> Result<Vec<Vec<reg::DuckValue>>> {
         let entry = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             registry
                 .get(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
@@ -584,7 +584,7 @@ impl Engine2 {
         rows: Vec<Vec<reg::DuckValue>>,
     ) -> Result<reg::DuckValue> {
         let entry = {
-            let registry = self.callbacks.lock().expect("callback registry poisoned");
+            let registry = self.callbacks.read().expect("callback registry poisoned");
             registry
                 .get(callback_handle)
                 .ok_or_else(|| anyhow!("unknown callback handle {callback_handle}"))?
@@ -647,10 +647,150 @@ fn neutral_to_wit(v: reg::DuckValue) -> extension_types::Duckvalue {
         reg::DuckValue::Uuid { hi, lo } => {
             extension_types::Duckvalue::Uuid(extension_types::Uuidvalue { hi, lo })
         }
+        // T2-1 residual (major-5): 128-bit integers ride the first-class WIT
+        // hugeint / uhugeint arms carrying two u64/s64 halves.
+        reg::DuckValue::Hugeint { lower, upper } => extension_types::Duckvalue::Hugeint(
+            extension_types::Hugeintvalue { lower, upper },
+        ),
+        reg::DuckValue::UHugeint { lower, upper } => extension_types::Duckvalue::Uhugeint(
+            extension_types::Uhugeintvalue { lower, upper },
+        ),
+        // S1 (major-5): the row-major WIT `duckvalue` variant has no first-class
+        // LIST/STRUCT/MAP/ARRAY arm (see types.wit — deferred until wit-parser
+        // gains recursive VALUE types). Lower these nested neutral values through
+        // the `complex` escape hatch, mirroring the runtime's own nested-column
+        // degradation: type-expr records the KIND for downstream dispatch, JSON
+        // carries a best-effort textual rendering.
+        reg::DuckValue::List(items) => {
+            extension_types::Duckvalue::Complex(extension_types::Complexvalue {
+                type_expr: "LIST".into(),
+                json: neutral_values_to_json(&items),
+            })
+        }
+        reg::DuckValue::Struct(fields) => {
+            extension_types::Duckvalue::Complex(extension_types::Complexvalue {
+                type_expr: "STRUCT".into(),
+                json: neutral_fields_to_json(&fields),
+            })
+        }
+        reg::DuckValue::Map(entries) => {
+            extension_types::Duckvalue::Complex(extension_types::Complexvalue {
+                type_expr: "MAP".into(),
+                json: neutral_map_to_json(&entries),
+            })
+        }
+        reg::DuckValue::Array(items) => {
+            extension_types::Duckvalue::Complex(extension_types::Complexvalue {
+                type_expr: "ARRAY".into(),
+                json: neutral_values_to_json(&items),
+            })
+        }
         reg::DuckValue::Complex { type_expr, json } => {
             extension_types::Duckvalue::Complex(extension_types::Complexvalue { type_expr, json })
         }
     }
+}
+
+/// Render a neutral `DuckValue` as a JSON-ish token for the `complex` escape
+/// hatch. Not a full JSON serializer — strings are quoted with a naive escape
+/// and every nested value falls through this recursion. Used only when the
+/// row-major WIT `duckvalue` variant has no structural arm for the value
+/// (LIST/STRUCT/MAP/ARRAY, per major-5 S1); the hot columnar path never hits
+/// this.
+fn neutral_value_to_json(v: &reg::DuckValue) -> String {
+    match v {
+        reg::DuckValue::Null => "null".to_string(),
+        reg::DuckValue::Boolean(b) => b.to_string(),
+        reg::DuckValue::Int8(x) => x.to_string(),
+        reg::DuckValue::Int16(x) => x.to_string(),
+        reg::DuckValue::Int32(x) => x.to_string(),
+        reg::DuckValue::Int64(x) => x.to_string(),
+        reg::DuckValue::Uint8(x) => x.to_string(),
+        reg::DuckValue::Uint16(x) => x.to_string(),
+        reg::DuckValue::Uint32(x) => x.to_string(),
+        reg::DuckValue::Uint64(x) => x.to_string(),
+        reg::DuckValue::Float32(x) => x.to_string(),
+        reg::DuckValue::Float64(x) => x.to_string(),
+        reg::DuckValue::Text(s) => json_quote(s),
+        reg::DuckValue::Blob(b) => json_quote(&format!("<blob:{} bytes>", b.len())),
+        reg::DuckValue::Timestamp(x)
+        | reg::DuckValue::Time(x)
+        | reg::DuckValue::Timestamptz(x) => x.to_string(),
+        reg::DuckValue::Date(x) => x.to_string(),
+        reg::DuckValue::Decimal {
+            lower,
+            upper,
+            width,
+            scale,
+        } => format!("\"DECIMAL({width},{scale}):{upper}:{lower}\""),
+        reg::DuckValue::Interval {
+            months,
+            days,
+            micros,
+        } => format!("\"INTERVAL:{months}m{days}d{micros}us\""),
+        reg::DuckValue::Uuid { hi, lo } => format!("\"UUID:{hi:016x}{lo:016x}\""),
+        reg::DuckValue::Hugeint { lower, upper } => {
+            let v = ((*upper as i128) << 64) | (*lower as i128);
+            v.to_string()
+        }
+        reg::DuckValue::UHugeint { lower, upper } => {
+            let v = ((*upper as u128) << 64) | (*lower as u128);
+            v.to_string()
+        }
+        reg::DuckValue::List(items) | reg::DuckValue::Array(items) => {
+            neutral_values_to_json(items)
+        }
+        reg::DuckValue::Struct(fields) => neutral_fields_to_json(fields),
+        reg::DuckValue::Map(entries) => neutral_map_to_json(entries),
+        reg::DuckValue::Complex { json, .. } => json.clone(),
+    }
+}
+
+fn neutral_values_to_json(items: &[reg::DuckValue]) -> String {
+    let parts: Vec<String> = items.iter().map(neutral_value_to_json).collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn neutral_fields_to_json(fields: &[(String, reg::DuckValue)]) -> String {
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(k, v)| format!("{}:{}", json_quote(k), neutral_value_to_json(v)))
+        .collect();
+    format!("{{{}}}", parts.join(","))
+}
+
+fn neutral_map_to_json(entries: &[(reg::DuckValue, reg::DuckValue)]) -> String {
+    let keys: Vec<String> = entries
+        .iter()
+        .map(|(k, _)| neutral_value_to_json(k))
+        .collect();
+    let vals: Vec<String> = entries
+        .iter()
+        .map(|(_, v)| neutral_value_to_json(v))
+        .collect();
+    format!(
+        "{{\"keys\":[{}],\"vals\":[{}]}}",
+        keys.join(","),
+        vals.join(",")
+    )
+}
+
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
@@ -685,6 +825,17 @@ fn wit_to_neutral(v: extension_types::Duckvalue) -> reg::DuckValue {
             micros: iv.micros,
         },
         extension_types::Duckvalue::Uuid(u) => reg::DuckValue::Uuid { hi: u.hi, lo: u.lo },
+        // T2-1 residual (major-5): HUGEINT / UHUGEINT ride first-class WIT arms
+        // with (lower, upper) halves; lift them straight into the matching
+        // structural neutral arms.
+        extension_types::Duckvalue::Hugeint(h) => reg::DuckValue::Hugeint {
+            lower: h.lower,
+            upper: h.upper,
+        },
+        extension_types::Duckvalue::Uhugeint(h) => reg::DuckValue::UHugeint {
+            lower: h.lower,
+            upper: h.upper,
+        },
         extension_types::Duckvalue::Complex(c) => reg::DuckValue::Complex {
             type_expr: c.type_expr,
             json: c.json,

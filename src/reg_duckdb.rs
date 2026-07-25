@@ -29,7 +29,8 @@ use ducklink_runtime::reg;
 // ~15% of dispatch). The cold table/aggregate paths still use reg::DuckValue.
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::types::{
     Complexvalue as WitComplex, Decimalvalue as WitDecimal, Duckvalue as WitVal,
-    Intervalvalue as WitInterval, Uuidvalue as WitUuid,
+    Hugeintvalue as WitHugeint, Intervalvalue as WitInterval, Uhugeintvalue as WitUhugeint,
+    Uuidvalue as WitUuid,
 };
 
 use crate::engine::{AggregateFunc, Engine2, ScalarFunc, TableFunc};
@@ -130,9 +131,32 @@ fn type_code(lt: &reg::LogicalType) -> u8 {
         reg::LogicalType::Date => T_DATE,
         reg::LogicalType::Time => T_TIME,
         reg::LogicalType::Timestamptz => T_TIMESTAMPTZ,
-        reg::LogicalType::Decimal => T_DECIMAL,
+        // S2 (major-5): DECIMAL now structurally carries width/scale. This
+        // bridge still declares the physical column at DECIMAL(18, 3) in
+        // `logical_type`; a value whose width/scale differ is a known
+        // limitation (see the write_ret Decimal arm around line 454).
+        // TODO: width/scale-aware conversion — plumb (width, scale) through
+        // the bridge type code so `logical_type` can build the exact
+        // `LogicalTypeHandle::decimal(width, scale)`.
+        reg::LogicalType::Decimal { .. } => T_DECIMAL,
         reg::LogicalType::Interval => T_INTERVAL,
         reg::LogicalType::Uuid => T_UUID,
+        // T2-1 residual (major-5): 128-bit integer logical types. This
+        // bridge has no dedicated HUGEINT/UHUGEINT storage path yet; route
+        // them through the COMPLEX escape hatch so they surface as VARCHAR
+        // JSON rather than trapping. A future extension of the type-code
+        // table can map these to LogicalTypeId::Hugeint / Uhugeint and
+        // read/write via `as_mut_slice_with_len::<i128>` (same pattern as
+        // T_UUID at line ~459).
+        reg::LogicalType::Hugeint | reg::LogicalType::UHugeint => T_COMPLEX,
+        // S1 (major-5): structural nested logical types have no first-class
+        // physical column in this bridge — surface them as COMPLEX (VARCHAR
+        // JSON) rather than trapping. Components that need real nested
+        // vector output should declare `Complex(type_expr)` explicitly.
+        reg::LogicalType::List(_)
+        | reg::LogicalType::Struct(_)
+        | reg::LogicalType::Map(_, _)
+        | reg::LogicalType::Array(_, _) => T_COMPLEX,
         reg::LogicalType::Complex(_) => T_COMPLEX,
     }
 }
@@ -363,10 +387,139 @@ fn neutral_to_wit(v: reg::DuckValue) -> WitVal {
             micros,
         }),
         reg::DuckValue::Uuid { hi, lo } => WitVal::Uuid(WitUuid { hi, lo }),
+        // T2-1 residual (major-5): 128-bit integers ride first-class WIT arms.
+        reg::DuckValue::Hugeint { lower, upper } => {
+            WitVal::Hugeint(WitHugeint { lower, upper })
+        }
+        reg::DuckValue::UHugeint { lower, upper } => {
+            WitVal::Uhugeint(WitUhugeint { lower, upper })
+        }
+        // S1 (major-5): the row-major WIT `duckvalue` has no structural
+        // LIST/STRUCT/MAP/ARRAY arm (see types.wit — deferred until wit-parser
+        // gains recursive VALUE types). Degrade to the `complex` escape hatch:
+        // type-expr records the KIND, json is a best-effort textual rendering.
+        // This path is cold (table/aggregate materialization only); the hot
+        // scalar path never touches this function.
+        reg::DuckValue::List(items) => WitVal::Complex(WitComplex {
+            type_expr: "LIST".into(),
+            json: neutral_values_to_json(&items),
+        }),
+        reg::DuckValue::Array(items) => WitVal::Complex(WitComplex {
+            type_expr: "ARRAY".into(),
+            json: neutral_values_to_json(&items),
+        }),
+        reg::DuckValue::Struct(fields) => WitVal::Complex(WitComplex {
+            type_expr: "STRUCT".into(),
+            json: neutral_fields_to_json(&fields),
+        }),
+        reg::DuckValue::Map(entries) => WitVal::Complex(WitComplex {
+            type_expr: "MAP".into(),
+            json: neutral_map_to_json(&entries),
+        }),
         reg::DuckValue::Complex { type_expr, json } => {
             WitVal::Complex(WitComplex { type_expr, json })
         }
     }
+}
+
+/// Render a neutral `DuckValue` as a JSON token for the `complex` escape hatch.
+/// Cold path only (table/aggregate materialization); the hot columnar scalar
+/// path never touches this. Nested LIST/STRUCT/MAP/ARRAY values recurse here
+/// because the row-major WIT `duckvalue` has no structural arms for them.
+fn neutral_value_to_json(v: &reg::DuckValue) -> String {
+    match v {
+        reg::DuckValue::Null => "null".to_string(),
+        reg::DuckValue::Boolean(b) => b.to_string(),
+        reg::DuckValue::Int8(x) => x.to_string(),
+        reg::DuckValue::Int16(x) => x.to_string(),
+        reg::DuckValue::Int32(x) => x.to_string(),
+        reg::DuckValue::Int64(x) => x.to_string(),
+        reg::DuckValue::Uint8(x) => x.to_string(),
+        reg::DuckValue::Uint16(x) => x.to_string(),
+        reg::DuckValue::Uint32(x) => x.to_string(),
+        reg::DuckValue::Uint64(x) => x.to_string(),
+        reg::DuckValue::Float32(x) => x.to_string(),
+        reg::DuckValue::Float64(x) => x.to_string(),
+        reg::DuckValue::Text(s) => json_quote(s),
+        reg::DuckValue::Blob(b) => json_quote(&format!("<blob:{} bytes>", b.len())),
+        reg::DuckValue::Timestamp(x)
+        | reg::DuckValue::Time(x)
+        | reg::DuckValue::Timestamptz(x) => x.to_string(),
+        reg::DuckValue::Date(x) => x.to_string(),
+        reg::DuckValue::Decimal {
+            lower,
+            upper,
+            width,
+            scale,
+        } => format!("\"DECIMAL({width},{scale}):{upper}:{lower}\""),
+        reg::DuckValue::Interval {
+            months,
+            days,
+            micros,
+        } => format!("\"INTERVAL:{months}m{days}d{micros}us\""),
+        reg::DuckValue::Uuid { hi, lo } => format!("\"UUID:{hi:016x}{lo:016x}\""),
+        reg::DuckValue::Hugeint { lower, upper } => {
+            let v = ((*upper as i128) << 64) | (*lower as i128);
+            v.to_string()
+        }
+        reg::DuckValue::UHugeint { lower, upper } => {
+            let v = ((*upper as u128) << 64) | (*lower as u128);
+            v.to_string()
+        }
+        reg::DuckValue::List(items) | reg::DuckValue::Array(items) => {
+            neutral_values_to_json(items)
+        }
+        reg::DuckValue::Struct(fields) => neutral_fields_to_json(fields),
+        reg::DuckValue::Map(entries) => neutral_map_to_json(entries),
+        reg::DuckValue::Complex { json, .. } => json.clone(),
+    }
+}
+
+fn neutral_values_to_json(items: &[reg::DuckValue]) -> String {
+    let parts: Vec<String> = items.iter().map(neutral_value_to_json).collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn neutral_fields_to_json(fields: &[(String, reg::DuckValue)]) -> String {
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(k, v)| format!("{}:{}", json_quote(k), neutral_value_to_json(v)))
+        .collect();
+    format!("{{{}}}", parts.join(","))
+}
+
+fn neutral_map_to_json(entries: &[(reg::DuckValue, reg::DuckValue)]) -> String {
+    let keys: Vec<String> = entries
+        .iter()
+        .map(|(k, _)| neutral_value_to_json(k))
+        .collect();
+    let vals: Vec<String> = entries
+        .iter()
+        .map(|(_, v)| neutral_value_to_json(v))
+        .collect();
+    format!(
+        "{{\"keys\":[{}],\"vals\":[{}]}}",
+        keys.join(","),
+        vals.join(",")
+    )
+}
+
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Write a component-returned WIT value into row `i` of a flat output column.
