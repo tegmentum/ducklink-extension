@@ -134,7 +134,7 @@ mod loadable {
     ) -> Result<bool, Box<dyn Error>> {
         // Populate the loadable C-API function-pointer table. Returns false on an
         // API-version mismatch, in which case loading aborts cleanly.
-        if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.4").map_err(stringify)? {
+        if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.5").map_err(stringify)? {
             return Ok(false);
         }
         let get_database = (*access)
@@ -251,7 +251,7 @@ mod loadable {
         info: ffi::duckdb_extension_info,
         access: *const ffi::duckdb_extension_access,
     ) -> Result<Option<Connection>, Box<dyn Error>> {
-        if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.4").map_err(stringify)? {
+        if !ffi::duckdb_rs_extension_api_init(info, access, "v1.5.5").map_err(stringify)? {
             return Ok(None);
         }
         let get_database = (*access)
