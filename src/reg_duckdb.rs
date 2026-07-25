@@ -73,13 +73,17 @@ fn guard<T>(
 
 /// Per-function state DuckDB hands back to `invoke`: which component callback to
 /// dispatch to, the shared engine, and the function's argument / return type
-/// codes (so one `WasmScalar` serves every signature).
+/// codes (so one `WasmScalar` serves every signature). Per-argument (and
+/// return) `Option<(width, scale)>` runs parallel to the type codes, populated
+/// only for `T_DECIMAL` slots — every other slot carries `None`.
 #[derive(Clone)]
 struct WasmScalarState {
     callback_handle: u32,
     engine: Arc<Mutex<Engine2>>,
     arg_codes: Vec<u8>,
+    arg_decimals: Vec<Option<(u8, u8)>>,
     ret_code: u8,
+    ret_decimal: Option<(u8, u8)>,
 }
 
 // Bridge type codes — one per DuckDB logical type the scalar bridge marshals.
@@ -108,47 +112,49 @@ const T_UUID: u8 = 19;
 // carried as its JSON rendering in a VARCHAR column (best-effort). The declared
 // type-expression is not reconstructed into a real LIST/STRUCT vector here.
 const T_COMPLEX: u8 = 20;
+// T2-1 (major-5): 128-bit integer logical types now have dedicated storage —
+// routed to LogicalTypeId::Hugeint / UHugeint and marshalled through the
+// `as_slice_with_len::<i128>` / `<u128>` path (see the T_HUGEINT / T_UHUGEINT
+// arms of read_col_into and write_ret).
+const T_HUGEINT: u8 = 21;
+const T_UHUGEINT: u8 = 22;
 
-/// Map a neutral logical type to a bridge type code. All current `reg`
-/// logical types are supported. Borrows `lt` because the `Complex` arm carries
-/// an owned `String`, so `reg::LogicalType` is no longer `Copy`.
-fn type_code(lt: &reg::LogicalType) -> u8 {
+/// Map a neutral logical type to a bridge type code and, for DECIMAL, the
+/// declared `(width, scale)`. All non-DECIMAL types return `None` for the
+/// decimal metadata. All current `reg` logical types are supported. Borrows
+/// `lt` because the `Complex` arm carries an owned `String`, so
+/// `reg::LogicalType` is no longer `Copy`.
+fn type_and_decimal(lt: &reg::LogicalType) -> (u8, Option<(u8, u8)>) {
     match lt {
-        reg::LogicalType::Int64 => T_I64,
-        reg::LogicalType::Uint64 => T_U64,
-        reg::LogicalType::Float64 => T_F64,
-        reg::LogicalType::Boolean => T_BOOL,
-        reg::LogicalType::Text => T_TEXT,
-        reg::LogicalType::Blob => T_BLOB,
-        reg::LogicalType::Int8 => T_I8,
-        reg::LogicalType::Int16 => T_I16,
-        reg::LogicalType::Int32 => T_I32,
-        reg::LogicalType::Uint8 => T_U8,
-        reg::LogicalType::Uint16 => T_U16,
-        reg::LogicalType::Uint32 => T_U32,
-        reg::LogicalType::Float32 => T_F32,
-        reg::LogicalType::Timestamp => T_TIMESTAMP,
-        reg::LogicalType::Date => T_DATE,
-        reg::LogicalType::Time => T_TIME,
-        reg::LogicalType::Timestamptz => T_TIMESTAMPTZ,
-        // S2 (major-5): DECIMAL now structurally carries width/scale. This
-        // bridge still declares the physical column at DECIMAL(18, 3) in
-        // `logical_type`; a value whose width/scale differ is a known
-        // limitation (see the write_ret Decimal arm around line 454).
-        // TODO: width/scale-aware conversion — plumb (width, scale) through
-        // the bridge type code so `logical_type` can build the exact
-        // `LogicalTypeHandle::decimal(width, scale)`.
-        reg::LogicalType::Decimal { .. } => T_DECIMAL,
-        reg::LogicalType::Interval => T_INTERVAL,
-        reg::LogicalType::Uuid => T_UUID,
-        // T2-1 residual (major-5): 128-bit integer logical types. This
-        // bridge has no dedicated HUGEINT/UHUGEINT storage path yet; route
-        // them through the COMPLEX escape hatch so they surface as VARCHAR
-        // JSON rather than trapping. A future extension of the type-code
-        // table can map these to LogicalTypeId::Hugeint / Uhugeint and
-        // read/write via `as_mut_slice_with_len::<i128>` (same pattern as
-        // T_UUID at line ~459).
-        reg::LogicalType::Hugeint | reg::LogicalType::UHugeint => T_COMPLEX,
+        reg::LogicalType::Int64 => (T_I64, None),
+        reg::LogicalType::Uint64 => (T_U64, None),
+        reg::LogicalType::Float64 => (T_F64, None),
+        reg::LogicalType::Boolean => (T_BOOL, None),
+        reg::LogicalType::Text => (T_TEXT, None),
+        reg::LogicalType::Blob => (T_BLOB, None),
+        reg::LogicalType::Int8 => (T_I8, None),
+        reg::LogicalType::Int16 => (T_I16, None),
+        reg::LogicalType::Int32 => (T_I32, None),
+        reg::LogicalType::Uint8 => (T_U8, None),
+        reg::LogicalType::Uint16 => (T_U16, None),
+        reg::LogicalType::Uint32 => (T_U32, None),
+        reg::LogicalType::Float32 => (T_F32, None),
+        reg::LogicalType::Timestamp => (T_TIMESTAMP, None),
+        reg::LogicalType::Date => (T_DATE, None),
+        reg::LogicalType::Time => (T_TIME, None),
+        reg::LogicalType::Timestamptz => (T_TIMESTAMPTZ, None),
+        // S2 (major-5): DECIMAL(width, scale) is plumbed end-to-end. The
+        // (width, scale) rides alongside the u8 code through
+        // WasmScalarState / WasmTableExtra so `logical_type` builds the exact
+        // `LogicalTypeHandle::decimal(width, scale)` and read/write pick the
+        // matching physical storage width (i16/i32/i64/i128).
+        reg::LogicalType::Decimal { width, scale } => (T_DECIMAL, Some((*width, *scale))),
+        reg::LogicalType::Interval => (T_INTERVAL, None),
+        reg::LogicalType::Uuid => (T_UUID, None),
+        // T2-1 (major-5): first-class HUGEINT / UHUGEINT storage — marshalled
+        // through `as_slice_with_len::<i128>` (Hugeint) / `<u128>` (UHugeint).
+        reg::LogicalType::Hugeint => (T_HUGEINT, None),
+        reg::LogicalType::UHugeint => (T_UHUGEINT, None),
         // S1 (major-5): structural nested logical types have no first-class
         // physical column in this bridge — surface them as COMPLEX (VARCHAR
         // JSON) rather than trapping. Components that need real nested
@@ -156,12 +162,12 @@ fn type_code(lt: &reg::LogicalType) -> u8 {
         reg::LogicalType::List(_)
         | reg::LogicalType::Struct(_)
         | reg::LogicalType::Map(_, _)
-        | reg::LogicalType::Array(_, _) => T_COMPLEX,
-        reg::LogicalType::Complex(_) => T_COMPLEX,
+        | reg::LogicalType::Array(_, _) => (T_COMPLEX, None),
+        reg::LogicalType::Complex(_) => (T_COMPLEX, None),
     }
 }
 
-fn logical_type(code: u8) -> LogicalTypeHandle {
+fn logical_type(code: u8, decimal: Option<(u8, u8)>) -> LogicalTypeHandle {
     let id = match code {
         T_I64 => LogicalTypeId::Bigint,
         T_U64 => LogicalTypeId::UBigint,
@@ -182,13 +188,17 @@ fn logical_type(code: u8) -> LogicalTypeHandle {
         T_TIMESTAMPTZ => LogicalTypeId::TimestampTZ,
         T_INTERVAL => LogicalTypeId::Interval,
         T_UUID => LogicalTypeId::Uuid,
+        T_HUGEINT => LogicalTypeId::Hugeint,
+        T_UHUGEINT => LogicalTypeId::UHugeint,
         // Complex crosses as JSON text -> declare a VARCHAR column.
         T_COMPLEX => LogicalTypeId::Varchar,
-        // DECIMAL needs a (width, scale) and is built directly below; the value's
-        // own width/scale is only known per-value, so the column is declared with
-        // DuckDB's default-precision DECIMAL(18, 3). A column whose values carry a
-        // different width/scale is a known limitation (see write_ret Decimal arm).
-        T_DECIMAL => return LogicalTypeHandle::decimal(18, 3),
+        // DECIMAL needs a (width, scale); use the declared pair when known,
+        // else fall back to DuckDB's default (18, 3) so old callers that
+        // haven't plumbed the metadata behave identically to before.
+        T_DECIMAL => {
+            let (w, s) = decimal.unwrap_or((18, 3));
+            return LogicalTypeHandle::decimal(w, s);
+        }
         _ => unreachable!("type code out of range"),
     };
     LogicalTypeHandle::from(id)
@@ -223,6 +233,7 @@ unsafe fn row_valid(validity: *const u64, r: usize) -> bool {
 /// (null when the column has no NULLs) and is consulted only for TEXT/BLOB.
 fn read_col_into(
     code: u8,
+    decimal: Option<(u8, u8)>,
     vec: &FlatVector,
     validity: *const u64,
     len: usize,
@@ -270,23 +281,64 @@ fn read_col_into(
                 });
             }
         }
-        // DECIMAL and UUID are both HUGEINT-backed (i128) in storage. UUID's
-        // physical storage is the sign-flipped hugeint; convert to the logical
-        // big-endian hi/lo halves the WIT contract expects.
+        // DECIMAL is width-parameterised: DuckDB picks the narrowest signed
+        // integer that fits the declared precision (i16 for w<=4, i32 for
+        // w<=9, i64 for w<=18, i128 otherwise). Read the physical storage at
+        // the actual width, then widen to i128 so the WIT contract always
+        // carries the full 128-bit value regardless of physical width. When
+        // no declared (width, scale) is present the bridge falls back to the
+        // legacy DECIMAL(18, 3) shape, preserving old behaviour.
         T_DECIMAL => {
-            let s = unsafe { vec.as_slice_with_len::<i128>(len) };
+            let (width, scale) = decimal.unwrap_or((18, 3));
+            let raw_i128: Box<dyn Fn(usize) -> i128> = if width <= 4 {
+                let s = unsafe { vec.as_slice_with_len::<i16>(len) };
+                Box::new(move |i| s[i] as i128)
+            } else if width <= 9 {
+                let s = unsafe { vec.as_slice_with_len::<i32>(len) };
+                Box::new(move |i| s[i] as i128)
+            } else if width <= 18 {
+                let s = unsafe { vec.as_slice_with_len::<i64>(len) };
+                Box::new(move |i| s[i] as i128)
+            } else {
+                let s = unsafe { vec.as_slice_with_len::<i128>(len) };
+                Box::new(move |i| s[i])
+            };
             for (i, row) in rows.iter_mut().enumerate() {
-                let raw = s[i] as u128;
+                let raw = raw_i128(i) as u128;
                 row[j] = WitVal::Decimal(WitDecimal {
                     lower: raw as u64,
                     upper: (raw >> 64) as u64,
-                    // The value's width/scale is not available from the flat
-                    // vector here; the registration declared DECIMAL(18, 3).
-                    width: 18,
-                    scale: 3,
+                    width,
+                    scale,
                 });
             }
         }
+        // HUGEINT / UHUGEINT: 128-bit physical storage, split into (lower u64,
+        // upper) halves for the WIT contract. Hugeint's upper is signed, so
+        // arithmetic right-shift preserves the sign bit; UHugeint's upper is
+        // unsigned and logical-right-shifts on a u128.
+        T_HUGEINT => {
+            let s = unsafe { vec.as_slice_with_len::<i128>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                let raw = s[i];
+                row[j] = WitVal::Hugeint(WitHugeint {
+                    lower: raw as u64,
+                    upper: (raw >> 64) as i64,
+                });
+            }
+        }
+        T_UHUGEINT => {
+            let s = unsafe { vec.as_slice_with_len::<u128>(len) };
+            for (i, row) in rows.iter_mut().enumerate() {
+                let raw = s[i];
+                row[j] = WitVal::Uhugeint(WitUhugeint {
+                    lower: raw as u64,
+                    upper: (raw >> 64) as u64,
+                });
+            }
+        }
+        // UUID physical storage is a sign-flipped hugeint; convert to the
+        // logical big-endian hi/lo halves the WIT contract expects.
         T_UUID => {
             let s = unsafe { vec.as_slice_with_len::<i128>(len) };
             for (i, row) in rows.iter_mut().enumerate() {
@@ -523,8 +575,13 @@ fn json_quote(s: &str) -> String {
 }
 
 /// Write a component-returned WIT value into row `i` of a flat output column.
+/// `decimal` is the declared `(width, scale)` for `T_DECIMAL` columns (used to
+/// pick the physical storage width); `None` for every other type code, and
+/// also for DECIMAL callers that predate the width/scale plumbing (in which
+/// case the write falls back to the legacy DECIMAL(18, 3) shape).
 fn write_ret(
     code: u8,
+    decimal: Option<(u8, u8)>,
     vec: &mut FlatVector,
     i: usize,
     len: usize,
@@ -604,10 +661,36 @@ fn write_ret(
             };
         }
         (T_DECIMAL, WitVal::Decimal(d)) => {
-            // HUGEINT-backed. The declared column is DECIMAL(18, 3); a value whose
-            // width/scale differ would be misinterpreted (known limitation).
+            // Physical storage width follows the declared precision: i16 for
+            // w<=4, i32 for w<=9, i64 for w<=18, i128 otherwise. The WIT
+            // value always carries the full 128-bit payload; narrow at write
+            // time by truncating the reconstructed i128.
+            let full = (((d.upper as u128) << 64) | d.lower as u128) as i128;
+            let (width, _scale) = decimal.unwrap_or((18, 3));
+            if width <= 4 {
+                let s = unsafe { vec.as_mut_slice_with_len::<i16>(len) };
+                s[i] = full as i16;
+            } else if width <= 9 {
+                let s = unsafe { vec.as_mut_slice_with_len::<i32>(len) };
+                s[i] = full as i32;
+            } else if width <= 18 {
+                let s = unsafe { vec.as_mut_slice_with_len::<i64>(len) };
+                s[i] = full as i64;
+            } else {
+                let s = unsafe { vec.as_mut_slice_with_len::<i128>(len) };
+                s[i] = full;
+            }
+        }
+        (T_HUGEINT, WitVal::Hugeint(h)) => {
+            // Reassemble the signed 128-bit value from the two-half WIT split.
             let s = unsafe { vec.as_mut_slice_with_len::<i128>(len) };
-            s[i] = (((d.upper as u128) << 64) | d.lower as u128) as i128;
+            s[i] = (((h.upper as i128) << 64) | (h.lower as i128)) as i128;
+        }
+        (T_UHUGEINT, WitVal::Uhugeint(u)) => {
+            // Reassemble the unsigned 128-bit value; DuckDB's physical
+            // storage for UHUGEINT is u128.
+            let s = unsafe { vec.as_mut_slice_with_len::<u128>(len) };
+            s[i] = ((u.upper as u128) << 64) | u.lower as u128;
         }
         (T_UUID, WitVal::Uuid(u)) => {
             let s = unsafe { vec.as_mut_slice_with_len::<i128>(len) };
@@ -634,7 +717,12 @@ fn write_ret(
 // state, so the per-function signature is handed to it through this thread-local,
 // set immediately before the (synchronous) registration call.
 thread_local! {
-    static PENDING_SIGNATURE: RefCell<Option<(Vec<u8>, u8)>> = const { RefCell::new(None) };
+    // (arg_codes, arg_decimals, ret_code, ret_decimal). The decimal metadata
+    // rides parallel to the u8 codes so `logical_type` can build the exact
+    // `DECIMAL(width, scale)` for each slot; every non-DECIMAL slot is `None`.
+    #[allow(clippy::type_complexity)]
+    static PENDING_SIGNATURE: RefCell<Option<(Vec<u8>, Vec<Option<(u8, u8)>>, u8, Option<(u8, u8)>)>> =
+        const { RefCell::new(None) };
 
     /// Per-thread reusable marshalling buffer for scalar dispatch. DuckDB calls
     /// `invoke` once per data chunk, possibly from several threads; each thread
@@ -708,7 +796,8 @@ impl VScalar for WasmScalar {
                         let v = ffi::duckdb_data_chunk_get_vector(raw_chunk, j as u64);
                         ffi::duckdb_vector_get_validity(v) as *const u64
                     };
-                    read_col_into(code, &cols[j], validity, len, &mut rows, j);
+                    let dec = state.arg_decimals.get(j).copied().flatten();
+                    read_col_into(code, dec, &cols[j], validity, len, &mut rows, j);
                     if !validity.is_null() {
                         let nm = null_mask.get_or_insert_with(|| vec![false; len]);
                         for (i, slot) in nm.iter_mut().enumerate() {
@@ -738,7 +827,7 @@ impl VScalar for WasmScalar {
                 if null_mask.as_ref().is_some_and(|nm| nm[i]) {
                     out.set_null(i);
                 } else {
-                    write_ret(state.ret_code, &mut out, i, len, result)?;
+                    write_ret(state.ret_code, state.ret_decimal, &mut out, i, len, result)?;
                 }
             }
             Ok(())
@@ -746,12 +835,17 @@ impl VScalar for WasmScalar {
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        let (arg_codes, ret_code) = PENDING_SIGNATURE
+        let (arg_codes, arg_decimals, ret_code, ret_decimal) = PENDING_SIGNATURE
             .with(|s| s.borrow().clone())
             .expect("PENDING_SIGNATURE must be set before registration");
+        let args: Vec<LogicalTypeHandle> = arg_codes
+            .into_iter()
+            .zip(arg_decimals.into_iter())
+            .map(|(code, dec)| logical_type(code, dec))
+            .collect();
         vec![ScalarFunctionSignature::exact(
-            arg_codes.into_iter().map(logical_type).collect(),
-            logical_type(ret_code),
+            args,
+            logical_type(ret_code, ret_decimal),
         )]
     }
 }
@@ -765,16 +859,24 @@ pub fn register_scalars(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for f in scalars {
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
-        let ret_code = type_code(&f.returns);
+        let (arg_codes, arg_decimals): (Vec<u8>, Vec<Option<(u8, u8)>>) = f
+            .arguments
+            .iter()
+            .map(|a| type_and_decimal(&a.logical))
+            .unzip();
+        let (ret_code, ret_decimal) = type_and_decimal(&f.returns);
         let state = WasmScalarState {
             callback_handle: f.callback_handle,
             engine: engine.clone(),
             arg_codes: arg_codes.clone(),
+            arg_decimals: arg_decimals.clone(),
             ret_code,
+            ret_decimal,
         };
         // Hand the signature to `WasmScalar::signatures()` for this one call.
-        PENDING_SIGNATURE.with(|s| *s.borrow_mut() = Some((arg_codes, ret_code)));
+        PENDING_SIGNATURE.with(|s| {
+            *s.borrow_mut() = Some((arg_codes, arg_decimals, ret_code, ret_decimal))
+        });
         let result = con.register_scalar_function_with_state::<WasmScalar>(&f.name, &state);
         PENDING_SIGNATURE.with(|s| *s.borrow_mut() = None);
         result?;
@@ -801,26 +903,40 @@ fn param_to_neutral(code: u8, v: &Value) -> reg::DuckValue {
         T_TEXT => reg::DuckValue::Text(v.to_string()),
         // No raw blob getter on the param value; fall back to its text form.
         T_BLOB => reg::DuckValue::Blob(v.to_string().into_bytes()),
+        // T_HUGEINT/T_UHUGEINT/T_DECIMAL: DuckDB's `Value` param API has no
+        // getter that returns a 128-bit integer / decimal payload; a real
+        // extraction path would need `duckdb_value_get_hugeint` at the C API.
+        // Table functions that declare HUGEINT/UHUGEINT/DECIMAL parameters
+        // therefore receive Null for now (they still work when passed via
+        // implicit cast from a smaller integer literal at bind time).
         _ => reg::DuckValue::Null,
     }
 }
 
 /// Per-function table data, passed to the static `VTab` callbacks via DuckDB's
-/// extra-info slot.
+/// extra-info slot. Decimal metadata rides parallel to the u8 codes so
+/// declared DECIMAL(width, scale) columns round-trip at the exact precision
+/// the component asked for. (Argument decimal metadata is handed to the
+/// static `VTab::parameters()` via `PENDING_TABLE_PARAMS` at registration
+/// time — since `param_to_neutral` has no 128-bit extraction path yet, no
+/// arg-side decimal metadata is retained here.)
 #[derive(Clone)]
 struct WasmTableExtra {
     callback_handle: u32,
     engine: Arc<Mutex<Engine2>>,
     arg_codes: Vec<u8>,
     col_codes: Vec<u8>,
+    col_decimals: Vec<Option<(u8, u8)>>,
     col_names: Vec<String>,
 }
 
 /// Bind result: the full set of rows the component produced for this call, plus
-/// the column type codes used to write them out.
+/// the column type codes (and per-column decimal metadata) used to write them
+/// out.
 struct WasmTableBind {
     rows: Vec<Vec<reg::DuckValue>>,
     col_codes: Vec<u8>,
+    col_decimals: Vec<Option<(u8, u8)>>,
 }
 
 /// Init state: a cursor over `WasmTableBind::rows` across `func` chunks.
@@ -828,10 +944,13 @@ struct WasmTableInit {
     cursor: AtomicUsize,
 }
 
-// The parameter types for the next table-function registration — handed to the
-// static `VTab::parameters()` the same way `PENDING_SIGNATURE` feeds scalars.
+// The parameter types (u8 code + optional decimal metadata) for the next
+// table-function registration — handed to the static `VTab::parameters()` the
+// same way `PENDING_SIGNATURE` feeds scalars.
 thread_local! {
-    static PENDING_TABLE_PARAMS: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    #[allow(clippy::type_complexity)]
+    static PENDING_TABLE_PARAMS: RefCell<Option<Vec<(u8, Option<(u8, u8)>)>>> =
+        const { RefCell::new(None) };
 }
 
 /// One `VTab` impl serving every component table function. `bind` runs the
@@ -846,8 +965,13 @@ impl VTab for WasmTable {
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         guard("table bind", || {
             let extra = unsafe { &*bind.get_extra_info::<WasmTableExtra>() };
-            for (name, &code) in extra.col_names.iter().zip(&extra.col_codes) {
-                bind.add_result_column(name, logical_type(code));
+            for ((name, &code), &dec) in extra
+                .col_names
+                .iter()
+                .zip(&extra.col_codes)
+                .zip(&extra.col_decimals)
+            {
+                bind.add_result_column(name, logical_type(code, dec));
             }
             let args: Vec<reg::DuckValue> = extra
                 .arg_codes
@@ -864,6 +988,7 @@ impl VTab for WasmTable {
             Ok(WasmTableBind {
                 rows,
                 col_codes: extra.col_codes.clone(),
+                col_decimals: extra.col_decimals.clone(),
             })
         })
     }
@@ -889,9 +1014,10 @@ impl VTab for WasmTable {
             }
             for (c, &code) in bind.col_codes.iter().enumerate() {
                 let mut col = output.flat_vector(c);
+                let dec = bind.col_decimals.get(c).copied().flatten();
                 for r in 0..n {
                     let val = neutral_to_wit(bind.rows[start + r][c].clone());
-                    write_ret(code, &mut col, r, n, val)?;
+                    write_ret(code, dec, &mut col, r, n, val)?;
                 }
             }
             init.cursor.store(start + n, Ordering::Relaxed);
@@ -901,9 +1027,12 @@ impl VTab for WasmTable {
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        PENDING_TABLE_PARAMS
-            .with(|s| s.borrow().clone())
-            .map(|codes| codes.into_iter().map(logical_type).collect())
+        PENDING_TABLE_PARAMS.with(|s| s.borrow().clone()).map(|codes| {
+            codes
+                .into_iter()
+                .map(|(code, dec)| logical_type(code, dec))
+                .collect()
+        })
     }
 }
 
@@ -1088,17 +1217,35 @@ pub fn register_tables(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for t in tables {
-        let arg_codes: Vec<u8> = t.arguments.iter().map(|a| type_code(&a.logical)).collect();
-        let col_codes: Vec<u8> = t.columns.iter().map(|c| type_code(&c.logical)).collect();
+        let (arg_codes, arg_decimals): (Vec<u8>, Vec<Option<(u8, u8)>>) = t
+            .arguments
+            .iter()
+            .map(|a| type_and_decimal(&a.logical))
+            .unzip();
+        let (col_codes, col_decimals): (Vec<u8>, Vec<Option<(u8, u8)>>) = t
+            .columns
+            .iter()
+            .map(|c| type_and_decimal(&c.logical))
+            .unzip();
         let col_names: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
+        let params: Vec<(u8, Option<(u8, u8)>)> = arg_codes
+            .iter()
+            .copied()
+            .zip(arg_decimals.iter().copied())
+            .collect();
+        // `arg_decimals` was consumed above into `params` for the static
+        // `VTab::parameters()` hand-off; not retained on the extra since
+        // there is no arg-side decimal extraction path yet.
+        let _ = arg_decimals;
         let extra = WasmTableExtra {
             callback_handle: t.callback_handle,
             engine: engine.clone(),
-            arg_codes: arg_codes.clone(),
+            arg_codes,
             col_codes,
+            col_decimals,
             col_names,
         };
-        PENDING_TABLE_PARAMS.with(|s| *s.borrow_mut() = Some(arg_codes));
+        PENDING_TABLE_PARAMS.with(|s| *s.borrow_mut() = Some(params));
         let result = con
             .register_table_function_with_extra_info::<WasmTable, WasmTableExtra>(&t.name, &extra);
         PENDING_TABLE_PARAMS.with(|s| *s.borrow_mut() = None);
@@ -1171,9 +1318,12 @@ fn duckdb_type_of(code: u8) -> ffi::duckdb_type {
         T_TIMESTAMPTZ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ,
         T_INTERVAL => ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL,
         T_UUID => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID,
-        // DECIMAL via this enum has no width/scale; aggregates over DECIMAL are a
-        // known limitation (the scalar/table path declares DECIMAL(18, 3) via a
-        // dedicated constructor instead). COMPLEX falls back to VARCHAR/JSON.
+        T_HUGEINT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT,
+        T_UHUGEINT => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT,
+        // TODO(aggregate DECIMAL): building a DECIMAL logical type via this
+        // enum has no width/scale slot — aggregates over DECIMAL therefore
+        // fall through to VARCHAR (a known limitation). Scalars + tables use
+        // `logical_type(T_DECIMAL, Some((w, s)))` directly.
         T_COMPLEX => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
         _ => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
     }
@@ -1225,8 +1375,23 @@ unsafe fn read_arg_raw(code: u8, vector: ffi::duckdb_vector, i: usize) -> reg::D
                 lo: logical as u64,
             }
         }
-        // DECIMAL (needs per-value width/scale) and COMPLEX (nested) over the raw
-        // aggregate path are not yet marshalled; surface as NULL.
+        T_HUGEINT => {
+            let raw = *(data as *const i128).add(i);
+            reg::DuckValue::Hugeint {
+                lower: raw as u64,
+                upper: (raw >> 64) as i64,
+            }
+        }
+        T_UHUGEINT => {
+            let raw = *(data as *const u128).add(i);
+            reg::DuckValue::UHugeint {
+                lower: raw as u64,
+                upper: (raw >> 64) as u64,
+            }
+        }
+        // DECIMAL (needs per-value width/scale, aggregate path has no plumbing
+        // for that yet — see the duckdb_type_of TODO) and COMPLEX (nested)
+        // over the raw aggregate path are not yet marshalled; surface as NULL.
         _ => reg::DuckValue::Null,
     }
 }
@@ -1287,6 +1452,12 @@ unsafe fn write_ret_raw(
         (T_UUID, reg::DuckValue::Uuid { hi, lo }) => {
             let logical = ((hi as u128) << 64) | lo as u128;
             *(data as *mut i128).add(i) = uuid_storage_to_logical(logical as i128) as i128;
+        }
+        (T_HUGEINT, reg::DuckValue::Hugeint { lower, upper }) => {
+            *(data as *mut i128).add(i) = ((upper as i128) << 64) | (lower as i128);
+        }
+        (T_UHUGEINT, reg::DuckValue::UHugeint { lower, upper }) => {
+            *(data as *mut u128).add(i) = ((upper as u128) << 64) | (lower as u128);
         }
         (T_COMPLEX, reg::DuckValue::Complex { json, .. }) => {
             ffi::duckdb_vector_assign_string_element_len(
@@ -1415,8 +1586,16 @@ pub unsafe fn register_aggregates(
 ) -> duckdb::Result<usize> {
     let mut registered = 0usize;
     for f in aggregates {
-        let arg_codes: Vec<u8> = f.arguments.iter().map(|a| type_code(&a.logical)).collect();
-        let ret_code = type_code(&f.returns);
+        // Aggregate path drops the decimal metadata for now — `duckdb_type_of`
+        // has no width/scale slot, so DECIMAL aggregates flatten to the
+        // legacy behaviour (fall through to VARCHAR). See the TODO on
+        // `duckdb_type_of`.
+        let arg_codes: Vec<u8> = f
+            .arguments
+            .iter()
+            .map(|a| type_and_decimal(&a.logical).0)
+            .collect();
+        let ret_code = type_and_decimal(&f.returns).0;
 
         let func = ffi::duckdb_create_aggregate_function();
         let cname = CString::new(f.name.as_str())
@@ -1723,5 +1902,60 @@ mod tests {
             "missing context, got: {msg}"
         );
         assert!(msg.contains("kaboom 42"), "missing payload, got: {msg}");
+    }
+
+    // --- type-code system (hugeint + decimal plumbing) --------------------
+
+    /// `type_and_decimal` routes the 128-bit integer logical types to their
+    /// own bridge codes (not the old T_COMPLEX/VARCHAR escape hatch) and
+    /// leaves the decimal metadata unset.
+    #[test]
+    fn type_and_decimal_routes_hugeint_and_uhugeint_first_class() {
+        let (code, dec) = type_and_decimal(&reg::LogicalType::Hugeint);
+        assert_eq!(code, T_HUGEINT);
+        assert_eq!(dec, None);
+        let (code, dec) = type_and_decimal(&reg::LogicalType::UHugeint);
+        assert_eq!(code, T_UHUGEINT);
+        assert_eq!(dec, None);
+    }
+
+    /// `type_and_decimal` on a DECIMAL variant surfaces the declared width and
+    /// scale alongside the bridge code, and `logical_type` reconstructs a
+    /// handle at exactly those parameters.
+    #[test]
+    fn type_and_decimal_carries_decimal_width_scale() {
+        for (w, s) in [(4u8, 2u8), (9, 4), (18, 6), (38, 10)] {
+            let (code, dec) = type_and_decimal(&reg::LogicalType::Decimal {
+                width: w,
+                scale: s,
+            });
+            assert_eq!(code, T_DECIMAL);
+            assert_eq!(dec, Some((w, s)));
+            let handle = logical_type(code, dec);
+            assert_eq!(handle.id(), LogicalTypeId::Decimal);
+            assert_eq!(handle.decimal_width(), w, "width for DECIMAL({w},{s})");
+            assert_eq!(handle.decimal_scale(), s, "scale for DECIMAL({w},{s})");
+        }
+    }
+
+    /// Missing decimal metadata (`None`) falls back to DECIMAL(18, 3) — the
+    /// same shape the legacy `type_code`/`logical_type` pair used, so any
+    /// old caller that hasn't wired the plumbing continues to see identical
+    /// behaviour.
+    #[test]
+    fn logical_type_decimal_none_falls_back_to_18_3() {
+        let handle = logical_type(T_DECIMAL, None);
+        assert_eq!(handle.id(), LogicalTypeId::Decimal);
+        assert_eq!(handle.decimal_width(), 18);
+        assert_eq!(handle.decimal_scale(), 3);
+    }
+
+    /// `logical_type` maps the hugeint bridge codes to `LogicalTypeId::Hugeint`
+    /// / `UHugeint` — first-class DuckDB storage, not the VARCHAR escape
+    /// hatch.
+    #[test]
+    fn logical_type_hugeint_maps_to_first_class_ids() {
+        assert_eq!(logical_type(T_HUGEINT, None).id(), LogicalTypeId::Hugeint);
+        assert_eq!(logical_type(T_UHUGEINT, None).id(), LogicalTypeId::UHugeint);
     }
 }
