@@ -1735,8 +1735,50 @@ pub fn register_components(
             }
             None => {}
         }
+        if !loaded.macros.is_empty() {
+            total += register_macros(con, &loaded.macros)?;
+        }
     }
     Ok(total)
+}
+
+/// Register component-declared SQL macros with DuckDB. Each becomes a
+/// `CREATE OR REPLACE MACRO {schema}.{name}({params}) AS {definition_sql}`
+/// statement executed against `con`. Table-macros (whose body starts with
+/// `TABLE`) get `AS TABLE {body}`; scalar-macros get `AS ({body})`.
+///
+/// Schema is applied only when non-empty; a bare macro name lands in `main`
+/// per DuckDB's default. Parameter names are dropped in verbatim; the caller
+/// (the component) is expected to have produced valid DuckDB identifiers.
+fn register_macros(
+    con: &Connection,
+    macros: &[reg::MacroReg],
+) -> duckdb::Result<usize> {
+    let mut registered = 0usize;
+    for m in macros {
+        let qualified = if m.schema.is_empty() {
+            m.name.clone()
+        } else {
+            format!("{}.{}", m.schema, m.name)
+        };
+        let params = m.parameters.join(", ");
+        // Table macros advertise their shape by prefixing the body with
+        // `TABLE ` (matches DuckDB's own macro grammar: `CREATE MACRO foo() AS
+        // TABLE SELECT ...`). Everything else is a scalar macro wrapped in
+        // parentheses to force expression parsing.
+        let body_trim = m.definition_sql.trim_start();
+        let as_clause = if body_trim.to_uppercase().starts_with("TABLE") {
+            m.definition_sql.to_string()
+        } else {
+            format!("({})", m.definition_sql)
+        };
+        let sql = format!(
+            "CREATE OR REPLACE MACRO {qualified}({params}) AS {as_clause}"
+        );
+        con.execute(&sql, [])?;
+        registered += 1;
+    }
+    Ok(registered)
 }
 
 #[cfg(all(test, feature = "bundled"))]

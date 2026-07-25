@@ -334,6 +334,13 @@ pub struct LoadedComponent {
     pub logical_types: Vec<LogicalTypeAlias>,
     /// #79 scaffold — see `CastReg`.
     pub casts: Vec<CastReg>,
+    /// SQL macros the component registered via `catalog.register-macro`. The
+    /// Direction-2 sink turns each into `CREATE OR REPLACE MACRO
+    /// {schema}.{name}({params}) AS {definition_sql}` on the connection.
+    /// The runtime.macro-registry capability path is deliberately Unsupported
+    /// (see crates/ducklink-runtime `Capabilitykind::Macro`); components
+    /// register through catalog and this field carries them across the sink.
+    pub macros: Vec<reg::MacroReg>,
 }
 
 /// Process-wide Direction-2 engine: loads components and dispatches DuckDB
@@ -468,6 +475,9 @@ impl Engine2 {
                 callback_handle: c.callback_handle,
             })
             .collect();
+        // Macros come across as-is (name, params, definition SQL) -- the
+        // Direction-2 sink turns them into CREATE OR REPLACE MACRO statements.
+        let macros = pending.macros;
         self.instances.insert(extension.to_string(), instance);
         Ok(LoadedComponent {
             scalars,
@@ -475,6 +485,7 @@ impl Engine2 {
             aggregates,
             logical_types,
             casts,
+            macros,
         })
     }
 
