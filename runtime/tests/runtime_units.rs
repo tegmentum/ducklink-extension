@@ -29,9 +29,22 @@ fn registry_get_returns_stored_entry() {
     let mut reg = CallbackRegistry::new();
     let h = reg.allocate("myext", CallbackKind::Cast, 42);
     let entry = reg.get(h).expect("allocated handle resolves");
-    assert_eq!(entry.extension, "myext");
+    assert_eq!(&*entry.extension, "myext");
     assert_eq!(entry.dispatcher_handle, 42);
     assert_eq!(entry.kind, CallbackKind::Cast);
+}
+
+#[test]
+fn registry_resolve_borrows_same_entry_as_get() {
+    // The dispatch hot path uses `resolve` (borrowing, no clone) instead of
+    // `get` (cloning). Both must agree on the stored entry.
+    let mut reg = CallbackRegistry::new();
+    let h = reg.allocate_quiet("myext", CallbackKind::Scalar, 7);
+    let borrowed = reg.resolve(h).expect("resolve returns the stored entry");
+    assert_eq!(&*borrowed.extension, "myext");
+    assert_eq!(borrowed.dispatcher_handle, 7);
+    assert_eq!(borrowed.kind, CallbackKind::Scalar);
+    assert!(reg.resolve(h + 999).is_none(), "unknown handle resolves None");
 }
 
 #[test]
@@ -295,6 +308,7 @@ fn pending_append_merges_all_kinds_and_drains_other() {
         source: "a".to_string(),
         target: "b".to_string(),
         callback_handle: 3,
+        implicit_cost: None,
     });
 
     base.append(other);
@@ -306,4 +320,42 @@ fn pending_append_merges_all_kinds_and_drains_other() {
     assert_eq!(base.macros.len(), 1);
     assert_eq!(base.casts.len(), 1);
     assert_eq!(base.aggregates.len(), 0);
+}
+
+// --- T2-4: CastReg.implicit_cost round-trip --------------------------------
+//
+// The three legal shapes the WIT `option<s32>` field can carry once captured
+// into a `reg::CastReg` are: `None` (unset → ducklink applies its 100
+// default at native-registration time), `Some(v)` with `v >= 0` (positive
+// implicit cost forwarded verbatim), and `Some(-1)` (the DuckDB C API's
+// "explicit-only" convention; the consolidator skips the setter). Sweep 4
+// added the `Some(50)` / `Some(-1)` coverage — previously only the `None`
+// arm was exercised in `pending_append_merges_all_kinds_and_drains_other`.
+
+fn cast_reg_with_cost(cost: Option<i32>) -> reg::CastReg {
+    reg::CastReg {
+        extension: "ext".to_string(),
+        source: "src".to_string(),
+        target: "tgt".to_string(),
+        callback_handle: 1,
+        implicit_cost: cost,
+    }
+}
+
+#[test]
+fn cast_reg_carries_implicit_cost_none() {
+    let c = cast_reg_with_cost(None);
+    assert_eq!(c.implicit_cost, None);
+}
+
+#[test]
+fn cast_reg_carries_implicit_cost_some_positive() {
+    let c = cast_reg_with_cost(Some(50));
+    assert_eq!(c.implicit_cost, Some(50));
+}
+
+#[test]
+fn cast_reg_carries_implicit_cost_some_explicit_only() {
+    let c = cast_reg_with_cost(Some(-1));
+    assert_eq!(c.implicit_cost, Some(-1));
 }

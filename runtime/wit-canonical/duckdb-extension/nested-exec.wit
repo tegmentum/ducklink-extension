@@ -1,4 +1,4 @@
-package duckdb:extension@2.0.0;
+package duckdb:extension@5.0.0;
 
 // A host import for EXECUTING SQL from inside an extension callback -- the
 // counterpart to `query`, which is READ-ONLY and gracefully degrades on
