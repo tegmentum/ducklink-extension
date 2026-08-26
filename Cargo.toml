@@ -41,8 +41,8 @@ bundled = ["duckdb-api", "duckdb/bundled"]
 ducklink-runtime = { path = "runtime" }
 # wasmtime to run the component. MUST match ducklink-runtime's pinned version so
 # the WasiCtx / generated bindings are the same types across the crate boundary.
-wasmtime = { version = "46.0.1", features = ["component-model"] }
-wasmtime-wasi = "46.0.1"
+wasmtime = { version = "48.0.0", features = ["component-model"] }
+wasmtime-wasi = "48.0.0"
 anyhow = "1"
 # Manifest parsing for the lifted resolver (de-risk spike for design "D").
 serde_json = "1"
