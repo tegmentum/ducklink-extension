@@ -52,8 +52,8 @@ network = ["dep:reqwest", "dep:sha2"]
 ducklink-runtime = { path = "runtime" }
 # wasmtime to run the component. MUST match ducklink-runtime's pinned version so
 # the WasiCtx / generated bindings are the same types across the crate boundary.
-wasmtime = { version = "47.0.2", features = ["component-model"] }
-wasmtime-wasi = "47.0.2"
+wasmtime = { version = "48.0.1", features = ["component-model"] }
+wasmtime-wasi = "48.0.1"
 anyhow = "1"
 # Parses the published ducklink catalog (catalog.json / the bundled snapshot)
 # for name->blob resolution in `ducklink_load`.

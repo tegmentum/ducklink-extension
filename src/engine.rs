@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{anyhow, Context, Result};
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine};
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder};
 
 use ducklink_runtime::duckdb_extension_bindings::duckdb::extension::{
     column_types as extension_column_types, runtime as extension_runtime, types as extension_types,
@@ -960,7 +960,9 @@ impl Engine2 {
         // but conceivable in an unusual test env). If it does, we log and
         // continue without fs access — matches the pattern for the network
         // grant, which is also best-effort.
-        if let Err(err) = builder.preopened_dir("/", "/", DirPerms::all(), FilePerms::all()) {
+        // wasmtime-wasi 48 collapsed (DirPerms, FilePerms) into a single
+        // FsPerms enum. ReadWrite is the equivalent of the pre-48 (all, all).
+        if let Err(err) = builder.preopened_dir("/", "/", FsPerms::ReadWrite) {
             eprintln!(
                 "[ducklink] warning: could not preopen '/' for component '{extension}': {err}; \
                  std::fs::* from inside the component will fail — use DuckDB `read_text(...)` \

@@ -12,10 +12,10 @@ publish = false
 # bindings are ABI-identical across both directions, and so this matches the
 # sqlink host + the webassembly-component-orchestration framework (which is on
 # 45.0.1), letting ducklink later reuse the framework's compose:dynlink host.
-wasmtime = { version = "47.0.2", features = ["component-model", "cache"] }
+wasmtime = { version = "48.0.1", features = ["component-model", "cache"] }
 # The extension store-state holds a WasiCtx and implements WasiView (components
 # target wasip2). Same version as wasmtime.
-wasmtime-wasi = "47.0.2"
+wasmtime-wasi = "48.0.1"
 # The witcanon contract-digest scheme: sha256("witcanon:1" || canonical WIT
 # bytes), byte-identical to compose-core::blobs::compute_wit_digest in
 # ~/git/webassembly-component-orchestration so digests interoperate. build.rs
@@ -25,12 +25,20 @@ hex = "0.4"
 # former inline `component_contract_major`/`check_component_contract` so the
 # same guard backs both the ducklink and sqlink hosts (datalink is public).
 # The witcanon CONTRACT_DIGEST (above) stays per-repo; this is the @MAJOR proxy.
-datalink-contract = { git = "https://github.com/tegmentum/datalink.git", rev = "55289c8798441c7c28e69e136a7ecc1c2ea542cb" }
+datalink-contract = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.1.0" }
 # The shared store-generic compose:dynlink/linker host machinery + the
 # ResidentBackend (instantiate-once-and-reuse provider lifecycle). ducklink's
 # compose_dynlink module is now a thin adapter over this; the resolve/invoke
 # bridge + bindings live here, shared with the other wasm-component hosts.
-datalink-dynlink = { git = "https://github.com/tegmentum/datalink.git", rev = "55289c8798441c7c28e69e136a7ecc1c2ea542cb" }
+datalink-dynlink = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.1.0" }
+# ADR-0029 Phase 6.1b — datalink-contract migrated its two introspection fns
+# from `(&Engine, &Component, &str)` to `(&CompiledComponent, &str)` (wasmos
+# migration doc: docs/design/runtime-abstraction/phase-6-1-component-metadata-
+# introspection.md). This crate keeps its `(engine, component)`-taking public
+# wrappers (500+ internal call sites across ducklink-extension production +
+# downstream consumers) and bridges to the new datalink-contract API via a
+# local `CompiledComponentImpl` wrapper struct in src/contract_guard_bridge.rs.
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", tag = "v0.1.0" }
 
 [build-dependencies]
 # Same witcanon scheme, used in build.rs to hash the canonical WIT into a const.
