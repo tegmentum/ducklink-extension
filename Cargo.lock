@@ -891,7 +891,7 @@ dependencies = [
 [[package]]
 name = "datalink-contract"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/datalink.git?tag=v0.1.0#5206e0dfc31e17ef62fb83384093e6863cabdc7b"
+source = "git+https://github.com/tegmentum/datalink.git?tag=v0.2.0#4edf501aa84b24fa24d5a1b5a89b4523cff7553f"
 dependencies = [
  "anyhow",
  "wasmos-runtime-api",
@@ -900,7 +900,7 @@ dependencies = [
 [[package]]
 name = "datalink-dynlink"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/datalink.git?tag=v0.1.0#5206e0dfc31e17ef62fb83384093e6863cabdc7b"
+source = "git+https://github.com/tegmentum/datalink.git?tag=v0.2.0#4edf501aa84b24fa24d5a1b5a89b4523cff7553f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3372,7 +3372,7 @@ dependencies = [
 [[package]]
 name = "wasmos-runtime-api"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/wasmos.git?tag=v0.1.0#1bf670c63b1b5ac0610a1e102e1971b75aa7daf6"
+source = "git+https://github.com/tegmentum/wasmos.git?tag=v0.3.2#082d80f01ba3eae6d6e98bde0ca239bc44581121"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3384,7 +3384,7 @@ dependencies = [
 [[package]]
 name = "wasmos-runtime-api-macros"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/wasmos.git?tag=v0.1.0#1bf670c63b1b5ac0610a1e102e1971b75aa7daf6"
+source = "git+https://github.com/tegmentum/wasmos.git?tag=v0.3.2#082d80f01ba3eae6d6e98bde0ca239bc44581121"
 dependencies = [
  "proc-macro2",
  "quote",

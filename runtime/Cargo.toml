@@ -25,12 +25,12 @@ hex = "0.4"
 # former inline `component_contract_major`/`check_component_contract` so the
 # same guard backs both the ducklink and sqlink hosts (datalink is public).
 # The witcanon CONTRACT_DIGEST (above) stays per-repo; this is the @MAJOR proxy.
-datalink-contract = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.1.0" }
+datalink-contract = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.2.0" }
 # The shared store-generic compose:dynlink/linker host machinery + the
 # ResidentBackend (instantiate-once-and-reuse provider lifecycle). ducklink's
 # compose_dynlink module is now a thin adapter over this; the resolve/invoke
 # bridge + bindings live here, shared with the other wasm-component hosts.
-datalink-dynlink = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.1.0" }
+datalink-dynlink = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.2.0" }
 # ADR-0029 Phase 6.1b — datalink-contract migrated its two introspection fns
 # from `(&Engine, &Component, &str)` to `(&CompiledComponent, &str)` (wasmos
 # migration doc: docs/design/runtime-abstraction/phase-6-1-component-metadata-
@@ -38,7 +38,7 @@ datalink-dynlink = { git = "https://github.com/tegmentum/datalink.git", tag = "v
 # wrappers (500+ internal call sites across ducklink-extension production +
 # downstream consumers) and bridges to the new datalink-contract API via a
 # local `CompiledComponentImpl` wrapper struct in src/contract_guard_bridge.rs.
-wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", tag = "v0.1.0" }
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", tag = "v0.3.2" }
 
 [build-dependencies]
 # Same witcanon scheme, used in build.rs to hash the canonical WIT into a const.
